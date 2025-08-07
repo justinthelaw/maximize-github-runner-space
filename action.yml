@@ -100,15 +100,15 @@ runs:
           sudo docker image prune --all --force > /dev/null
         fi
         if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then
-          sudo apt-get remove -y '^aspnetcore-.*' > /dev/null
-          sudo apt-get remove -y '^dotnet-.*' > /dev/null
-          sudo apt-get remove -y '^llvm-.*' > /dev/null
-          sudo apt-get remove -y 'php.*' > /dev/null
-          sudo apt-get remove -y '^mongodb-.*' > /dev/null
-          sudo apt-get remove -y '^mysql-.*' > /dev/null
-          sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing > /dev/null
-          sudo apt-get remove -y google-cloud-sdk --fix-missing > /dev/null
-          sudo apt-get remove -y google-cloud-cli --fix-missing > /dev/null
+          sudo apt-get purge -y '^aspnetcore-.*' > /dev/null
+          sudo apt-get purge -y '^dotnet-.*' > /dev/null
+          sudo apt-get purge -y '^llvm-.*' > /dev/null
+          sudo apt-get purge -y 'php.*' > /dev/null
+          sudo apt-get purge -y '^mongodb-.*' > /dev/null
+          sudo apt-get purge -y '^mysql-.*' > /dev/null
+          sudo apt-get purge -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing > /dev/null
+          sudo apt-get purge -y google-cloud-sdk --fix-missing > /dev/null
+          sudo apt-get purge -y google-cloud-cli --fix-missing > /dev/null
           sudo apt-get autoremove -y > /dev/null
           sudo apt-get clean > /dev/null
         fi
