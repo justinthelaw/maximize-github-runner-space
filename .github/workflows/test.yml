@@ -1,0 +1,81 @@
+name: Test Action
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        option:
+          - remove-dotnet
+          - remove-android
+          - remove-haskell
+          - remove-codeql
+          - remove-docker-images
+          - remove-large-packages
+          - remove-cached-tools
+          - remove-swapfile
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run action
+        uses: ./
+        with:
+          ${{ matrix.option }}: 'true'
+      - name: Verify removal
+        shell: bash
+        run: |
+          case "${{ matrix.option }}" in
+            remove-dotnet)
+              if [ -d "/usr/share/dotnet" ]; then
+                echo '.NET was not removed'
+                exit 1
+              fi
+              ;;
+            remove-android)
+              if [ -d "/usr/local/lib/android" ]; then
+                echo 'Android SDKs were not removed'
+                exit 1
+              fi
+              ;;
+            remove-haskell)
+              if [ -d "/opt/ghc" ] || [ -d "/usr/local/.ghcup" ]; then
+                echo 'Haskell artifacts were not removed'
+                exit 1
+              fi
+              ;;
+            remove-codeql)
+              if [ -d "/opt/hostedtoolcache/CodeQL" ]; then
+                echo 'CodeQL bundles were not removed'
+                exit 1
+              fi
+              ;;
+            remove-docker-images)
+              if [ "$(docker image ls -q | wc -l)" -gt 0 ]; then
+                echo 'Docker images were not removed'
+                exit 1
+              fi
+              ;;
+            remove-large-packages)
+              if dpkg -l | grep -E 'azure-cli|google-cloud-sdk|google-cloud-cli|google-chrome-stable|firefox|powershell'; then
+                echo 'Large packages were not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-tools)
+              if [ -d "$AGENT_TOOLSDIRECTORY" ]; then
+                echo 'Cached tools were not removed'
+                exit 1
+              fi
+              ;;
+            remove-swapfile)
+              if [ -f "/mnt/swapfile" ] || swapon --show | grep -q '/mnt/swapfile'; then
+                echo 'Swapfile was not removed'
+                exit 1
+              fi
+              ;;
+          esac
+

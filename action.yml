@@ -1,4 +1,4 @@
-name: "Maximize GitHub Runner SPace"
+name: "Maximize GitHub Runner Space"
 description: "Maximize the available disk space for your test and/or build job"
 branding:
   icon: "crop"
