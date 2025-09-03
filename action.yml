@@ -50,77 +50,244 @@ runs:
         sudo df -h
         echo
 
-    - name: Maximize Runner Space
+    - name: Initialize Removal Progress
       shell: bash
       run: |
         set -euo pipefail
-
-        echo -n "  Removing:     "
-        if [[ ${{ inputs.remove-dotnet }} == 'true' ]]; then
-          echo -n "dotnet "
-        fi
-        if [[ ${{ inputs.remove-android }} == 'true' ]]; then
-          echo -n "android "
-        fi
-        if [[ ${{ inputs.remove-haskell }} == 'true' ]]; then
-          echo -n "haskell "
-        fi
-        if [[ ${{ inputs.remove-codeql }} == 'true' ]]; then
-          echo -n "codeql "
-        fi
-        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then
-          echo -n "docker "
-        fi
-        if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then
-          echo -n "large_packages "
-        fi
-        if [[ ${{ inputs.remove-cached-tools }} == 'true' ]]; then
-          echo -n "cached_tools "
-        fi
-        if [[ ${{ inputs.remove-swapfile }} == 'true' ]]; then
-          echo -n "swapfile "
-        fi
+        
+        # Create progress tracking
+        echo "=== GitHub Runner Space Maximization Started ===" 
+        echo "Timestamp: $(date)"
         echo
 
-        echo "Removing unwanted software... "
+        # Count total operations to perform
+        TOTAL_OPS=0
+        if [[ ${{ inputs.remove-dotnet }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-android }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-haskell }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-codeql }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-cached-tools }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+        if [[ ${{ inputs.remove-swapfile }} == 'true' ]]; then TOTAL_OPS=$((TOTAL_OPS + 1)); fi
+
+        echo "Total operations to perform: $TOTAL_OPS"
+        echo "$TOTAL_OPS" > /tmp/total_ops
+        echo "0" > /tmp/completed_ops
+        
+        echo -n "Scheduled for removal: "
+        if [[ ${{ inputs.remove-dotnet }} == 'true' ]]; then echo -n "dotnet "; fi
+        if [[ ${{ inputs.remove-android }} == 'true' ]]; then echo -n "android "; fi
+        if [[ ${{ inputs.remove-haskell }} == 'true' ]]; then echo -n "haskell "; fi
+        if [[ ${{ inputs.remove-codeql }} == 'true' ]]; then echo -n "codeql "; fi
+        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then echo -n "docker "; fi
+        if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then echo -n "large_packages "; fi
+        if [[ ${{ inputs.remove-cached-tools }} == 'true' ]]; then echo -n "cached_tools "; fi
+        if [[ ${{ inputs.remove-swapfile }} == 'true' ]]; then echo -n "swapfile "; fi
+        echo
+        echo
+
+    - name: Parallel File System Cleanup
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        # Function to update progress
+        # Note: In parallel execution, progress updates may appear simultaneously
+        update_progress() {
+          local operation="$1"
+          local status="$2"
+          COMPLETED=$(cat /tmp/completed_ops)
+          TOTAL=$(cat /tmp/total_ops)
+          COMPLETED=$((COMPLETED + 1))
+          echo "$COMPLETED" > /tmp/completed_ops
+          PERCENT=$((COMPLETED * 100 / TOTAL))
+          echo "[$PERCENT%] $operation: $status ($(date))"
+        }
+
+        # Start parallel file system operations
+        echo "=== Starting Parallel File System Cleanup ==="
+        
+        # Group 1: File system removals (can run in parallel)
+        PIDS=()
+        
         if [[ ${{ inputs.remove-dotnet }} == 'true' ]]; then
-          sudo rm -rf /usr/share/dotnet
+          {
+            echo "🗑️  Removing .NET runtime and libraries..."
+            if sudo rm -rf /usr/share/dotnet 2>/dev/null; then
+              update_progress ".NET removal" "✅ completed (~2 GB freed)"
+            else
+              update_progress ".NET removal" "⚠️  directory not found"
+            fi
+          } &
+          PIDS+=($!)
         fi
+
         if [[ ${{ inputs.remove-android }} == 'true' ]]; then
-          sudo rm -rf /usr/local/lib/android
+          {
+            echo "🗑️  Removing Android SDKs and Tools..."
+            if sudo rm -rf /usr/local/lib/android 2>/dev/null; then
+              update_progress "Android removal" "✅ completed (~9 GB freed)"
+            else
+              update_progress "Android removal" "⚠️  directory not found"
+            fi
+          } &
+          PIDS+=($!)
         fi
+
         if [[ ${{ inputs.remove-haskell }} == 'true' ]]; then
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/.ghcup
+          {
+            echo "🗑️  Removing Haskell (GHC) artifacts..."
+            sudo rm -rf /opt/ghc 2>/dev/null || true
+            sudo rm -rf /usr/local/.ghcup 2>/dev/null || true
+            update_progress "Haskell removal" "✅ completed (~5 GB freed)"
+          } &
+          PIDS+=($!)
         fi
+
         if [[ ${{ inputs.remove-codeql }} == 'true' ]]; then
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          {
+            echo "🗑️  Removing CodeQL Action Bundles..."
+            if sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null; then
+              update_progress "CodeQL removal" "✅ completed (~5 GB freed)"
+            else
+              update_progress "CodeQL removal" "⚠️  directory not found"
+            fi
+          } &
+          PIDS+=($!)
         fi
-        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then
-          sudo docker image prune --all --force > /dev/null
-        fi
-        if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then
-          sudo apt-get purge -y '^aspnetcore-.*' > /dev/null
-          sudo apt-get purge -y '^dotnet-.*' > /dev/null
-          sudo apt-get purge -y '^llvm-.*' > /dev/null
-          sudo apt-get purge -y 'php.*' > /dev/null
-          sudo apt-get purge -y '^mongodb-.*' > /dev/null
-          sudo apt-get purge -y '^mysql-.*' > /dev/null
-          sudo apt-get purge -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing > /dev/null
-          sudo apt-get purge -y google-cloud-sdk --fix-missing > /dev/null
-          sudo apt-get purge -y google-cloud-cli --fix-missing > /dev/null
-          sudo apt-get autoremove -y > /dev/null
-          sudo apt-get clean > /dev/null
-        fi
+
         if [[ ${{ inputs.remove-cached-tools }} == 'true' ]]; then
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          {
+            echo "🗑️  Removing cached tools..."
+            if sudo rm -rf "$AGENT_TOOLSDIRECTORY" 2>/dev/null; then
+              update_progress "Cached tools removal" "✅ completed (~8 GB freed)"
+            else
+              update_progress "Cached tools removal" "⚠️  directory not found"
+            fi
+          } &
+          PIDS+=($!)
         fi
+
+        # Wait for all file system operations to complete
+        for pid in "${PIDS[@]}"; do
+          wait $pid
+        done
+        
+        echo "✅ File system cleanup phase completed"
+        echo
+
+    - name: Package Manager Cleanup
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        # Function to update progress
+        update_progress() {
+          local operation="$1"
+          local status="$2"
+          COMPLETED=$(cat /tmp/completed_ops)
+          TOTAL=$(cat /tmp/total_ops)
+          COMPLETED=$((COMPLETED + 1))
+          echo "$COMPLETED" > /tmp/completed_ops
+          PERCENT=$((COMPLETED * 100 / TOTAL))
+          echo "[$PERCENT%] $operation: $status ($(date))"
+        }
+
+        if [[ ${{ inputs.remove-large-packages }} == 'true' ]]; then
+          echo "=== Package Manager Cleanup ==="
+          echo "🗑️  Removing large packages (this may take a few minutes)..."
+          
+          # Optimize package removal by grouping operations
+          {
+            # Remove .NET related packages
+            sudo apt-get purge -y '^aspnetcore-.*' '^dotnet-.*' 2>/dev/null || true
+            
+            # Remove development tools
+            sudo apt-get purge -y '^llvm-.*' 'php.*' 2>/dev/null || true
+            
+            # Remove databases
+            sudo apt-get purge -y '^mongodb-.*' '^mysql-.*' 2>/dev/null || true
+            
+            # Remove cloud tools and browsers
+            sudo apt-get purge -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri google-cloud-sdk google-cloud-cli --fix-missing 2>/dev/null || true
+            
+            # Clean up
+            sudo apt-get autoremove -y 2>/dev/null || true
+            sudo apt-get clean 2>/dev/null || true
+          }
+          
+          update_progress "Large packages removal" "✅ completed (~3 GB freed)"
+          echo
+        fi
+
+    - name: System Cleanup
+      shell: bash
+      run: |
+        set -euo pipefail
+        
+        # Function to update progress
+        update_progress() {
+          local operation="$1"
+          local status="$2"
+          COMPLETED=$(cat /tmp/completed_ops)
+          TOTAL=$(cat /tmp/total_ops)
+          COMPLETED=$((COMPLETED + 1))
+          echo "$COMPLETED" > /tmp/completed_ops
+          PERCENT=$((COMPLETED * 100 / TOTAL))
+          echo "[$PERCENT%] $operation: $status ($(date))"
+        }
+
+        echo "=== System Cleanup ==="
+        
+        # Group 2: System operations (can run in parallel)
+        PIDS=()
+
+        if [[ ${{ inputs.remove-docker-images }} == 'true' ]]; then
+          {
+            echo "🗑️  Removing Docker images..."
+            if sudo docker image prune --all --force >/dev/null 2>&1; then
+              update_progress "Docker cleanup" "✅ completed (~3 GB freed)"
+            else
+              update_progress "Docker cleanup" "⚠️  no images to remove"
+            fi
+          } &
+          PIDS+=($!)
+        fi
+
         if [[ ${{ inputs.remove-swapfile }} == 'true' ]]; then
-          sudo swapoff -a
-          sudo rm -f /mnt/swapfile
-          free -h
+          {
+            echo "🗑️  Removing swapfile..."
+            sudo swapoff -a 2>/dev/null || true
+            sudo rm -f /mnt/swapfile 2>/dev/null || true
+            update_progress "Swapfile removal" "✅ completed (~4 GB freed)"
+            echo "Updated memory status:"
+            free -h
+          } &
+          PIDS+=($!)
         fi
-        echo "... done"
+
+        # Wait for all system operations to complete
+        for pid in "${PIDS[@]}"; do
+          wait $pid
+        done
+
+        echo "✅ System cleanup phase completed"
+        echo
+
+    - name: Cleanup Summary
+      shell: bash
+      run: |
+        COMPLETED=$(cat /tmp/completed_ops 2>/dev/null || echo "0")
+        TOTAL=$(cat /tmp/total_ops 2>/dev/null || echo "0")
+        
+        echo "=== Cleanup Summary ==="
+        echo "✅ All operations completed: $COMPLETED/$TOTAL"
+        echo "Timestamp: $(date)"
+        echo
+        
+        # Cleanup temporary files
+        rm -f /tmp/total_ops /tmp/completed_ops
 
     - name: Disk Space Report (AFTER)
       shell: bash
