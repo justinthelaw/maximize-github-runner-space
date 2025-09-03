@@ -93,6 +93,7 @@ runs:
         set -euo pipefail
         
         # Function to update progress
+        # Note: In parallel execution, progress updates may appear simultaneously
         update_progress() {
           local operation="$1"
           local status="$2"
