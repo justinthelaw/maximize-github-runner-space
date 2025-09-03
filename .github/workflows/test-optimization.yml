@@ -1,0 +1,13 @@
+name: Test Optimization
+
+on: workflow_dispatch
+
+jobs:
+  test-optimization:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test optimized action
+        uses: ./
+        with:
+          remove-swapfile: 'true'
