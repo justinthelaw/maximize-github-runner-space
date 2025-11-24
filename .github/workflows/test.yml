@@ -23,7 +23,7 @@ jobs:
           - remove-cached-tools
           - remove-swapfile
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Run action
         uses: ./
         with:
