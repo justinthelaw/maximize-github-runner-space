@@ -1,0 +1,37 @@
+model = "gpt-5.3-codex"
+personality = "pragmatic"
+model_provider = "openai"
+model_reasoning_effort = "xhigh"
+model_reasoning_summary = "concise"
+model_verbosity = "low"
+approval_policy = "on-request"
+cli_auth_credentials_store = "file"
+chatgpt_base_url = "https://chatgpt.com/backend-api/"
+project_doc_max_bytes = 32768
+project_doc_fallback_filenames = [".claude/CLAUDE.md"]
+file_opener = "vscode"
+show_raw_agent_reasoning = true
+
+[agents]
+max_threads = 3
+max_depth = 1
+
+[history]
+persistence = "save-all"
+
+[tui]
+notifications = true
+notification_method = "auto"
+animations = true
+show_tooltips = false
+
+[feedback]
+enabled = false
+
+[features]
+search_tool = true
+
+[mcp_servers.context7]
+args = ["-y", "@upstash/context7-mcp"]
+command = "npx"
+enabled = true
