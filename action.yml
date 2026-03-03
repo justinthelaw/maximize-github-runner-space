@@ -358,6 +358,11 @@ runs:
           echo "Removing Java/OpenJDK packages..."
           sudo apt-get purge -y '^openjdk-.*' 2>/dev/null || true
           sudo apt-get autoremove -y 2>/dev/null || true
+          # Runner images also ship Temurin toolchains outside apt packages.
+          sudo rm -rf /usr/lib/jvm /usr/local/lib/jvm /opt/hostedtoolcache/Java* 2>/dev/null || true
+          sudo update-alternatives --remove-all java 2>/dev/null || true
+          sudo update-alternatives --remove-all javac 2>/dev/null || true
+          sudo rm -f /usr/bin/java /usr/bin/javac /etc/alternatives/java /etc/alternatives/javac 2>/dev/null || true
           sudo apt-get clean 2>/dev/null || true
           update_progress "Java removal" "completed"
         fi
