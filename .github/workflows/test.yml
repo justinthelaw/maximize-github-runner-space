@@ -8,7 +8,56 @@ on:
     branches: ["master"]
   pull_request:
 
+concurrency:
+  group: "app-test-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
+  no-op:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run action with defaults
+        uses: ./
+
+  max-with-skip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Capture pre-state
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "/usr/share/dotnet" ]; then
+            echo "DOTNET_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "DOTNET_PRE=0" >> "$GITHUB_ENV"
+          fi
+          if [ -d "/usr/local/lib/android" ]; then
+            echo "ANDROID_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "ANDROID_PRE=0" >> "$GITHUB_ENV"
+          fi
+      - name: Run max profile with skips
+        uses: ./
+        with:
+          cleanup-profile: max
+          skip-components: dotnet,android
+      - name: Verify skipped components still present
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${DOTNET_PRE}" = "1" ] && [ ! -d "/usr/share/dotnet" ]; then
+            echo '.NET should have been skipped but is missing'
+            exit 1
+          fi
+
+          if [ "${ANDROID_PRE}" = "1" ] && [ ! -d "/usr/local/lib/android" ]; then
+            echo 'Android should have been skipped but is missing'
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -22,6 +71,11 @@ jobs:
           - remove-large-packages
           - remove-cached-tools
           - remove-swapfile
+          - remove-swift
+          - remove-julia
+          - remove-java
+          - remove-browsers
+          - remove-powershell
     steps:
       - uses: actions/checkout@v6
       - name: Run action
@@ -31,6 +85,8 @@ jobs:
       - name: Verify removal
         shell: bash
         run: |
+          set -euo pipefail
+
           case "${{ matrix.option }}" in
             remove-dotnet)
               if [ -d "/usr/share/dotnet" ]; then
@@ -69,7 +125,8 @@ jobs:
               fi
               ;;
             remove-cached-tools)
-              if [ -d "$AGENT_TOOLSDIRECTORY" ]; then
+              tools_dir="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+              if [ -d "$tools_dir" ]; then
                 echo 'Cached tools were not removed'
                 exit 1
               fi
@@ -80,5 +137,38 @@ jobs:
                 exit 1
               fi
               ;;
+            remove-swift)
+              if [ -d "/usr/share/swift" ] || command -v swift >/dev/null 2>&1; then
+                echo 'Swift was not removed'
+                exit 1
+              fi
+              ;;
+            remove-julia)
+              if [ -e "/usr/local/bin/julia" ] || command -v julia >/dev/null 2>&1; then
+                echo 'Julia was not removed'
+                exit 1
+              fi
+              ;;
+            remove-java)
+              if command -v javac >/dev/null 2>&1; then
+                echo 'Java was not removed'
+                exit 1
+              fi
+              ;;
+            remove-browsers)
+              if command -v google-chrome >/dev/null 2>&1 || \
+                 command -v google-chrome-stable >/dev/null 2>&1 || \
+                 command -v microsoft-edge >/dev/null 2>&1 || \
+                 command -v microsoft-edge-stable >/dev/null 2>&1 || \
+                 command -v firefox >/dev/null 2>&1; then
+                echo 'Browsers were not removed'
+                exit 1
+              fi
+              ;;
+            remove-powershell)
+              if command -v pwsh >/dev/null 2>&1; then
+                echo 'PowerShell was not removed'
+                exit 1
+              fi
+              ;;
           esac
-
