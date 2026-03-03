@@ -8,6 +8,10 @@ on:
     branches: ["master"]
   pull_request:
 
+concurrency:
+  group: "app-test-${{ github.ref }}"
+  cancel-in-progress: true
+
 jobs:
   no-op:
     runs-on: ubuntu-latest
