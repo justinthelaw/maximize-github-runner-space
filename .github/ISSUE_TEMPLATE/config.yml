@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability Reporting
+    url: https://github.com/justinthelaw/maximize-github-runner-space/blob/master/docs/SECURITY.md
+    about: Please follow SECURITY.md and do not disclose vulnerabilities publicly.
+  - name: Support Guidance
+    url: https://github.com/justinthelaw/maximize-github-runner-space/blob/master/docs/SUPPORT.md
+    about: Read SUPPORT.md before opening an issue.

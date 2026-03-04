@@ -5,25 +5,25 @@ permissions:
 
 on:
   push:
-    branches: ["master"]
+    branches: [master]
   pull_request:
 
 concurrency:
-  group: "app-test-${{ github.ref }}"
+  group: app-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   no-op:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run action with defaults
         uses: ./
 
   max-with-skip:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Capture pre-state
         shell: bash
         run: |
@@ -77,11 +77,23 @@ jobs:
           - remove-browsers
           - remove-powershell
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Run action
         uses: ./
         with:
-          ${{ matrix.option }}: 'true'
+          remove-dotnet: ${{ matrix.option == 'remove-dotnet' && 'true' || 'false' }}
+          remove-android: ${{ matrix.option == 'remove-android' && 'true' || 'false' }}
+          remove-haskell: ${{ matrix.option == 'remove-haskell' && 'true' || 'false' }}
+          remove-codeql: ${{ matrix.option == 'remove-codeql' && 'true' || 'false' }}
+          remove-docker-images: ${{ matrix.option == 'remove-docker-images' && 'true' || 'false' }}
+          remove-large-packages: ${{ matrix.option == 'remove-large-packages' && 'true' || 'false' }}
+          remove-cached-tools: ${{ matrix.option == 'remove-cached-tools' && 'true' || 'false' }}
+          remove-swapfile: ${{ matrix.option == 'remove-swapfile' && 'true' || 'false' }}
+          remove-swift: ${{ matrix.option == 'remove-swift' && 'true' || 'false' }}
+          remove-julia: ${{ matrix.option == 'remove-julia' && 'true' || 'false' }}
+          remove-java: ${{ matrix.option == 'remove-java' && 'true' || 'false' }}
+          remove-browsers: ${{ matrix.option == 'remove-browsers' && 'true' || 'false' }}
+          remove-powershell: ${{ matrix.option == 'remove-powershell' && 'true' || 'false' }}
       - name: Verify removal
         shell: bash
         run: |

@@ -1,40 +1,14 @@
 # Maximize GitHub Runner Space
 
-Forked from [easimon's maximize-build-space action](https://github.com/easimon/maximize-build-space).
-Inspiration and additional cleanup ideas from [AdityaGarg8/remove-unwanted-software](https://github.com/AdityaGarg8/remove-unwanted-software).
+## Project Purpose
 
-Public GitHub-hosted `ubuntu-latest` runners ship with many preinstalled SDKs and tools. This action removes selected components to reclaim disk for large builds/tests.
+Forked from [easimon's maximize-build-space action](https://github.com/easimon/maximize-build-space), with additional cleanup coverage and controls.
 
-## What this action does
+This GitHub Action reclaims disk space on GitHub-hosted Ubuntu runners by removing selected preinstalled SDKs, toolchains, and caches.
 
-- Reports disk space before/after cleanup.
-- Removes selected preinstalled toolchains, packages, caches, Docker artifacts, and optional swap.
-- Runs independent cleanup tasks in parallel with progress reporting.
+## Quick Start
 
-## Supported cleanup modes
-
-- `cleanup-profile: custom` (default): uses per-component `remove-*` flags.
-- `cleanup-profile: max`: enables all cleanup components, then honors `skip-components`.
-
-`skip-components` accepts a comma-separated list of component IDs:
-
-- `dotnet`
-- `android`
-- `haskell`
-- `codeql`
-- `cached-tools`
-- `swapfile`
-- `swift`
-- `julia`
-- `java`
-- `browsers`
-- `powershell`
-- `docker-images`
-- `large-packages`
-
-## Usage
-
-Run this action early in your job (typically before expensive install/build steps).
+Run this action early in your workflow.
 
 ### Max cleanup with selective skips
 
@@ -58,40 +32,34 @@ Run this action early in your job (typically before expensive install/build step
     remove-docker-images: 'true'
 ```
 
-## Inputs
+## Development
 
-```yaml
-cleanup-profile:
-  description: "Cleanup mode: custom or max"
-  default: "custom"
+### What this action does
 
-skip-components:
-  description: "Comma-separated components to skip when cleanup-profile=max"
-  default: ""
+- Reports disk space before and after cleanup.
+- Removes selected preinstalled components.
+- Runs independent cleanup tasks in parallel with progress reporting.
 
-remove-dotnet:         # ~2 GB
-remove-android:        # ~9 GB
-remove-haskell:        # ~5 GB
-remove-codeql:         # ~5 GB
-remove-cached-tools:   # ~8 GB
-remove-swapfile:       # ~4 GB
-remove-swift:          # ~2-3 GB
-remove-julia:          # ~1 GB
-remove-java:           # ~1-2 GB
-remove-browsers:       # ~1+ GB
-remove-powershell:
-remove-docker-images:  # ~3 GB
-remove-large-packages: # ~3 GB
+### Validation
+
+```bash
+pre-commit run --all-files
 ```
 
-## Caveats
+CI matrix tests in `.github/workflows/test.yml` verify each removal toggle independently.
 
-- This action is intentionally destructive (`rm -rf`, `apt-get purge`, Docker prune, swap disable).
-- Removing dependencies your workflow needs will break subsequent steps.
-- Runner images evolve; paths/packages may change over time.
+## Contributing
 
-## Upstream runner docs (latest references)
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for workflow and pull request expectations.
 
-- GitHub-hosted runners reference: <https://docs.github.com/actions/reference/runners/github-hosted-runners>
-- Runner images repository: <https://github.com/actions/runner-images>
-- Current Ubuntu 24.04 software inventory: <https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md>
+## Security
+
+See [docs/SECURITY.md](docs/SECURITY.md) for supported versions and vulnerability reporting.
+
+## Support
+
+See [docs/SUPPORT.md](docs/SUPPORT.md) for issue routing and required context.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
