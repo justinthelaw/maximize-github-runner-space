@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a reproducible defect
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Include exact runner and workflow details to make triage fast.
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-sentence description of the problem
+      placeholder: Cleanup failed for...
+    validations:
+      required: true
+
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Workflow Snippet
+      description: Include the step that runs this action
+      render: yaml
+    validations:
+      required: true
+
+  - type: input
+    id: runner
+    attributes:
+      label: Runner Image
+      description: For example ubuntu-latest, ubuntu-24.04
+      placeholder: ubuntu-latest
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Exact steps to reproduce the issue
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: disk
+    attributes:
+      label: Disk Usage Before and After
+      description: Include `df -h` output before and after action execution
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Include the relevant run output
+    validations:
+      required: true

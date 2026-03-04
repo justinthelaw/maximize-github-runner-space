@@ -1,0 +1,60 @@
+minimum_pre_commit_version: "3.7.0"
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit, pre-push]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        name: Large Files Check
+        args: ["--maxkb=1024"]
+        stages: [pre-push]
+
+      - id: detect-private-key
+        name: Private Key Check
+        stages: [pre-push]
+
+      - id: check-merge-conflict
+        name: Merge Conflict Resolution Check
+        stages: [pre-commit, pre-push]
+
+      - id: end-of-file-fixer
+        name: Newline EOF Checker
+        stages: [pre-commit, pre-push]
+
+      - id: trailing-whitespace
+        name: Whitespace Cleaning Check
+        args: [--markdown-linebreak-ext=md]
+        stages: [pre-commit, pre-push]
+
+  - repo: https://github.com/sirosen/fix-smartquotes
+    rev: 0.2.0
+    hooks:
+      - id: fix-smartquotes
+        name: Fix Quotes
+        stages: [pre-commit, pre-push]
+
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.18.1
+    hooks:
+      - id: markdownlint-cli2
+        name: Markdown Lint
+        args: ["--fix", "--config=.markdownlint-cli2.jsonc"]
+        stages: [pre-commit, pre-push]
+
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.37.1
+    hooks:
+      - id: yamllint
+        name: YAML Lint
+        args: ["-c=.yamllint"]
+        stages: [pre-commit, pre-push]
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.11
+    hooks:
+      - id: actionlint
+        name: GitHub Workflow Lint
+        files: ^\.github/workflows/.*\.ya?ml$
+        stages: [pre-commit, pre-push]
