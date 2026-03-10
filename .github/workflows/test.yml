@@ -16,15 +16,19 @@ jobs:
   default-max:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run action with max profile (default)
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Max Profile Test
         uses: ./
 
   no-op-custom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run action with custom profile and no toggles
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Custom Profile Test, with No Toggles
         uses: ./
         with:
           cleanup-profile: custom
@@ -32,8 +36,10 @@ jobs:
   max-with-skip:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Capture pre-state
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Capture Pre-Action State
         shell: bash
         run: |
           set -euo pipefail
@@ -47,12 +53,14 @@ jobs:
           else
             echo "ANDROID_PRE=0" >> "$GITHUB_ENV"
           fi
-      - name: Run max profile with skips
+
+      - name: Max Profile Test, with Skips
         uses: ./
         with:
           cleanup-profile: max
           skip-components: dotnet,android
-      - name: Verify skipped components still present
+
+      - name: Verify Post-Action State
         shell: bash
         run: |
           set -euo pipefail
@@ -85,9 +93,12 @@ jobs:
           - remove-java
           - remove-browsers
           - remove-powershell
+
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run action with custom profile and toggles
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Custom Profile Test, with Various Toggles
         uses: ./
         with:
           cleanup-profile: custom
@@ -104,7 +115,8 @@ jobs:
           remove-java: ${{ matrix.option == 'remove-java' && 'true' || 'false' }}
           remove-browsers: ${{ matrix.option == 'remove-browsers' && 'true' || 'false' }}
           remove-powershell: ${{ matrix.option == 'remove-powershell' && 'true' || 'false' }}
-      - name: Verify removal
+
+      - name: Verify Post-Action State
         shell: bash
         run: |
           set -euo pipefail
