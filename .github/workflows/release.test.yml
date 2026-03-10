@@ -5,6 +5,9 @@ on:
     branches:
       - main
     paths:
+      - .github/actions/release/action.yaml
+      - .github/workflows/release.test.yml
+      - .github/workflows/release.yml
       - release-please-config.json
       - .release-please-manifest.json
   workflow_dispatch:
