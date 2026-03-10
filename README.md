@@ -12,7 +12,7 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 
 - [Why use this action?](#why-use-this-action)
 - [Quick start](#quick-start)
-- [How cleanup profiles work](#how-cleanup-profiles-work)
+- [Cleanup Progiles](#cleanup-profiles)
 - [Inputs reference](#inputs-reference)
 - [Practical guidance](#practical-guidance)
 - [Compatibility](#compatibility)
@@ -36,7 +36,9 @@ This action helps by:
 
 Use this action near the top of your job, right after checkout.
 
-### Option A: Maximum cleanup (with selective skips)
+Below are sub-sections outlining 2 usage patterns for this action.
+
+### Option A: Maximum cleanup with Selective Skips
 
 ```yaml
 name: CI
@@ -58,7 +60,7 @@ jobs:
         run: echo "Build steps go here"
 ```
 
-### Option B: Custom cleanup (explicit toggles)
+### Option B: Custom cleanup with Explicit Toggles
 
 ```yaml
 name: CI
@@ -83,9 +85,9 @@ jobs:
         run: echo "Build steps go here"
 ```
 
-## How cleanup profiles work
+## Cleanup Profiles
 
-### `cleanup-profile: custom` (default)
+### `cleanup-profile: custom`
 
 - Default behavior.
 - Nothing is removed unless a `remove-*` input is set to `'true'`.
