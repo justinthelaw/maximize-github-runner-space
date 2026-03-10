@@ -48,14 +48,16 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.6.1 <!-- x-release-please-version -->
+      - name: Free Runner Space
+        # NOTE: Use a specific tag or commit shasum for immutability
+        uses: justinthelaw/maximize-github-runner-space@main
         with:
           skip-components: java,browsers
 
-      - name: Continue with your build
+      - name: Continue With Your Build
         run: echo "Build steps go here"
 ```
 
@@ -69,10 +71,11 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.6.1 <!-- x-release-please-version -->
+      - name: Free Runner Space
+        # NOTE: Use a specific tag or commit shasum for immutability
         with:
           cleanup-profile: custom
           remove-android: "true"
@@ -80,7 +83,7 @@ jobs:
           remove-cached-tools: "true"
           remove-docker-images: "true"
 
-      - name: Continue with your build
+      - name: Continue With Your Build
         run: echo "Build steps go here"
 ```
 
