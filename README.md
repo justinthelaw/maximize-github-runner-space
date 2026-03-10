@@ -76,10 +76,10 @@ jobs:
         uses: justinthelaw/maximize-github-runner-space@master
         with:
           cleanup-profile: custom
-          remove-android: 'true'
-          remove-codeql: 'true'
-          remove-cached-tools: 'true'
-          remove-docker-images: 'true'
+          remove-android: "true"
+          remove-codeql: "true"
+          remove-cached-tools: "true"
+          remove-docker-images: "true"
 
       - name: Continue with your build
         run: echo "Build steps go here"
@@ -117,23 +117,23 @@ jobs:
 
 ## Inputs reference
 
-| Input | Default | Description |
-| --- | --- | --- |
-| `cleanup-profile` | `custom` | Cleanup mode: `custom` or `max`. |
-| `skip-components` | `` | Comma-separated components to keep when `cleanup-profile=max`. |
-| `remove-dotnet` | `false` | Remove .NET runtime and libraries (~2 GB). |
-| `remove-android` | `false` | Remove Android SDKs and tools (~9 GB). |
-| `remove-haskell` | `false` | Remove GHC (Haskell) artifacts (~5 GB). |
-| `remove-codeql` | `false` | Remove CodeQL action bundles (~5 GB). |
-| `remove-cached-tools` | `false` | Remove setup-action tool cache (~8 GB). |
-| `remove-swapfile` | `false` | Disable and remove swapfile (~4 GB). |
-| `remove-swift` | `false` | Remove Swift toolchain files (~2–3 GB). |
-| `remove-julia` | `false` | Remove Julia binaries and libraries (~1 GB). |
-| `remove-java` | `false` | Purge OpenJDK packages (~1–2 GB). |
-| `remove-browsers` | `false` | Purge browsers and webdriver packages (~1+ GB). |
-| `remove-powershell` | `false` | Purge the PowerShell package. |
-| `remove-docker-images` | `false` | Remove cached Docker images (~3 GB). |
-| `remove-large-packages` | `false` | Purge additional large apt packages (~3 GB). |
+| Input                   | Default  | Description                                                    |
+| ----------------------- | -------- | -------------------------------------------------------------- |
+| `cleanup-profile`       | `custom` | Cleanup mode: `custom` or `max`.                               |
+| `skip-components`       | ``       | Comma-separated components to keep when `cleanup-profile=max`. |
+| `remove-dotnet`         | `false`  | Remove .NET runtime and libraries (~2 GB).                     |
+| `remove-android`        | `false`  | Remove Android SDKs and tools (~9 GB).                         |
+| `remove-haskell`        | `false`  | Remove GHC (Haskell) artifacts (~5 GB).                        |
+| `remove-codeql`         | `false`  | Remove CodeQL action bundles (~5 GB).                          |
+| `remove-cached-tools`   | `false`  | Remove setup-action tool cache (~8 GB).                        |
+| `remove-swapfile`       | `false`  | Disable and remove swapfile (~4 GB).                           |
+| `remove-swift`          | `false`  | Remove Swift toolchain files (~2–3 GB).                        |
+| `remove-julia`          | `false`  | Remove Julia binaries and libraries (~1 GB).                   |
+| `remove-java`           | `false`  | Purge OpenJDK packages (~1–2 GB).                              |
+| `remove-browsers`       | `false`  | Purge browsers and webdriver packages (~1+ GB).                |
+| `remove-powershell`     | `false`  | Purge the PowerShell package.                                  |
+| `remove-docker-images`  | `false`  | Remove cached Docker images (~3 GB).                           |
+| `remove-large-packages` | `false`  | Purge additional large apt packages (~3 GB).                   |
 
 ## Practical guidance
 
