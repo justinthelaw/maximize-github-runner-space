@@ -32,5 +32,5 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           target-branch: main
-          skip-github-release: "true"
+          skip-github-release: "false"
           skip-github-pull-request: "true"
