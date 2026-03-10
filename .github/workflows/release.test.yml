@@ -4,6 +4,9 @@ on:
   pull_request:
     branches:
       - main
+    paths:
+      - release-please-config.json
+      - .release-please-manifest.json
   workflow_dispatch:
 
 concurrency:
@@ -15,14 +18,11 @@ permissions:
   pull-requests: read
 
 jobs:
-  release-please-dry-run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Run Release Please (dry run)
-        uses: googleapis/release-please-action@16a9c90856f42705d54a6fda1823352bdc62cf38 # v4.4.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          target-branch: main
-          dry-run: true
+  release-please-test:
+    uses: ./.github/workflows/release-please-runner.yml
+    with:
+      target-branch: main
+      skip-github-release: true
+      skip-github-pull-request: true
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}
