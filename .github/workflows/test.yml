@@ -13,12 +13,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  no-op:
+  default-max:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run action with defaults
+      - name: Run action with defaults (max profile)
         uses: ./
+
+  no-op-custom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run action with custom profile and no toggles
+        uses: ./
+        with:
+          cleanup-profile: custom
 
   max-with-skip:
     runs-on: ubuntu-latest
@@ -78,9 +87,10 @@ jobs:
           - remove-powershell
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Run action
+      - name: Run action in custom profile
         uses: ./
         with:
+          cleanup-profile: custom
           remove-dotnet: ${{ matrix.option == 'remove-dotnet' && 'true' || 'false' }}
           remove-android: ${{ matrix.option == 'remove-android' && 'true' || 'false' }}
           remove-haskell: ${{ matrix.option == 'remove-haskell' && 'true' || 'false' }}
