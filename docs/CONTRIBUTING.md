@@ -15,14 +15,14 @@ This document is for action maintainers and contributors. If you only need to us
 - `action.yml`: Composite action inputs and cleanup implementation.
 - `.github/workflows/test.yml`: Matrix tests for input behavior and max-profile skip behavior.
 - `.github/workflows/lint.yml`: Pre-commit checks in CI.
-- `.github/workflows/release-please.yml`: Automated release PR and tagging flow.
+- `.github/workflows/release.yml`: Automated release PR and tagging flow.
 - `release-please-config.json`: Release Please configuration.
 - `.release-please-manifest.json`: Version manifest for Release Please.
 - `README.md`: End-user usage and input documentation.
 
 ## Local setup
 
-1. Create a branch from `master`.
+1. Create a branch from `main`.
 2. Install pre-commit.
 3. Install hooks.
 
@@ -64,7 +64,7 @@ This repository uses [release-please](https://github.com/googleapis/release-plea
 
 ### How it works
 
-- Commits merge into `master`.
+- Commits merge into `main`.
 - The `release-please` workflow opens or updates a release PR.
 - The release PR updates `CHANGELOG.md` and version metadata.
 - Merging the release PR creates a GitHub release and tag.
