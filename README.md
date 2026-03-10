@@ -38,7 +38,7 @@ Use this action near the top of your job, right after checkout.
 
 Below are sub-sections outlining 2 usage patterns for this action.
 
-### Option A: Default maximum cleanup with selective skips
+### Option A: Maximum Cleanup (Default)
 
 ```yaml
 name: CI
@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@vX.X.X
+        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
         with:
           skip-components: java,browsers
 
@@ -59,7 +59,7 @@ jobs:
         run: echo "Build steps go here"
 ```
 
-### Option B: Custom cleanup with Explicit Toggles
+### Option B: Custom Cleanup
 
 ```yaml
 name: CI
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@vX.X.X
+        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
         with:
           cleanup-profile: custom
           remove-android: "true"
