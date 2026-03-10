@@ -6,7 +6,7 @@ Only the latest state of `main` is supported.
 
 | Version       | Supported |
 | ------------- | --------- |
-| `main`      | Yes       |
+| `main`        | Yes       |
 | Older commits | No        |
 
 ## Reporting a Vulnerability
