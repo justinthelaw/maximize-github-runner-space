@@ -9,7 +9,7 @@ on:
   pull_request:
 
 concurrency:
-  group: app-test-${{ github.ref }}
+  group: test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
