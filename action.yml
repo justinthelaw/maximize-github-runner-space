@@ -8,7 +8,7 @@ inputs:
   cleanup-profile:
     description: "Cleanup mode: custom (use remove-* flags) or max (enable all components except those in skip-components)"
     required: false
-    default: "custom"
+    default: "max"
   skip-components:
     description: "Comma-separated components to skip when cleanup-profile=max (e.g. dotnet,android,swift)"
     required: false

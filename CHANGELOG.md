@@ -2,7 +2,6 @@
 
 ## [0.6.0](https://github.com/justinthelaw/maximize-github-runner-space/compare/maximize-github-runner-space-v0.5.1...maximize-github-runner-space-v0.6.0) (2026-03-10)
 
-
 ### Features
 
 * add dependabot dependency bumps ([#9](https://github.com/justinthelaw/maximize-github-runner-space/issues/9)) ([2ff0d3a](https://github.com/justinthelaw/maximize-github-runner-space/commit/2ff0d3a3704fbae1036ac6e0488770637584ec2c))
@@ -11,7 +10,6 @@
 * enhance workflow execution speed, progress reporting ([#11](https://github.com/justinthelaw/maximize-github-runner-space/issues/11)) ([6edcbaf](https://github.com/justinthelaw/maximize-github-runner-space/commit/6edcbaf79e24fbb49a78649b4898d12a246c476d))
 * show directory contents of build mount path if not empty ([62d379b](https://github.com/justinthelaw/maximize-github-runner-space/commit/62d379bbe31e834154be288e762650b7fa7619a4))
 * test workflow, fix large package removal ([#4](https://github.com/justinthelaw/maximize-github-runner-space/issues/4)) ([e0578cf](https://github.com/justinthelaw/maximize-github-runner-space/commit/e0578cf9844d871b0e6b3fde4849ecb2662d2566))
-
 
 ### Bug Fixes
 

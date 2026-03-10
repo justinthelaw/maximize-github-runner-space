@@ -12,7 +12,7 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 
 - [Why use this action?](#why-use-this-action)
 - [Quick start](#quick-start)
-- [Cleanup Progiles](#cleanup-profiles)
+- [Cleanup Profiles](#cleanup-profiles)
 - [Inputs reference](#inputs-reference)
 - [Practical guidance](#practical-guidance)
 - [Compatibility](#compatibility)
@@ -28,8 +28,8 @@ GitHub-hosted Ubuntu runners often start with many gigabytes consumed by preinst
 This action helps by:
 
 - Reporting disk usage before and after cleanup.
-- Supporting a safe `custom` mode (opt in only what to remove).
-- Supporting an aggressive `max` mode (remove almost everything, with optional skips).
+- Supporting an aggressive default `max` mode (remove almost everything, with optional skips).
+- Supporting an opt-in `custom` mode (remove only selected components).
 - Running cleanup tasks in parallel to reduce runtime.
 
 ## Quick start
@@ -38,7 +38,7 @@ Use this action near the top of your job, right after checkout.
 
 Below are sub-sections outlining 2 usage patterns for this action.
 
-### Option A: Maximum cleanup with Selective Skips
+### Option A: Maximum Cleanup (Default)
 
 ```yaml
 name: CI
@@ -51,16 +51,15 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@master
+        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
         with:
-          cleanup-profile: max
           skip-components: java,browsers
 
       - name: Continue with your build
         run: echo "Build steps go here"
 ```
 
-### Option B: Custom cleanup with Explicit Toggles
+### Option B: Custom Cleanup
 
 ```yaml
 name: CI
@@ -73,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@master
+        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
         with:
           cleanup-profile: custom
           remove-android: "true"
@@ -87,17 +86,17 @@ jobs:
 
 ## Cleanup Profiles
 
-### `cleanup-profile: custom`
-
-- Default behavior.
-- Nothing is removed unless a `remove-*` input is set to `'true'`.
-- Best choice when you want precise control.
-
 ### `cleanup-profile: max`
 
+- Default behavior.
 - Enables all cleanup components.
 - Use `skip-components` to keep specific tools.
 - Best choice when disk pressure is severe and you know exactly what must remain installed.
+
+### `cleanup-profile: custom`
+
+- Nothing is removed unless a `remove-*` input is set to `'true'`.
+- Best choice when you want precise control.
 
 `skip-components` accepts a comma-separated list. Current component names:
 
@@ -119,8 +118,8 @@ jobs:
 
 | Input                   | Default  | Description                                                    |
 | ----------------------- | -------- | -------------------------------------------------------------- |
-| `cleanup-profile`       | `custom` | Cleanup mode: `custom` or `max`.                               |
-| `skip-components`       | ``       | Comma-separated components to keep when `cleanup-profile=max`. |
+| `cleanup-profile`       | `max`    | Cleanup mode: `max` (default) or `custom`.                     |
+| `skip-components`       | N/A      | Comma-separated components to keep when `cleanup-profile=max`. |
 | `remove-dotnet`         | `false`  | Remove .NET runtime and libraries (~2 GB).                     |
 | `remove-android`        | `false`  | Remove Android SDKs and tools (~9 GB).                         |
 | `remove-haskell`        | `false`  | Remove GHC (Haskell) artifacts (~5 GB).                        |
@@ -138,8 +137,9 @@ jobs:
 ## Practical guidance
 
 - **Run early**: put this before dependency restore/build/test steps.
-- **Start with `custom`**: remove only what you know you do not need.
-- **Move to `max` carefully**: use `skip-components` to preserve required toolchains.
+- **Assume `max` by default**: this action removes all cleanup components unless skipped.
+- **Use `skip-components`** to preserve required toolchains when staying in `max`.
+- **Switch to `custom`** when you need explicit per-component control.
 - **Expect tool loss**: later steps may fail if they rely on removed software.
 
 ## Compatibility
