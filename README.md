@@ -119,7 +119,7 @@ jobs:
 | Input                   | Default  | Description                                                    |
 | ----------------------- | -------- | -------------------------------------------------------------- |
 | `cleanup-profile`       | `max`    | Cleanup mode: `max` (default) or `custom`.                     |
-| `skip-components`       | ``       | Comma-separated components to keep when `cleanup-profile=max`. |
+| `skip-components`       | N/A      | Comma-separated components to keep when `cleanup-profile=max`. |
 | `remove-dotnet`         | `false`  | Remove .NET runtime and libraries (~2 GB).                     |
 | `remove-android`        | `false`  | Remove Android SDKs and tools (~9 GB).                         |
 | `remove-haskell`        | `false`  | Remove GHC (Haskell) artifacts (~5 GB).                        |
