@@ -16,14 +16,12 @@ permissions:
 
 jobs:
   release-please:
-    uses: ./.github/workflows/release-please-runner.yml
-    with:
-      target-branch: main
-      skip-github-release: false
-      skip-github-pull-request: false
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Release Please
+        uses: ./.github/actions/release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           target-branch: main
+          skip-github-release: "false"
+          skip-github-pull-request: "false"

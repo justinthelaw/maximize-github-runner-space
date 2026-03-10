@@ -19,10 +19,12 @@ permissions:
 
 jobs:
   release-please-test:
-    uses: ./.github/workflows/release-please-runner.yml
-    with:
-      target-branch: main
-      skip-github-release: true
-      skip-github-pull-request: true
-    secrets:
-      token: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Release Please Test
+        uses: ./.github/actions/release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: main
+          skip-github-release: "true"
+          skip-github-pull-request: "true"
