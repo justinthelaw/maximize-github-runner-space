@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
+        uses: justinthelaw/maximize-github-runner-space@v0.6.1 <!-- x-release-please-version -->
         with:
           skip-components: java,browsers
 
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.6.0 <!-- x-release-please-version -->
+        uses: justinthelaw/maximize-github-runner-space@v0.6.1 <!-- x-release-please-version -->
         with:
           cleanup-profile: custom
           remove-android: "true"

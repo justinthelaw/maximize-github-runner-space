@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/justinthelaw/maximize-github-runner-space/compare/v0.6.0...v0.6.1) (2026-03-10)
+
+
+### Bug Fixes
+
+* default profile to max, release-please tag format ([#18](https://github.com/justinthelaw/maximize-github-runner-space/issues/18)) ([3c2a3a1](https://github.com/justinthelaw/maximize-github-runner-space/commit/3c2a3a1083fd0e075b9c4950c3a6c5a353da8b0c))
+
 ## [0.6.0](https://github.com/justinthelaw/maximize-github-runner-space/compare/maximize-github-runner-space-v0.5.1...maximize-github-runner-space-v0.6.0) (2026-03-10)
 
 ### Features
