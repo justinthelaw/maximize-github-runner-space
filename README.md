@@ -14,7 +14,6 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 - [Quick start](#quick-start)
 - [Cleanup Profiles](#cleanup-profiles)
 - [Inputs reference](#inputs-reference)
-- [Practical guidance](#practical-guidance)
 - [Compatibility](#compatibility)
 - [Contributing](#contributing)
 - [Security](#security)
@@ -34,9 +33,7 @@ This action helps by:
 
 ## Quick start
 
-Use this action near the top of your job, right after checkout.
-
-Below are sub-sections outlining 2 usage patterns for this action.
+Use this action near the top of your job, right after checkout, using one of the following [cleanup profiles](#cleanup-profiles):
 
 ### Option A: Maximum Cleanup (Default)
 
@@ -53,7 +50,7 @@ jobs:
 
       - name: Free Runner Space
         # NOTE: Use a specific tag or commit shasum for immutability
-        uses: justinthelaw/maximize-github-runner-space@main
+        uses: justinthelaw/maximize-github-runner-space@latest
         with:
           skip-components: java,browsers
 
@@ -76,6 +73,7 @@ jobs:
 
       - name: Free Runner Space
         # NOTE: Use a specific tag or commit shasum for immutability
+        uses: justinthelaw/maximize-github-runner-space@latest
         with:
           cleanup-profile: custom
           remove-android: "true"
@@ -138,14 +136,6 @@ Estimated savings are based on the latest passing CI matrix runs for this reposi
 | `remove-powershell`     | `false` | Purge the PowerShell package (~150–250 MB).                   |
 | `remove-docker-images`  | `false` | Remove cached Docker images (~3–6 GB).                        |
 | `remove-large-packages` | `false` | Purge additional large apt packages (~1–3 GB).                |
-
-## Practical guidance
-
-- **Run early**: put this before dependency restore/build/test steps.
-- **Assume `max` by default**: this action removes all cleanup components unless skipped.
-- **Use `skip-components`** to preserve required toolchains when staying in `max`.
-- **Switch to `custom`** when you need explicit per-component control.
-- **Expect tool loss**: later steps may fail if they rely on removed software.
 
 ## Compatibility
 
