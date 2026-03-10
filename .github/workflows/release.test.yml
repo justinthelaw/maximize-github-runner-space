@@ -16,9 +16,7 @@ concurrency:
   group: release-test-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: write-all
 
 jobs:
   release-please-test:
