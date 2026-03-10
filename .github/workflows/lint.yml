@@ -6,7 +6,7 @@ permissions:
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
 
 concurrency:
   group: lint-${{ github.ref }}

@@ -2,11 +2,11 @@
 
 ## Supported Versions
 
-Only the latest state of `master` is supported.
+Only the latest state of `main` is supported.
 
 | Version       | Supported |
 | ------------- | --------- |
-| `master`      | Yes       |
+| `main`      | Yes       |
 | Older commits | No        |
 
 ## Reporting a Vulnerability
