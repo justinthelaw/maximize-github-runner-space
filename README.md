@@ -8,6 +8,19 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 > This action is intentionally destructive. It can remove tools your later steps expect.
 > Run it early and only remove components you do not need.
 
+## Table of Contents
+
+- [Why use this action?](#why-use-this-action)
+- [Quick start](#quick-start)
+- [How cleanup profiles work](#how-cleanup-profiles-work)
+- [Inputs reference](#inputs-reference)
+- [Practical guidance](#practical-guidance)
+- [Compatibility](#compatibility)
+- [Contributing](#contributing)
+- [Security](#security)
+- [Support](#support)
+- [License](#license)
+
 ## Why use this action?
 
 GitHub-hosted Ubuntu runners often start with many gigabytes consumed by preinstalled software. That is convenient for general use, but it can block large workflows (for example, Docker image builds, Android/iOS builds, or large monorepo test runs).
@@ -133,12 +146,18 @@ jobs:
 - Uses system tools such as `bash`, `sudo`, `apt-get`, and `docker`.
 - Not intended for Windows or macOS runners.
 
-## For maintainers and contributors
+## Contributing
 
-Development and release process details live in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for development and release workflow details.
 
-## Security, support, and license
+## Security
 
-- Security policy: [docs/SECURITY.md](docs/SECURITY.md)
-- Support guidance: [docs/SUPPORT.md](docs/SUPPORT.md)
-- License: [LICENSE](LICENSE)
+See [docs/SECURITY.md](docs/SECURITY.md) for the security policy and reporting guidance.
+
+## Support
+
+See [docs/SUPPORT.md](docs/SUPPORT.md) for help and support guidance.
+
+## License
+
+This project is licensed under the terms of the [LICENSE](LICENSE) file.
