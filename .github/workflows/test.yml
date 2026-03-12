@@ -87,12 +87,49 @@ jobs:
           - remove-docker-images
           - remove-large-packages
           - remove-cached-tools
+          - remove-cached-go
+          - remove-cached-node
+          - remove-cached-python
+          - remove-cached-pypy
+          - remove-cached-ruby
           - remove-swapfile
           - remove-swift
           - remove-julia
           - remove-java
           - remove-browsers
+          - remove-chrome
+          - remove-chromium
+          - remove-edge
+          - remove-firefox
+          - remove-webdrivers
+          - remove-selenium
           - remove-powershell
+          - remove-miniconda
+          - remove-homebrew
+          - remove-vcpkg
+          - remove-aws-cli
+          - remove-aws-sam-cli
+          - remove-azure-cli
+          - remove-gh-cli
+          - remove-gcloud-cli
+          - remove-azcopy
+          - remove-kubectl
+          - remove-helm
+          - remove-kind
+          - remove-minikube
+          - remove-kustomize
+          - remove-docker-engine
+          - remove-buildah
+          - remove-podman
+          - remove-maven
+          - remove-gradle
+          - remove-ant
+          - remove-php
+          - remove-rust
+          - remove-postgresql
+          - remove-mysql
+          - remove-apache
+          - remove-nginx
 
     steps:
       - name: Checkout
@@ -109,12 +146,49 @@ jobs:
           remove-docker-images: ${{ matrix.option == 'remove-docker-images' && 'true' || 'false' }}
           remove-large-packages: ${{ matrix.option == 'remove-large-packages' && 'true' || 'false' }}
           remove-cached-tools: ${{ matrix.option == 'remove-cached-tools' && 'true' || 'false' }}
+          remove-cached-go: ${{ matrix.option == 'remove-cached-go' && 'true' || 'false' }}
+          remove-cached-node: ${{ matrix.option == 'remove-cached-node' && 'true' || 'false' }}
+          remove-cached-python: ${{ matrix.option == 'remove-cached-python' && 'true' || 'false' }}
+          remove-cached-pypy: ${{ matrix.option == 'remove-cached-pypy' && 'true' || 'false' }}
+          remove-cached-ruby: ${{ matrix.option == 'remove-cached-ruby' && 'true' || 'false' }}
           remove-swapfile: ${{ matrix.option == 'remove-swapfile' && 'true' || 'false' }}
           remove-swift: ${{ matrix.option == 'remove-swift' && 'true' || 'false' }}
           remove-julia: ${{ matrix.option == 'remove-julia' && 'true' || 'false' }}
           remove-java: ${{ matrix.option == 'remove-java' && 'true' || 'false' }}
           remove-browsers: ${{ matrix.option == 'remove-browsers' && 'true' || 'false' }}
+          remove-chrome: ${{ matrix.option == 'remove-chrome' && 'true' || 'false' }}
+          remove-chromium: ${{ matrix.option == 'remove-chromium' && 'true' || 'false' }}
+          remove-edge: ${{ matrix.option == 'remove-edge' && 'true' || 'false' }}
+          remove-firefox: ${{ matrix.option == 'remove-firefox' && 'true' || 'false' }}
+          remove-webdrivers: ${{ matrix.option == 'remove-webdrivers' && 'true' || 'false' }}
+          remove-selenium: ${{ matrix.option == 'remove-selenium' && 'true' || 'false' }}
           remove-powershell: ${{ matrix.option == 'remove-powershell' && 'true' || 'false' }}
+          remove-miniconda: ${{ matrix.option == 'remove-miniconda' && 'true' || 'false' }}
+          remove-homebrew: ${{ matrix.option == 'remove-homebrew' && 'true' || 'false' }}
+          remove-vcpkg: ${{ matrix.option == 'remove-vcpkg' && 'true' || 'false' }}
+          remove-aws-cli: ${{ matrix.option == 'remove-aws-cli' && 'true' || 'false' }}
+          remove-aws-sam-cli: ${{ matrix.option == 'remove-aws-sam-cli' && 'true' || 'false' }}
+          remove-azure-cli: ${{ matrix.option == 'remove-azure-cli' && 'true' || 'false' }}
+          remove-gh-cli: ${{ matrix.option == 'remove-gh-cli' && 'true' || 'false' }}
+          remove-gcloud-cli: ${{ matrix.option == 'remove-gcloud-cli' && 'true' || 'false' }}
+          remove-azcopy: ${{ matrix.option == 'remove-azcopy' && 'true' || 'false' }}
+          remove-kubectl: ${{ matrix.option == 'remove-kubectl' && 'true' || 'false' }}
+          remove-helm: ${{ matrix.option == 'remove-helm' && 'true' || 'false' }}
+          remove-kind: ${{ matrix.option == 'remove-kind' && 'true' || 'false' }}
+          remove-minikube: ${{ matrix.option == 'remove-minikube' && 'true' || 'false' }}
+          remove-kustomize: ${{ matrix.option == 'remove-kustomize' && 'true' || 'false' }}
+          remove-docker-engine: ${{ matrix.option == 'remove-docker-engine' && 'true' || 'false' }}
+          remove-buildah: ${{ matrix.option == 'remove-buildah' && 'true' || 'false' }}
+          remove-podman: ${{ matrix.option == 'remove-podman' && 'true' || 'false' }}
+          remove-maven: ${{ matrix.option == 'remove-maven' && 'true' || 'false' }}
+          remove-gradle: ${{ matrix.option == 'remove-gradle' && 'true' || 'false' }}
+          remove-ant: ${{ matrix.option == 'remove-ant' && 'true' || 'false' }}
+          remove-php: ${{ matrix.option == 'remove-php' && 'true' || 'false' }}
+          remove-rust: ${{ matrix.option == 'remove-rust' && 'true' || 'false' }}
+          remove-postgresql: ${{ matrix.option == 'remove-postgresql' && 'true' || 'false' }}
+          remove-mysql: ${{ matrix.option == 'remove-mysql' && 'true' || 'false' }}
+          remove-apache: ${{ matrix.option == 'remove-apache' && 'true' || 'false' }}
+          remove-nginx: ${{ matrix.option == 'remove-nginx' && 'true' || 'false' }}
 
       - name: Verify Post-Action State
         shell: bash
@@ -141,7 +215,8 @@ jobs:
               fi
               ;;
             remove-codeql)
-              if [ -d "/opt/hostedtoolcache/CodeQL" ]; then
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/CodeQL" ]; then
                 echo 'CodeQL bundles were not removed'
                 exit 1
               fi
@@ -159,8 +234,8 @@ jobs:
               fi
               ;;
             remove-cached-tools)
-              tools_dir="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
-              if [ -d "$tools_dir" ]; then
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir" ] && [ "$(ls -A "$tools_dir")" != "" ]; then
                 echo 'Cached tools were not removed'
                 exit 1
               fi
@@ -202,6 +277,239 @@ jobs:
             remove-powershell)
               if command -v pwsh >/dev/null 2>&1; then
                 echo 'PowerShell was not removed'
+                exit 1
+              fi
+              ;;
+            remove-miniconda)
+              conda_root="${CONDA:-/usr/share/miniconda}"
+              if [ -d "$conda_root" ]; then
+                echo 'Miniconda was not removed'
+                exit 1
+              fi
+              ;;
+            remove-homebrew)
+              if [ -d "/home/linuxbrew" ]; then
+                echo 'Homebrew was not removed'
+                exit 1
+              fi
+              ;;
+            remove-vcpkg)
+              if [ -d "/usr/local/share/vcpkg" ]; then
+                echo 'vcpkg was not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-go)
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/Go" ] || [ -d "$tools_dir/go" ]; then
+                echo 'Go toolcache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-node)
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/node" ] || [ -d "$tools_dir/Node" ]; then
+                echo 'Node.js toolcache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-python)
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/Python" ] || [ -d "$tools_dir/python" ]; then
+                echo 'Python toolcache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-pypy)
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/PyPy" ] || [ -d "$tools_dir/pypy" ]; then
+                echo 'PyPy toolcache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-cached-ruby)
+              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+              if [ -d "$tools_dir/Ruby" ] || [ -d "$tools_dir/ruby" ]; then
+                echo 'Ruby toolcache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-chrome)
+              if command -v google-chrome >/dev/null 2>&1 || \
+                 command -v google-chrome-stable >/dev/null 2>&1; then
+                echo 'Chrome was not removed'
+                exit 1
+              fi
+              ;;
+            remove-chromium)
+              if command -v chromium >/dev/null 2>&1 || \
+                 command -v chromium-browser >/dev/null 2>&1; then
+                echo 'Chromium was not removed'
+                exit 1
+              fi
+              ;;
+            remove-edge)
+              if command -v microsoft-edge >/dev/null 2>&1 || \
+                 command -v microsoft-edge-stable >/dev/null 2>&1; then
+                echo 'Edge was not removed'
+                exit 1
+              fi
+              ;;
+            remove-firefox)
+              if command -v firefox >/dev/null 2>&1; then
+                echo 'Firefox was not removed'
+                exit 1
+              fi
+              ;;
+            remove-webdrivers)
+              if command -v chromedriver >/dev/null 2>&1 || \
+                 command -v geckodriver >/dev/null 2>&1 || \
+                 command -v msedgedriver >/dev/null 2>&1; then
+                echo 'Webdrivers were not removed'
+                exit 1
+              fi
+              ;;
+            remove-selenium)
+              if [ -e "/usr/share/java/selenium-server.jar" ]; then
+                echo 'Selenium server was not removed'
+                exit 1
+              fi
+              ;;
+            remove-aws-cli)
+              if command -v aws >/dev/null 2>&1; then
+                echo 'AWS CLI was not removed'
+                exit 1
+              fi
+              ;;
+            remove-aws-sam-cli)
+              if command -v sam >/dev/null 2>&1; then
+                echo 'AWS SAM CLI was not removed'
+                exit 1
+              fi
+              ;;
+            remove-azure-cli)
+              if command -v az >/dev/null 2>&1; then
+                echo 'Azure CLI was not removed'
+                exit 1
+              fi
+              ;;
+            remove-gh-cli)
+              if command -v gh >/dev/null 2>&1; then
+                echo 'GitHub CLI was not removed'
+                exit 1
+              fi
+              ;;
+            remove-gcloud-cli)
+              if command -v gcloud >/dev/null 2>&1; then
+                echo 'Google Cloud CLI was not removed'
+                exit 1
+              fi
+              ;;
+            remove-azcopy)
+              if command -v azcopy >/dev/null 2>&1; then
+                echo 'AzCopy was not removed'
+                exit 1
+              fi
+              ;;
+            remove-kubectl)
+              if command -v kubectl >/dev/null 2>&1; then
+                echo 'kubectl was not removed'
+                exit 1
+              fi
+              ;;
+            remove-helm)
+              if command -v helm >/dev/null 2>&1; then
+                echo 'Helm was not removed'
+                exit 1
+              fi
+              ;;
+            remove-kind)
+              if command -v kind >/dev/null 2>&1; then
+                echo 'kind was not removed'
+                exit 1
+              fi
+              ;;
+            remove-minikube)
+              if command -v minikube >/dev/null 2>&1; then
+                echo 'Minikube was not removed'
+                exit 1
+              fi
+              ;;
+            remove-kustomize)
+              if command -v kustomize >/dev/null 2>&1; then
+                echo 'Kustomize was not removed'
+                exit 1
+              fi
+              ;;
+            remove-docker-engine)
+              if command -v docker >/dev/null 2>&1; then
+                echo 'Docker Engine was not removed'
+                exit 1
+              fi
+              ;;
+            remove-buildah)
+              if command -v buildah >/dev/null 2>&1; then
+                echo 'Buildah was not removed'
+                exit 1
+              fi
+              ;;
+            remove-podman)
+              if command -v podman >/dev/null 2>&1; then
+                echo 'Podman was not removed'
+                exit 1
+              fi
+              ;;
+            remove-maven)
+              if command -v mvn >/dev/null 2>&1; then
+                echo 'Maven was not removed'
+                exit 1
+              fi
+              ;;
+            remove-gradle)
+              if command -v gradle >/dev/null 2>&1; then
+                echo 'Gradle was not removed'
+                exit 1
+              fi
+              ;;
+            remove-ant)
+              if command -v ant >/dev/null 2>&1; then
+                echo 'Ant was not removed'
+                exit 1
+              fi
+              ;;
+            remove-php)
+              if command -v php >/dev/null 2>&1 || command -v composer >/dev/null 2>&1; then
+                echo 'PHP tooling was not removed'
+                exit 1
+              fi
+              ;;
+            remove-rust)
+              if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
+                echo 'Rust toolchain was not removed'
+                exit 1
+              fi
+              ;;
+            remove-postgresql)
+              if command -v psql >/dev/null 2>&1 || [ -d "/var/lib/postgresql" ]; then
+                echo 'PostgreSQL was not removed'
+                exit 1
+              fi
+              ;;
+            remove-mysql)
+              if command -v mysql >/dev/null 2>&1 || [ -d "/var/lib/mysql" ]; then
+                echo 'MySQL/MariaDB was not removed'
+                exit 1
+              fi
+              ;;
+            remove-apache)
+              if command -v apache2 >/dev/null 2>&1 || [ -d "/etc/apache2" ]; then
+                echo 'Apache was not removed'
+                exit 1
+              fi
+              ;;
+            remove-nginx)
+              if command -v nginx >/dev/null 2>&1 || [ -d "/etc/nginx" ]; then
+                echo 'Nginx was not removed'
                 exit 1
               fi
               ;;

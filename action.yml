@@ -61,6 +61,170 @@ inputs:
     description: "Purges PowerShell package."
     required: false
     default: "false"
+  remove-miniconda:
+    description: "Removes Miniconda installation."
+    required: false
+    default: "false"
+  remove-homebrew:
+    description: "Removes Homebrew (Linuxbrew) files."
+    required: false
+    default: "false"
+  remove-vcpkg:
+    description: "Removes vcpkg installation."
+    required: false
+    default: "false"
+
+  # Cached toolcache subsets (useful when you want partial toolcache cleanup)
+  remove-cached-go:
+    description: "Removes Go toolcache entries."
+    required: false
+    default: "false"
+  remove-cached-node:
+    description: "Removes Node.js toolcache entries."
+    required: false
+    default: "false"
+  remove-cached-python:
+    description: "Removes Python toolcache entries."
+    required: false
+    default: "false"
+  remove-cached-pypy:
+    description: "Removes PyPy toolcache entries."
+    required: false
+    default: "false"
+  remove-cached-ruby:
+    description: "Removes Ruby toolcache entries."
+    required: false
+    default: "false"
+
+  # Browser and webdriver subsets (for granular control)
+  remove-chrome:
+    description: "Purges Google Chrome."
+    required: false
+    default: "false"
+  remove-chromium:
+    description: "Purges Chromium browser."
+    required: false
+    default: "false"
+  remove-edge:
+    description: "Purges Microsoft Edge."
+    required: false
+    default: "false"
+  remove-firefox:
+    description: "Purges Firefox."
+    required: false
+    default: "false"
+  remove-webdrivers:
+    description: "Removes browser webdrivers (chromedriver, geckodriver, edgedriver)."
+    required: false
+    default: "false"
+  remove-selenium:
+    description: "Removes Selenium server artifacts."
+    required: false
+    default: "false"
+
+  # Cloud/CLI tools
+  remove-aws-cli:
+    description: "Removes AWS CLI v2."
+    required: false
+    default: "false"
+  remove-aws-sam-cli:
+    description: "Removes AWS SAM CLI."
+    required: false
+    default: "false"
+  remove-azure-cli:
+    description: "Removes Azure CLI."
+    required: false
+    default: "false"
+  remove-gh-cli:
+    description: "Removes GitHub CLI."
+    required: false
+    default: "false"
+  remove-gcloud-cli:
+    description: "Removes Google Cloud CLI/SDK."
+    required: false
+    default: "false"
+  remove-azcopy:
+    description: "Removes AzCopy."
+    required: false
+    default: "false"
+
+  # Kubernetes and DevOps tools
+  remove-kubectl:
+    description: "Removes kubectl."
+    required: false
+    default: "false"
+  remove-helm:
+    description: "Removes Helm."
+    required: false
+    default: "false"
+  remove-kind:
+    description: "Removes kind."
+    required: false
+    default: "false"
+  remove-minikube:
+    description: "Removes Minikube."
+    required: false
+    default: "false"
+  remove-kustomize:
+    description: "Removes Kustomize."
+    required: false
+    default: "false"
+
+  # Container tooling (beyond cached images)
+  remove-docker-engine:
+    description: "Purges Docker Engine packages and data directories."
+    required: false
+    default: "false"
+  remove-buildah:
+    description: "Removes Buildah."
+    required: false
+    default: "false"
+  remove-podman:
+    description: "Removes Podman."
+    required: false
+    default: "false"
+
+  # Project/build tools
+  remove-maven:
+    description: "Removes Apache Maven."
+    required: false
+    default: "false"
+  remove-gradle:
+    description: "Removes Gradle."
+    required: false
+    default: "false"
+  remove-ant:
+    description: "Removes Apache Ant."
+    required: false
+    default: "false"
+
+  # Language-specific tooling
+  remove-php:
+    description: "Removes PHP and common PHP tooling (composer/phpunit)."
+    required: false
+    default: "false"
+  remove-rust:
+    description: "Removes Rust toolchain (rustup/cargo)."
+    required: false
+    default: "false"
+
+  # Services and databases
+  remove-postgresql:
+    description: "Purges PostgreSQL packages and data."
+    required: false
+    default: "false"
+  remove-mysql:
+    description: "Purges MySQL/MariaDB packages and data."
+    required: false
+    default: "false"
+  remove-apache:
+    description: "Purges Apache HTTP Server."
+    required: false
+    default: "false"
+  remove-nginx:
+    description: "Purges Nginx."
+    required: false
+    default: "false"
 
   # Existing optional cleanups
   remove-docker-images:
@@ -99,6 +263,43 @@ runs:
         REMOVE_JAVA: ${{ inputs.remove-java }}
         REMOVE_BROWSERS: ${{ inputs.remove-browsers }}
         REMOVE_POWERSHELL: ${{ inputs.remove-powershell }}
+        REMOVE_MINICONDA: ${{ inputs.remove-miniconda }}
+        REMOVE_HOMEBREW: ${{ inputs.remove-homebrew }}
+        REMOVE_VCPKG: ${{ inputs.remove-vcpkg }}
+        REMOVE_CACHED_GO: ${{ inputs.remove-cached-go }}
+        REMOVE_CACHED_NODE: ${{ inputs.remove-cached-node }}
+        REMOVE_CACHED_PYTHON: ${{ inputs.remove-cached-python }}
+        REMOVE_CACHED_PYPY: ${{ inputs.remove-cached-pypy }}
+        REMOVE_CACHED_RUBY: ${{ inputs.remove-cached-ruby }}
+        REMOVE_CHROME: ${{ inputs.remove-chrome }}
+        REMOVE_CHROMIUM: ${{ inputs.remove-chromium }}
+        REMOVE_EDGE: ${{ inputs.remove-edge }}
+        REMOVE_FIREFOX: ${{ inputs.remove-firefox }}
+        REMOVE_WEBDRIVERS: ${{ inputs.remove-webdrivers }}
+        REMOVE_SELENIUM: ${{ inputs.remove-selenium }}
+        REMOVE_AWS_CLI: ${{ inputs.remove-aws-cli }}
+        REMOVE_AWS_SAM_CLI: ${{ inputs.remove-aws-sam-cli }}
+        REMOVE_AZURE_CLI: ${{ inputs.remove-azure-cli }}
+        REMOVE_GH_CLI: ${{ inputs.remove-gh-cli }}
+        REMOVE_GCLOUD_CLI: ${{ inputs.remove-gcloud-cli }}
+        REMOVE_AZCOPY: ${{ inputs.remove-azcopy }}
+        REMOVE_KUBECTL: ${{ inputs.remove-kubectl }}
+        REMOVE_HELM: ${{ inputs.remove-helm }}
+        REMOVE_KIND: ${{ inputs.remove-kind }}
+        REMOVE_MINIKUBE: ${{ inputs.remove-minikube }}
+        REMOVE_KUSTOMIZE: ${{ inputs.remove-kustomize }}
+        REMOVE_DOCKER_ENGINE: ${{ inputs.remove-docker-engine }}
+        REMOVE_BUILDAH: ${{ inputs.remove-buildah }}
+        REMOVE_PODMAN: ${{ inputs.remove-podman }}
+        REMOVE_MAVEN: ${{ inputs.remove-maven }}
+        REMOVE_GRADLE: ${{ inputs.remove-gradle }}
+        REMOVE_ANT: ${{ inputs.remove-ant }}
+        REMOVE_PHP: ${{ inputs.remove-php }}
+        REMOVE_RUST: ${{ inputs.remove-rust }}
+        REMOVE_POSTGRESQL: ${{ inputs.remove-postgresql }}
+        REMOVE_MYSQL: ${{ inputs.remove-mysql }}
+        REMOVE_APACHE: ${{ inputs.remove-apache }}
+        REMOVE_NGINX: ${{ inputs.remove-nginx }}
         REMOVE_DOCKER_IMAGES: ${{ inputs.remove-docker-images }}
         REMOVE_LARGE_PACKAGES: ${{ inputs.remove-large-packages }}
       run: |
@@ -117,9 +318,12 @@ runs:
         should_enable() {
           local component="$1"
           local custom_value="$2"
+          local group="${3:-}"
 
           if [[ "${CLEANUP_PROFILE}" == "max" ]]; then
             if csv_contains "$SKIP_COMPONENTS_NORMALIZED" "$component"; then
+              echo "false"
+            elif [[ -n "$group" ]] && csv_contains "$SKIP_COMPONENTS_NORMALIZED" "$group"; then
               echo "false"
             else
               echo "true"
@@ -148,15 +352,101 @@ runs:
         COMPONENT_ANDROID=$(should_enable "android" "${REMOVE_ANDROID}")
         COMPONENT_HASKELL=$(should_enable "haskell" "${REMOVE_HASKELL}")
         COMPONENT_CODEQL=$(should_enable "codeql" "${REMOVE_CODEQL}")
-        COMPONENT_CACHED_TOOLS=$(should_enable "cached-tools" "${REMOVE_CACHED_TOOLS}")
         COMPONENT_SWAPFILE=$(should_enable "swapfile" "${REMOVE_SWAPFILE}")
         COMPONENT_SWIFT=$(should_enable "swift" "${REMOVE_SWIFT}")
         COMPONENT_JULIA=$(should_enable "julia" "${REMOVE_JULIA}")
         COMPONENT_JAVA=$(should_enable "java" "${REMOVE_JAVA}")
-        COMPONENT_BROWSERS=$(should_enable "browsers" "${REMOVE_BROWSERS}")
         COMPONENT_POWERSHELL=$(should_enable "powershell" "${REMOVE_POWERSHELL}")
+        COMPONENT_MINICONDA=$(should_enable "miniconda" "${REMOVE_MINICONDA}")
+        COMPONENT_HOMEBREW=$(should_enable "homebrew" "${REMOVE_HOMEBREW}")
+        COMPONENT_VCPKG=$(should_enable "vcpkg" "${REMOVE_VCPKG}")
+        if [[ "${CLEANUP_PROFILE}" == "max" ]]; then
+          if csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-tools" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-go" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-node" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-python" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-pypy" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "cached-ruby"; then
+            COMPONENT_CACHED_TOOLS="false"
+          else
+            COMPONENT_CACHED_TOOLS="true"
+          fi
+        else
+          COMPONENT_CACHED_TOOLS=$(should_enable "cached-tools" "${REMOVE_CACHED_TOOLS}")
+        fi
+        if [[ "${CLEANUP_PROFILE}" == "max" ]]; then
+          if csv_contains "$SKIP_COMPONENTS_NORMALIZED" "browsers" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "chrome" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "chromium" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "edge" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "firefox" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "webdrivers" || \
+             csv_contains "$SKIP_COMPONENTS_NORMALIZED" "selenium"; then
+            COMPONENT_BROWSERS="false"
+          else
+            COMPONENT_BROWSERS="true"
+          fi
+        else
+          COMPONENT_BROWSERS=$(should_enable "browsers" "${REMOVE_BROWSERS}")
+        fi
+        COMPONENT_CACHED_GO=$(should_enable "cached-go" "${REMOVE_CACHED_GO}" "cached-tools")
+        COMPONENT_CACHED_NODE=$(should_enable "cached-node" "${REMOVE_CACHED_NODE}" "cached-tools")
+        COMPONENT_CACHED_PYTHON=$(should_enable "cached-python" "${REMOVE_CACHED_PYTHON}" "cached-tools")
+        COMPONENT_CACHED_PYPY=$(should_enable "cached-pypy" "${REMOVE_CACHED_PYPY}" "cached-tools")
+        COMPONENT_CACHED_RUBY=$(should_enable "cached-ruby" "${REMOVE_CACHED_RUBY}" "cached-tools")
+        COMPONENT_CHROME=$(should_enable "chrome" "${REMOVE_CHROME}" "browsers")
+        COMPONENT_CHROMIUM=$(should_enable "chromium" "${REMOVE_CHROMIUM}" "browsers")
+        COMPONENT_EDGE=$(should_enable "edge" "${REMOVE_EDGE}" "browsers")
+        COMPONENT_FIREFOX=$(should_enable "firefox" "${REMOVE_FIREFOX}" "browsers")
+        COMPONENT_WEBDRIVERS=$(should_enable "webdrivers" "${REMOVE_WEBDRIVERS}" "browsers")
+        COMPONENT_SELENIUM=$(should_enable "selenium" "${REMOVE_SELENIUM}" "browsers")
+        COMPONENT_AWS_CLI=$(should_enable "aws-cli" "${REMOVE_AWS_CLI}")
+        COMPONENT_AWS_SAM_CLI=$(should_enable "aws-sam-cli" "${REMOVE_AWS_SAM_CLI}")
+        COMPONENT_AZURE_CLI=$(should_enable "azure-cli" "${REMOVE_AZURE_CLI}")
+        COMPONENT_GH_CLI=$(should_enable "gh-cli" "${REMOVE_GH_CLI}")
+        COMPONENT_GCLOUD_CLI=$(should_enable "gcloud-cli" "${REMOVE_GCLOUD_CLI}")
+        COMPONENT_AZCOPY=$(should_enable "azcopy" "${REMOVE_AZCOPY}")
+        COMPONENT_KUBECTL=$(should_enable "kubectl" "${REMOVE_KUBECTL}")
+        COMPONENT_HELM=$(should_enable "helm" "${REMOVE_HELM}")
+        COMPONENT_KIND=$(should_enable "kind" "${REMOVE_KIND}")
+        COMPONENT_MINIKUBE=$(should_enable "minikube" "${REMOVE_MINIKUBE}")
+        COMPONENT_KUSTOMIZE=$(should_enable "kustomize" "${REMOVE_KUSTOMIZE}")
+        COMPONENT_DOCKER_ENGINE=$(should_enable "docker-engine" "${REMOVE_DOCKER_ENGINE}")
+        COMPONENT_BUILDAH=$(should_enable "buildah" "${REMOVE_BUILDAH}")
+        COMPONENT_PODMAN=$(should_enable "podman" "${REMOVE_PODMAN}")
+        COMPONENT_MAVEN=$(should_enable "maven" "${REMOVE_MAVEN}")
+        COMPONENT_GRADLE=$(should_enable "gradle" "${REMOVE_GRADLE}")
+        COMPONENT_ANT=$(should_enable "ant" "${REMOVE_ANT}")
+        COMPONENT_PHP=$(should_enable "php" "${REMOVE_PHP}")
+        COMPONENT_RUST=$(should_enable "rust" "${REMOVE_RUST}")
+        COMPONENT_POSTGRESQL=$(should_enable "postgresql" "${REMOVE_POSTGRESQL}")
+        COMPONENT_MYSQL=$(should_enable "mysql" "${REMOVE_MYSQL}")
+        COMPONENT_APACHE=$(should_enable "apache" "${REMOVE_APACHE}")
+        COMPONENT_NGINX=$(should_enable "nginx" "${REMOVE_NGINX}")
         COMPONENT_DOCKER_IMAGES=$(should_enable "docker-images" "${REMOVE_DOCKER_IMAGES}")
         COMPONENT_LARGE_PACKAGES=$(should_enable "large-packages" "${REMOVE_LARGE_PACKAGES}")
+
+        if [[ "$COMPONENT_CACHED_TOOLS" == "true" ]]; then
+          COMPONENT_CACHED_GO="false"
+          COMPONENT_CACHED_NODE="false"
+          COMPONENT_CACHED_PYTHON="false"
+          COMPONENT_CACHED_PYPY="false"
+          COMPONENT_CACHED_RUBY="false"
+        fi
+
+        if [[ "$COMPONENT_BROWSERS" == "true" ]]; then
+          COMPONENT_CHROME="false"
+          COMPONENT_CHROMIUM="false"
+          COMPONENT_EDGE="false"
+          COMPONENT_FIREFOX="false"
+          COMPONENT_WEBDRIVERS="false"
+          COMPONENT_SELENIUM="false"
+        fi
+
+        TOOLCACHE_DIR="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+        if [[ -z "${TOOLCACHE_DIR}" || "${TOOLCACHE_DIR}" == "/" ]]; then
+          TOOLCACHE_DIR="/opt/hostedtoolcache"
+        fi
 
         cat > /tmp/component_flags.env <<FLAGS
         COMPONENT_DOTNET=${COMPONENT_DOTNET}
@@ -170,8 +460,46 @@ runs:
         COMPONENT_JAVA=${COMPONENT_JAVA}
         COMPONENT_BROWSERS=${COMPONENT_BROWSERS}
         COMPONENT_POWERSHELL=${COMPONENT_POWERSHELL}
+        COMPONENT_MINICONDA=${COMPONENT_MINICONDA}
+        COMPONENT_HOMEBREW=${COMPONENT_HOMEBREW}
+        COMPONENT_VCPKG=${COMPONENT_VCPKG}
+        COMPONENT_CACHED_GO=${COMPONENT_CACHED_GO}
+        COMPONENT_CACHED_NODE=${COMPONENT_CACHED_NODE}
+        COMPONENT_CACHED_PYTHON=${COMPONENT_CACHED_PYTHON}
+        COMPONENT_CACHED_PYPY=${COMPONENT_CACHED_PYPY}
+        COMPONENT_CACHED_RUBY=${COMPONENT_CACHED_RUBY}
+        COMPONENT_CHROME=${COMPONENT_CHROME}
+        COMPONENT_CHROMIUM=${COMPONENT_CHROMIUM}
+        COMPONENT_EDGE=${COMPONENT_EDGE}
+        COMPONENT_FIREFOX=${COMPONENT_FIREFOX}
+        COMPONENT_WEBDRIVERS=${COMPONENT_WEBDRIVERS}
+        COMPONENT_SELENIUM=${COMPONENT_SELENIUM}
+        COMPONENT_AWS_CLI=${COMPONENT_AWS_CLI}
+        COMPONENT_AWS_SAM_CLI=${COMPONENT_AWS_SAM_CLI}
+        COMPONENT_AZURE_CLI=${COMPONENT_AZURE_CLI}
+        COMPONENT_GH_CLI=${COMPONENT_GH_CLI}
+        COMPONENT_GCLOUD_CLI=${COMPONENT_GCLOUD_CLI}
+        COMPONENT_AZCOPY=${COMPONENT_AZCOPY}
+        COMPONENT_KUBECTL=${COMPONENT_KUBECTL}
+        COMPONENT_HELM=${COMPONENT_HELM}
+        COMPONENT_KIND=${COMPONENT_KIND}
+        COMPONENT_MINIKUBE=${COMPONENT_MINIKUBE}
+        COMPONENT_KUSTOMIZE=${COMPONENT_KUSTOMIZE}
+        COMPONENT_DOCKER_ENGINE=${COMPONENT_DOCKER_ENGINE}
+        COMPONENT_BUILDAH=${COMPONENT_BUILDAH}
+        COMPONENT_PODMAN=${COMPONENT_PODMAN}
+        COMPONENT_MAVEN=${COMPONENT_MAVEN}
+        COMPONENT_GRADLE=${COMPONENT_GRADLE}
+        COMPONENT_ANT=${COMPONENT_ANT}
+        COMPONENT_PHP=${COMPONENT_PHP}
+        COMPONENT_RUST=${COMPONENT_RUST}
+        COMPONENT_POSTGRESQL=${COMPONENT_POSTGRESQL}
+        COMPONENT_MYSQL=${COMPONENT_MYSQL}
+        COMPONENT_APACHE=${COMPONENT_APACHE}
+        COMPONENT_NGINX=${COMPONENT_NGINX}
         COMPONENT_DOCKER_IMAGES=${COMPONENT_DOCKER_IMAGES}
         COMPONENT_LARGE_PACKAGES=${COMPONENT_LARGE_PACKAGES}
+        TOOLCACHE_DIR=${TOOLCACHE_DIR}
         FLAGS
 
         TOTAL_OPS=0
@@ -187,6 +515,43 @@ runs:
           "$COMPONENT_JAVA" \
           "$COMPONENT_BROWSERS" \
           "$COMPONENT_POWERSHELL" \
+          "$COMPONENT_MINICONDA" \
+          "$COMPONENT_HOMEBREW" \
+          "$COMPONENT_VCPKG" \
+          "$COMPONENT_CACHED_GO" \
+          "$COMPONENT_CACHED_NODE" \
+          "$COMPONENT_CACHED_PYTHON" \
+          "$COMPONENT_CACHED_PYPY" \
+          "$COMPONENT_CACHED_RUBY" \
+          "$COMPONENT_CHROME" \
+          "$COMPONENT_CHROMIUM" \
+          "$COMPONENT_EDGE" \
+          "$COMPONENT_FIREFOX" \
+          "$COMPONENT_WEBDRIVERS" \
+          "$COMPONENT_SELENIUM" \
+          "$COMPONENT_AWS_CLI" \
+          "$COMPONENT_AWS_SAM_CLI" \
+          "$COMPONENT_AZURE_CLI" \
+          "$COMPONENT_GH_CLI" \
+          "$COMPONENT_GCLOUD_CLI" \
+          "$COMPONENT_AZCOPY" \
+          "$COMPONENT_KUBECTL" \
+          "$COMPONENT_HELM" \
+          "$COMPONENT_KIND" \
+          "$COMPONENT_MINIKUBE" \
+          "$COMPONENT_KUSTOMIZE" \
+          "$COMPONENT_DOCKER_ENGINE" \
+          "$COMPONENT_BUILDAH" \
+          "$COMPONENT_PODMAN" \
+          "$COMPONENT_MAVEN" \
+          "$COMPONENT_GRADLE" \
+          "$COMPONENT_ANT" \
+          "$COMPONENT_PHP" \
+          "$COMPONENT_RUST" \
+          "$COMPONENT_POSTGRESQL" \
+          "$COMPONENT_MYSQL" \
+          "$COMPONENT_APACHE" \
+          "$COMPONENT_NGINX" \
           "$COMPONENT_DOCKER_IMAGES" \
           "$COMPONENT_LARGE_PACKAGES"; do
           if [[ "$flag" == "true" ]]; then
@@ -239,6 +604,43 @@ runs:
         [[ "$COMPONENT_JAVA" == "true" ]] && echo -n "java "
         [[ "$COMPONENT_BROWSERS" == "true" ]] && echo -n "browsers "
         [[ "$COMPONENT_POWERSHELL" == "true" ]] && echo -n "powershell "
+        [[ "$COMPONENT_MINICONDA" == "true" ]] && echo -n "miniconda "
+        [[ "$COMPONENT_HOMEBREW" == "true" ]] && echo -n "homebrew "
+        [[ "$COMPONENT_VCPKG" == "true" ]] && echo -n "vcpkg "
+        [[ "$COMPONENT_CACHED_GO" == "true" ]] && echo -n "cached-go "
+        [[ "$COMPONENT_CACHED_NODE" == "true" ]] && echo -n "cached-node "
+        [[ "$COMPONENT_CACHED_PYTHON" == "true" ]] && echo -n "cached-python "
+        [[ "$COMPONENT_CACHED_PYPY" == "true" ]] && echo -n "cached-pypy "
+        [[ "$COMPONENT_CACHED_RUBY" == "true" ]] && echo -n "cached-ruby "
+        [[ "$COMPONENT_CHROME" == "true" ]] && echo -n "chrome "
+        [[ "$COMPONENT_CHROMIUM" == "true" ]] && echo -n "chromium "
+        [[ "$COMPONENT_EDGE" == "true" ]] && echo -n "edge "
+        [[ "$COMPONENT_FIREFOX" == "true" ]] && echo -n "firefox "
+        [[ "$COMPONENT_WEBDRIVERS" == "true" ]] && echo -n "webdrivers "
+        [[ "$COMPONENT_SELENIUM" == "true" ]] && echo -n "selenium "
+        [[ "$COMPONENT_AWS_CLI" == "true" ]] && echo -n "aws-cli "
+        [[ "$COMPONENT_AWS_SAM_CLI" == "true" ]] && echo -n "aws-sam-cli "
+        [[ "$COMPONENT_AZURE_CLI" == "true" ]] && echo -n "azure-cli "
+        [[ "$COMPONENT_GH_CLI" == "true" ]] && echo -n "gh-cli "
+        [[ "$COMPONENT_GCLOUD_CLI" == "true" ]] && echo -n "gcloud-cli "
+        [[ "$COMPONENT_AZCOPY" == "true" ]] && echo -n "azcopy "
+        [[ "$COMPONENT_KUBECTL" == "true" ]] && echo -n "kubectl "
+        [[ "$COMPONENT_HELM" == "true" ]] && echo -n "helm "
+        [[ "$COMPONENT_KIND" == "true" ]] && echo -n "kind "
+        [[ "$COMPONENT_MINIKUBE" == "true" ]] && echo -n "minikube "
+        [[ "$COMPONENT_KUSTOMIZE" == "true" ]] && echo -n "kustomize "
+        [[ "$COMPONENT_DOCKER_ENGINE" == "true" ]] && echo -n "docker-engine "
+        [[ "$COMPONENT_BUILDAH" == "true" ]] && echo -n "buildah "
+        [[ "$COMPONENT_PODMAN" == "true" ]] && echo -n "podman "
+        [[ "$COMPONENT_MAVEN" == "true" ]] && echo -n "maven "
+        [[ "$COMPONENT_GRADLE" == "true" ]] && echo -n "gradle "
+        [[ "$COMPONENT_ANT" == "true" ]] && echo -n "ant "
+        [[ "$COMPONENT_PHP" == "true" ]] && echo -n "php "
+        [[ "$COMPONENT_RUST" == "true" ]] && echo -n "rust "
+        [[ "$COMPONENT_POSTGRESQL" == "true" ]] && echo -n "postgresql "
+        [[ "$COMPONENT_MYSQL" == "true" ]] && echo -n "mysql "
+        [[ "$COMPONENT_APACHE" == "true" ]] && echo -n "apache "
+        [[ "$COMPONENT_NGINX" == "true" ]] && echo -n "nginx "
         [[ "$COMPONENT_DOCKER_IMAGES" == "true" ]] && echo -n "docker-images "
         [[ "$COMPONENT_LARGE_PACKAGES" == "true" ]] && echo -n "large-packages "
         echo
@@ -254,10 +656,23 @@ runs:
         echo "=== Starting Parallel File System Cleanup ==="
         PIDS=()
 
+        safe_rm() {
+          local target="$1"
+          if [[ -n "$target" && "$target" != "/" ]]; then
+            sudo rm -rf "$target" 2>/dev/null || true
+          fi
+        }
+
         if [[ "$COMPONENT_DOTNET" == "true" ]]; then
           {
             echo "Removing .NET runtime and libraries..."
-            sudo rm -rf /usr/share/dotnet 2>/dev/null || true
+            safe_rm /usr/share/dotnet
+            safe_rm /usr/lib/dotnet
+            safe_rm /etc/dotnet
+            safe_rm /home/runner/.dotnet
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/dotnet"
+            fi
             update_progress ".NET removal" "completed"
           } &
           PIDS+=($!)
@@ -266,7 +681,12 @@ runs:
         if [[ "$COMPONENT_ANDROID" == "true" ]]; then
           {
             echo "Removing Android SDKs and tools..."
-            sudo rm -rf /usr/local/lib/android 2>/dev/null || true
+            safe_rm /usr/local/lib/android
+            safe_rm /usr/local/share/android
+            safe_rm /opt/android
+            safe_rm /opt/android-sdk
+            safe_rm /home/runner/.android
+            safe_rm /home/runner/.gradle
             update_progress "Android removal" "completed"
           } &
           PIDS+=($!)
@@ -275,8 +695,11 @@ runs:
         if [[ "$COMPONENT_HASKELL" == "true" ]]; then
           {
             echo "Removing Haskell artifacts..."
-            sudo rm -rf /opt/ghc 2>/dev/null || true
-            sudo rm -rf /usr/local/.ghcup 2>/dev/null || true
+            safe_rm /opt/ghc
+            safe_rm /usr/local/.ghcup
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/ghc"
+            fi
             update_progress "Haskell removal" "completed"
           } &
           PIDS+=($!)
@@ -285,7 +708,9 @@ runs:
         if [[ "$COMPONENT_CODEQL" == "true" ]]; then
           {
             echo "Removing CodeQL bundles..."
-            sudo rm -rf /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              sudo rm -rf "${TOOLCACHE_DIR}/CodeQL" 2>/dev/null || true
+            fi
             update_progress "CodeQL removal" "completed"
           } &
           PIDS+=($!)
@@ -294,9 +719,11 @@ runs:
         if [[ "$COMPONENT_CACHED_TOOLS" == "true" ]]; then
           {
             echo "Removing cached setup-action tools..."
-            tools_dir="${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}"
+            tools_dir="${TOOLCACHE_DIR:-/opt/hostedtoolcache}"
             if [[ -n "$tools_dir" && "$tools_dir" != "/" ]]; then
               sudo rm -rf "$tools_dir" 2>/dev/null || true
+              sudo mkdir -p "$tools_dir" 2>/dev/null || true
+              sudo chown "$USER":"$USER" "$tools_dir" 2>/dev/null || true
               update_progress "Cached tools removal" "completed"
             else
               update_progress "Cached tools removal" "skipped (unsafe path)"
@@ -308,8 +735,12 @@ runs:
         if [[ "$COMPONENT_SWIFT" == "true" ]]; then
           {
             echo "Removing Swift toolchain files..."
-            sudo rm -rf /usr/share/swift 2>/dev/null || true
-            sudo rm -rf /usr/local/share/swift 2>/dev/null || true
+            safe_rm /usr/share/swift
+            safe_rm /usr/local/share/swift
+            safe_rm /usr/lib/swift
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/swift"
+            fi
             update_progress "Swift removal" "completed"
           } &
           PIDS+=($!)
@@ -318,9 +749,120 @@ runs:
         if [[ "$COMPONENT_JULIA" == "true" ]]; then
           {
             echo "Removing Julia files..."
+            safe_rm /usr/local/julia
             sudo rm -rf /usr/local/julia* 2>/dev/null || true
             sudo rm -f /usr/local/bin/julia 2>/dev/null || true
+            safe_rm /usr/share/julia
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/Julia"
+            fi
             update_progress "Julia removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_MINICONDA" == "true" ]]; then
+          {
+            echo "Removing Miniconda..."
+            conda_root="${CONDA:-/usr/share/miniconda}"
+            if [[ -n "$conda_root" && "$conda_root" != "/" ]]; then
+              safe_rm "$conda_root"
+            fi
+            safe_rm /home/runner/.conda
+            sudo rm -f /home/runner/.condarc 2>/dev/null || true
+            safe_rm /home/runner/.cache/conda
+            update_progress "Miniconda removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_HOMEBREW" == "true" ]]; then
+          {
+            echo "Removing Homebrew..."
+            safe_rm /home/linuxbrew
+            update_progress "Homebrew removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_VCPKG" == "true" ]]; then
+          {
+            echo "Removing vcpkg..."
+            safe_rm /usr/local/share/vcpkg
+            update_progress "vcpkg removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_CACHED_GO" == "true" ]]; then
+          {
+            echo "Removing Go toolcache..."
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/Go"
+              safe_rm "${TOOLCACHE_DIR}/go"
+            fi
+            update_progress "Go toolcache removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_CACHED_NODE" == "true" ]]; then
+          {
+            echo "Removing Node.js toolcache..."
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/node"
+              safe_rm "${TOOLCACHE_DIR}/Node"
+            fi
+            update_progress "Node.js toolcache removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_CACHED_PYTHON" == "true" ]]; then
+          {
+            echo "Removing Python toolcache..."
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/Python"
+              safe_rm "${TOOLCACHE_DIR}/python"
+            fi
+            update_progress "Python toolcache removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_CACHED_PYPY" == "true" ]]; then
+          {
+            echo "Removing PyPy toolcache..."
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/PyPy"
+              safe_rm "${TOOLCACHE_DIR}/pypy"
+            fi
+            update_progress "PyPy toolcache removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_CACHED_RUBY" == "true" ]]; then
+          {
+            echo "Removing Ruby toolcache..."
+            if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+              safe_rm "${TOOLCACHE_DIR}/Ruby"
+              safe_rm "${TOOLCACHE_DIR}/ruby"
+            fi
+            update_progress "Ruby toolcache removal" "completed"
+          } &
+          PIDS+=($!)
+        fi
+
+        if [[ "$COMPONENT_RUST" == "true" ]]; then
+          {
+            echo "Removing Rust toolchain..."
+            safe_rm /usr/local/rustup
+            safe_rm /usr/local/cargo
+            safe_rm /home/runner/.cargo
+            safe_rm /home/runner/.rustup
+            sudo rm -f /usr/local/bin/rustc /usr/local/bin/cargo /usr/local/bin/rustup 2>/dev/null || true
+            update_progress "Rust removal" "completed"
           } &
           PIDS+=($!)
         fi
@@ -340,51 +882,304 @@ runs:
         source /tmp/progress.sh
 
         echo "=== Package Manager Cleanup ==="
+        APT_DIRTY=0
+
+        apt_purge() {
+          sudo apt-get purge -y "$@" 2>/dev/null || true
+          APT_DIRTY=1
+        }
+
+        safe_rm() {
+          local target="$1"
+          if [[ -n "$target" && "$target" != "/" ]]; then
+            sudo rm -rf "$target" 2>/dev/null || true
+          fi
+        }
+
+        remove_binary() {
+          local name="$1"
+          local path
+          path=$(command -v "$name" 2>/dev/null || true)
+          if [[ -n "$path" ]]; then
+            sudo rm -f "$path" 2>/dev/null || true
+          fi
+        }
 
         if [[ "$COMPONENT_LARGE_PACKAGES" == "true" ]]; then
           echo "Removing large package groups..."
-          sudo apt-get purge -y '^aspnetcore-.*' '^dotnet-.*' 2>/dev/null || true
-          sudo apt-get purge -y '^llvm-.*' 'php.*' 2>/dev/null || true
-          sudo apt-get purge -y '^mongodb-.*' '^mysql-.*' 2>/dev/null || true
-          sudo apt-get purge -y azure-cli google-cloud-sdk google-cloud-cli \
+          apt_purge '^aspnetcore-.*' '^dotnet-.*'
+          apt_purge '^llvm-.*' 'php.*'
+          apt_purge '^mongodb-.*' '^mysql-.*'
+          apt_purge azure-cli google-cloud-sdk google-cloud-cli \
             google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri \
-            --fix-missing 2>/dev/null || true
-          sudo apt-get autoremove -y 2>/dev/null || true
-          sudo apt-get clean 2>/dev/null || true
+            --fix-missing
           update_progress "Large packages removal" "completed"
         fi
 
         if [[ "$COMPONENT_JAVA" == "true" ]]; then
           echo "Removing Java/OpenJDK packages..."
-          sudo apt-get purge -y '^openjdk-.*' 2>/dev/null || true
-          sudo apt-get autoremove -y 2>/dev/null || true
+          apt_purge '^openjdk-.*'
           # Runner images also ship Temurin toolchains outside apt packages.
-          sudo rm -rf /usr/lib/jvm /usr/local/lib/jvm /opt/hostedtoolcache/Java* 2>/dev/null || true
+          safe_rm /usr/lib/jvm
+          safe_rm /usr/local/lib/jvm
+          if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
+            safe_rm "${TOOLCACHE_DIR}"/Java*
+          fi
           sudo update-alternatives --remove-all java 2>/dev/null || true
           sudo update-alternatives --remove-all javac 2>/dev/null || true
           sudo rm -f /usr/bin/java /usr/bin/javac /etc/alternatives/java /etc/alternatives/javac 2>/dev/null || true
-          sudo apt-get clean 2>/dev/null || true
           update_progress "Java removal" "completed"
         fi
 
         if [[ "$COMPONENT_BROWSERS" == "true" ]]; then
           echo "Removing browsers and webdriver packages..."
-          sudo apt-get purge -y google-chrome-stable microsoft-edge-stable firefox \
-            chromium-browser chromium-codecs-ffmpeg-extra 2>/dev/null || true
-          sudo rm -rf /usr/local/share/chromedriver-linux64 2>/dev/null || true
-          sudo rm -rf /usr/local/share/edge_driver 2>/dev/null || true
-          sudo rm -rf /usr/local/share/gecko_driver 2>/dev/null || true
-          sudo apt-get autoremove -y 2>/dev/null || true
-          sudo apt-get clean 2>/dev/null || true
+          apt_purge google-chrome-stable microsoft-edge-stable firefox \
+            chromium-browser chromium-codecs-ffmpeg-extra
+          safe_rm /opt/google/chrome
+          safe_rm /opt/microsoft/msedge
+          safe_rm /usr/lib/chromium
+          safe_rm /usr/lib/firefox
+          safe_rm /usr/local/share/chromedriver-linux64
+          safe_rm /usr/local/share/edge_driver
+          safe_rm /usr/local/share/gecko_driver
+          safe_rm /usr/share/java/selenium-server.jar
+          if command -v snap >/dev/null 2>&1; then
+            sudo snap remove firefox 2>/dev/null || true
+            sudo snap remove chromium 2>/dev/null || true
+          fi
           update_progress "Browsers removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_CHROME" == "true" ]]; then
+          echo "Removing Google Chrome..."
+          apt_purge google-chrome-stable
+          safe_rm /opt/google/chrome
+          remove_binary google-chrome
+          remove_binary google-chrome-stable
+          update_progress "Chrome removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_CHROMIUM" == "true" ]]; then
+          echo "Removing Chromium..."
+          apt_purge chromium-browser chromium-codecs-ffmpeg-extra
+          safe_rm /usr/lib/chromium
+          remove_binary chromium-browser
+          remove_binary chromium
+          if command -v snap >/dev/null 2>&1; then
+            sudo snap remove chromium 2>/dev/null || true
+          fi
+          update_progress "Chromium removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_EDGE" == "true" ]]; then
+          echo "Removing Microsoft Edge..."
+          apt_purge microsoft-edge-stable
+          safe_rm /opt/microsoft/msedge
+          remove_binary microsoft-edge
+          remove_binary microsoft-edge-stable
+          update_progress "Edge removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_FIREFOX" == "true" ]]; then
+          echo "Removing Firefox..."
+          apt_purge firefox
+          safe_rm /usr/lib/firefox
+          remove_binary firefox
+          if command -v snap >/dev/null 2>&1; then
+            sudo snap remove firefox 2>/dev/null || true
+          fi
+          update_progress "Firefox removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_WEBDRIVERS" == "true" ]]; then
+          echo "Removing browser webdrivers..."
+          safe_rm /usr/local/share/chromedriver-linux64
+          safe_rm /usr/local/share/edge_driver
+          safe_rm /usr/local/share/gecko_driver
+          remove_binary chromedriver
+          remove_binary msedgedriver
+          remove_binary geckodriver
+          update_progress "Webdrivers removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_SELENIUM" == "true" ]]; then
+          echo "Removing Selenium server artifacts..."
+          safe_rm /usr/share/java/selenium-server.jar
+          update_progress "Selenium removal" "completed"
         fi
 
         if [[ "$COMPONENT_POWERSHELL" == "true" ]]; then
           echo "Removing PowerShell package..."
-          sudo apt-get purge -y powershell 2>/dev/null || true
+          apt_purge powershell
+          remove_binary pwsh
+          update_progress "PowerShell removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_AWS_CLI" == "true" ]]; then
+          echo "Removing AWS CLI..."
+          safe_rm /usr/local/aws-cli
+          remove_binary aws
+          sudo rm -f /usr/local/bin/aws /usr/local/bin/aws_completer 2>/dev/null || true
+          update_progress "AWS CLI removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_AWS_SAM_CLI" == "true" ]]; then
+          echo "Removing AWS SAM CLI..."
+          safe_rm /usr/local/aws-sam-cli
+          remove_binary sam
+          update_progress "AWS SAM CLI removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_AZURE_CLI" == "true" ]]; then
+          echo "Removing Azure CLI..."
+          apt_purge azure-cli
+          safe_rm /opt/az
+          remove_binary az
+          update_progress "Azure CLI removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_GH_CLI" == "true" ]]; then
+          echo "Removing GitHub CLI..."
+          apt_purge gh
+          remove_binary gh
+          update_progress "GitHub CLI removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_GCLOUD_CLI" == "true" ]]; then
+          echo "Removing Google Cloud CLI..."
+          apt_purge google-cloud-cli google-cloud-sdk
+          safe_rm /usr/lib/google-cloud-sdk
+          safe_rm /opt/google-cloud-cli
+          remove_binary gcloud
+          remove_binary gsutil
+          update_progress "Google Cloud CLI removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_AZCOPY" == "true" ]]; then
+          echo "Removing AzCopy..."
+          remove_binary azcopy
+          sudo rm -f /usr/local/bin/azcopy /usr/local/bin/azcopy10 2>/dev/null || true
+          update_progress "AzCopy removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_KUBECTL" == "true" ]]; then
+          echo "Removing kubectl..."
+          remove_binary kubectl
+          update_progress "kubectl removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_HELM" == "true" ]]; then
+          echo "Removing Helm..."
+          remove_binary helm
+          update_progress "Helm removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_KIND" == "true" ]]; then
+          echo "Removing kind..."
+          remove_binary kind
+          update_progress "kind removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_MINIKUBE" == "true" ]]; then
+          echo "Removing Minikube..."
+          remove_binary minikube
+          update_progress "Minikube removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_KUSTOMIZE" == "true" ]]; then
+          echo "Removing Kustomize..."
+          remove_binary kustomize
+          update_progress "Kustomize removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_BUILDAH" == "true" ]]; then
+          echo "Removing Buildah..."
+          apt_purge buildah
+          remove_binary buildah
+          update_progress "Buildah removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_PODMAN" == "true" ]]; then
+          echo "Removing Podman..."
+          apt_purge podman
+          remove_binary podman
+          safe_rm /var/lib/containers
+          update_progress "Podman removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_MAVEN" == "true" ]]; then
+          echo "Removing Maven..."
+          apt_purge maven
+          safe_rm /usr/share/maven
+          sudo rm -rf /usr/local/apache-maven* 2>/dev/null || true
+          remove_binary mvn
+          update_progress "Maven removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_GRADLE" == "true" ]]; then
+          echo "Removing Gradle..."
+          apt_purge gradle
+          safe_rm /usr/share/gradle
+          sudo rm -rf /usr/local/gradle* 2>/dev/null || true
+          remove_binary gradle
+          update_progress "Gradle removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_ANT" == "true" ]]; then
+          echo "Removing Ant..."
+          apt_purge ant
+          safe_rm /usr/share/ant
+          remove_binary ant
+          update_progress "Ant removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_PHP" == "true" ]]; then
+          echo "Removing PHP tooling..."
+          apt_purge 'php.*'
+          apt_purge composer phpunit
+          safe_rm /etc/php
+          safe_rm /usr/share/php
+          remove_binary php
+          remove_binary composer
+          remove_binary phpunit
+          update_progress "PHP removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_POSTGRESQL" == "true" ]]; then
+          echo "Removing PostgreSQL..."
+          apt_purge '^postgresql-.*'
+          safe_rm /var/lib/postgresql
+          safe_rm /etc/postgresql
+          safe_rm /usr/lib/postgresql
+          update_progress "PostgreSQL removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_MYSQL" == "true" ]]; then
+          echo "Removing MySQL/MariaDB..."
+          apt_purge '^mysql-.*' '^mariadb-.*'
+          safe_rm /var/lib/mysql
+          safe_rm /etc/mysql
+          update_progress "MySQL removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_APACHE" == "true" ]]; then
+          echo "Removing Apache HTTP Server..."
+          apt_purge apache2 apache2-utils apache2-bin
+          safe_rm /etc/apache2
+          safe_rm /var/www
+          update_progress "Apache removal" "completed"
+        fi
+
+        if [[ "$COMPONENT_NGINX" == "true" ]]; then
+          echo "Removing Nginx..."
+          apt_purge nginx nginx-common
+          safe_rm /etc/nginx
+          update_progress "Nginx removal" "completed"
+        fi
+
+        if [[ "$APT_DIRTY" == "1" ]]; then
           sudo apt-get autoremove -y 2>/dev/null || true
           sudo apt-get clean 2>/dev/null || true
-          update_progress "PowerShell removal" "completed"
         fi
 
         echo
@@ -398,6 +1193,13 @@ runs:
 
         echo "=== System Cleanup ==="
         PIDS=()
+
+        safe_rm() {
+          local target="$1"
+          if [[ -n "$target" && "$target" != "/" ]]; then
+            sudo rm -rf "$target" 2>/dev/null || true
+          fi
+        }
 
         if [[ "$COMPONENT_DOCKER_IMAGES" == "true" ]]; then
           {
@@ -425,6 +1227,23 @@ runs:
         for pid in "${PIDS[@]}"; do
           wait "$pid"
         done
+
+        if [[ "$COMPONENT_DOCKER_ENGINE" == "true" ]]; then
+          echo "Removing Docker Engine..."
+          sudo systemctl stop docker 2>/dev/null || true
+          sudo systemctl stop containerd 2>/dev/null || true
+          sudo apt-get purge -y docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin moby-engine moby-cli \
+            2>/dev/null || true
+          sudo rm -f /usr/bin/docker /usr/local/bin/docker 2>/dev/null || true
+          safe_rm /var/lib/docker
+          safe_rm /var/lib/containerd
+          safe_rm /etc/docker
+          safe_rm /usr/lib/docker
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          update_progress "Docker Engine removal" "completed"
+        fi
 
         echo "System cleanup phase completed"
         echo
