@@ -16,6 +16,7 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 - [Inputs reference](#inputs-reference)
 - [Compatibility](#compatibility)
 - [Contributing](#contributing)
+- [Migration Guide](#migration-guide)
 - [Security](#security)
 - [Support](#support)
 - [License](#license)
@@ -52,7 +53,7 @@ jobs:
         # NOTE: Use a specific tag or commit shasum for immutability
         uses: justinthelaw/maximize-github-runner-space@latest
         with:
-          skip-components: java,browsers
+          skip-components: java,browsers,docker-engine
 
       - name: Continue With Your Build
         run: echo "Build steps go here"
@@ -93,6 +94,7 @@ jobs:
 - Enables all cleanup components.
 - Use `skip-components` to keep specific tools.
 - Best choice when disk pressure is severe and you know exactly what must remain installed.
+- If you need Docker later in your job, keep `docker-engine`.
 
 ### `cleanup-profile: custom`
 
@@ -101,41 +103,179 @@ jobs:
 
 `skip-components` accepts a comma-separated list. Current component names:
 
-- `dotnet`
-- `android`
-- `haskell`
-- `codeql`
-- `cached-tools`
-- `swapfile`
-- `swift`
-- `julia`
-- `java`
-- `browsers`
-- `powershell`
-- `docker-images`
-- `large-packages`
+```text
+dotnet
+android
+haskell
+codeql
+cached-tools
+cached-go
+cached-node
+cached-python
+cached-pypy
+cached-ruby
+swapfile
+swift
+julia
+java
+browsers
+chrome
+chromium
+edge
+firefox
+webdrivers
+selenium
+powershell
+miniconda
+homebrew
+vcpkg
+aws-cli
+aws-sam-cli
+azure-cli
+gh-cli
+gcloud-cli
+azcopy
+kubectl
+helm
+kind
+minikube
+kustomize
+docker-engine
+buildah
+podman
+maven
+gradle
+ant
+php
+rust
+postgresql
+mysql
+apache
+nginx
+docker-images
+large-packages
+```
 
 ## Inputs reference
 
-Estimated savings are based on the latest passing CI matrix runs for this repository and should be treated as directional guidance (runner image updates can shift these numbers over time).
+All `remove-*` inputs are optional toggles. In `cleanup-profile: max`, every component below is enabled unless listed in `skip-components`.
 
-| Input                   | Default | Description                                                    |
-| ----------------------- | ------- | -------------------------------------------------------------- |
-| `cleanup-profile`       | `max`   | Cleanup mode: `max` (default) or `custom`.                     |
-| `skip-components`       | N/A     | Comma-separated components to keep when `cleanup-profile=max`. |
-| `remove-dotnet`         | `false` | Remove .NET runtime and libraries (~1.5–2.0 GB).              |
-| `remove-android`        | `false` | Remove Android SDKs and tools (~10–14 GB).                    |
-| `remove-haskell`        | `false` | Remove GHC (Haskell) artifacts (~2–4 GB).                     |
-| `remove-codeql`         | `false` | Remove CodeQL action bundles (~2–3 GB).                       |
-| `remove-cached-tools`   | `false` | Remove setup-action tool cache (~5–8 GB).                     |
-| `remove-swapfile`       | `false` | Disable and remove swapfile (~4 GB).                          |
-| `remove-swift`          | `false` | Remove Swift toolchain files (~2.0–2.5 GB).                   |
-| `remove-julia`          | `false` | Remove Julia binaries and libraries (~300–700 MB).            |
-| `remove-java`           | `false` | Purge OpenJDK packages (~1.0–1.5 GB).                         |
-| `remove-browsers`       | `false` | Purge browsers and webdriver packages (~1.5–2.0 GB).          |
-| `remove-powershell`     | `false` | Purge the PowerShell package (~150–250 MB).                   |
-| `remove-docker-images`  | `false` | Remove cached Docker images (~3–6 GB).                        |
-| `remove-large-packages` | `false` | Purge additional large apt packages (~1–3 GB).                |
+### Profiles and global options
+
+| Input             | Default | Description                                                    |
+| ----------------- | ------- | -------------------------------------------------------------- |
+| `cleanup-profile` | `max`   | Cleanup mode: `max` (default) or `custom`.                     |
+| `skip-components` | N/A     | Comma-separated components to keep when `cleanup-profile=max`. |
+
+### Component toggles
+
+Each row lists the `remove-*` input, its `skip-components` name, and the primary removal targets.
+For grouped areas like browsers and toolcache, listing a subcomponent in `skip-components` automatically disables the group removal so only non-skipped subcomponents are removed.
+
+**Toolchains and SDKs**
+
+| Input            | Component | Removes                                                                                          |
+| ---------------- | --------- | ------------------------------------------------------------------------------------------------ |
+| `remove-dotnet`  | `dotnet`  | `/usr/share/dotnet`, `/usr/lib/dotnet`, `/etc/dotnet`, toolcache `dotnet`, `~/.dotnet`           |
+| `remove-android` | `android` | `/usr/local/lib/android`, `/usr/local/share/android`, `/opt/android*`, `~/.android`, `~/.gradle` |
+| `remove-haskell` | `haskell` | `/opt/ghc`, `/usr/local/.ghcup`, toolcache `ghc`                                                 |
+| `remove-swift`   | `swift`   | `/usr/share/swift`, `/usr/local/share/swift`, `/usr/lib/swift`, toolcache `swift`                |
+| `remove-julia`   | `julia`   | `/usr/local/julia*`, `/usr/share/julia`, toolcache `Julia`                                       |
+| `remove-java`    | `java`    | `openjdk-*` packages, `/usr/lib/jvm`, toolcache `Java`                                           |
+| `remove-rust`    | `rust`    | `/usr/local/rustup`, `/usr/local/cargo`, `~/.cargo`, `~/.rustup`, `rustc/cargo` binaries         |
+
+**Code scanning**
+
+| Input           | Component | Removes                    |
+| --------------- | --------- | -------------------------- |
+| `remove-codeql` | `codeql`  | toolcache `CodeQL` bundles |
+
+**Toolcache (global and per-language)**
+
+| Input                  | Component       | Removes                                      |
+| ---------------------- | --------------- | -------------------------------------------- |
+| `remove-cached-tools`  | `cached-tools`  | Entire toolcache directory (recreated empty) |
+| `remove-cached-go`     | `cached-go`     | toolcache `Go`                               |
+| `remove-cached-node`   | `cached-node`   | toolcache `node`                             |
+| `remove-cached-python` | `cached-python` | toolcache `Python`                           |
+| `remove-cached-pypy`   | `cached-pypy`   | toolcache `PyPy`                             |
+| `remove-cached-ruby`   | `cached-ruby`   | toolcache `Ruby`                             |
+
+**Package managers**
+
+| Input              | Component   | Removes                               |
+| ------------------ | ----------- | ------------------------------------- |
+| `remove-miniconda` | `miniconda` | `CONDA` root, `~/.conda`, conda cache |
+| `remove-homebrew`  | `homebrew`  | `/home/linuxbrew`                     |
+| `remove-vcpkg`     | `vcpkg`     | `/usr/local/share/vcpkg`              |
+
+**Browsers and drivers**
+
+| Input               | Component    | Removes                                                                 |
+| ------------------- | ------------ | ----------------------------------------------------------------------- |
+| `remove-browsers`   | `browsers`   | Chrome, Edge, Firefox, Chromium, webdrivers, Selenium artifacts         |
+| `remove-chrome`     | `chrome`     | `google-chrome-stable` package, `/opt/google/chrome`, chrome binaries   |
+| `remove-chromium`   | `chromium`   | `chromium-*` packages, `/usr/lib/chromium`, chromium binaries           |
+| `remove-edge`       | `edge`       | `microsoft-edge-stable` package, `/opt/microsoft/msedge`, edge binaries |
+| `remove-firefox`    | `firefox`    | `firefox` package/snap, `/usr/lib/firefox`, firefox binary              |
+| `remove-webdrivers` | `webdrivers` | chromedriver, geckodriver, msedgedriver and driver dirs                 |
+| `remove-selenium`   | `selenium`   | `/usr/share/java/selenium-server.jar`                                   |
+
+**Cloud CLIs**
+
+| Input                | Component     | Removes                                                                          |
+| -------------------- | ------------- | -------------------------------------------------------------------------------- |
+| `remove-aws-cli`     | `aws-cli`     | `/usr/local/aws-cli`, `aws` binary                                               |
+| `remove-aws-sam-cli` | `aws-sam-cli` | `/usr/local/aws-sam-cli`, `sam` binary                                           |
+| `remove-azure-cli`   | `azure-cli`   | `azure-cli` package, `/opt/az`, `az` binary                                      |
+| `remove-gh-cli`      | `gh-cli`      | `gh` package and binary                                                          |
+| `remove-gcloud-cli`  | `gcloud-cli`  | `google-cloud-*` packages, `/usr/lib/google-cloud-sdk`, `gcloud/gsutil` binaries |
+| `remove-azcopy`      | `azcopy`      | `azcopy` binary                                                                  |
+
+**Kubernetes and DevOps**
+
+| Input              | Component   | Removes            |
+| ------------------ | ----------- | ------------------ |
+| `remove-kubectl`   | `kubectl`   | `kubectl` binary   |
+| `remove-helm`      | `helm`      | `helm` binary      |
+| `remove-kind`      | `kind`      | `kind` binary      |
+| `remove-minikube`  | `minikube`  | `minikube` binary  |
+| `remove-kustomize` | `kustomize` | `kustomize` binary |
+
+**Containers**
+
+| Input                  | Component       | Removes                                                            |
+| ---------------------- | --------------- | ------------------------------------------------------------------ |
+| `remove-docker-images` | `docker-images` | cached Docker images, build cache, volumes                         |
+| `remove-docker-engine` | `docker-engine` | Docker packages, `/var/lib/docker`, `/etc/docker`, `docker` binary |
+| `remove-buildah`       | `buildah`       | `buildah` package and binary                                       |
+| `remove-podman`        | `podman`        | `podman` package and binary, `/var/lib/containers`                 |
+
+**Project/build tools**
+
+| Input           | Component | Removes                                                     |
+| --------------- | --------- | ----------------------------------------------------------- |
+| `remove-maven`  | `maven`   | `maven` package, `/usr/share/maven`, `mvn` binary           |
+| `remove-gradle` | `gradle`  | `gradle` package, `/usr/share/gradle`, `gradle` binary      |
+| `remove-ant`    | `ant`     | `ant` package, `/usr/share/ant`, `ant` binary               |
+| `remove-php`    | `php`     | `php*` packages, composer/phpunit, `/etc/php`, `php` binary |
+
+**Services and databases**
+
+| Input               | Component    | Removes                                                          |
+| ------------------- | ------------ | ---------------------------------------------------------------- |
+| `remove-postgresql` | `postgresql` | `postgresql*` packages, `/var/lib/postgresql`, `/etc/postgresql` |
+| `remove-mysql`      | `mysql`      | `mysql*/mariadb*` packages, `/var/lib/mysql`, `/etc/mysql`       |
+| `remove-apache`     | `apache`     | `apache2*` packages, `/etc/apache2`, `/var/www`                  |
+| `remove-nginx`      | `nginx`      | `nginx*` packages, `/etc/nginx`                                  |
+
+**Misc**
+
+| Input                   | Component        | Removes                                              |
+| ----------------------- | ---------------- | ---------------------------------------------------- |
+| `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                  |
+| `remove-swapfile`       | `swapfile`       | swapfile at `/mnt/swapfile` and swap entry           |
+| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs) |
 
 ## Compatibility
 
@@ -145,15 +285,19 @@ Estimated savings are based on the latest passing CI matrix runs for this reposi
 
 ## Contributing
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for development and release workflow details.
+See [CONTRIBUTING guide](/docs/CONTRIBUTING.md) for development and release workflow details.
+
+## Migration Guide
+
+See [migration guide](/docs/MIGRATIONS.md) for breaking changes between releases.
 
 ## Security
 
-See [docs/SECURITY.md](docs/SECURITY.md) for the security policy and reporting guidance.
+See [security policy](/docs/SECURITY.md) for the security policy and reporting guidance.
 
 ## Support
 
-See [docs/SUPPORT.md](docs/SUPPORT.md) for help and support guidance.
+See [support instructions](/docs/SUPPORT.md) for help and support guidance.
 
 ## License
 

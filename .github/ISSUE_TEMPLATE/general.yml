@@ -1,0 +1,14 @@
+name: General Issue
+description: Share anything that doesn't fit the structured bug or feature templates; fields are optional.
+title: ""
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when the other options feel too prescriptive. No field is required, so you can leave the form blank and add details later.
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details or context (optional)
+      description: Describe the problem, link related runs, or paste logs. Leave this blank if you just want to open a quick note.

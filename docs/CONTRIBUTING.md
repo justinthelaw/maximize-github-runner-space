@@ -2,7 +2,7 @@
 
 Thanks for helping improve **Maximize GitHub Runner Space**.
 
-This document is for action maintainers and contributors. If you only need to use the action, start in the root [README](../README.md).
+This document is for action maintainers and contributors. If you only need to use the action, start in the root [README](/README.md).
 
 ## Project goals
 
@@ -19,6 +19,7 @@ This document is for action maintainers and contributors. If you only need to us
 - `release-please-config.json`: Release Please configuration.
 - `.release-please-manifest.json`: Version manifest for Release Please.
 - `README.md`: End-user usage and input documentation.
+- `docs/MIGRATIONS.md`: Migration notes for breaking changes between releases.
 
 ## Local setup
 
@@ -37,6 +38,7 @@ When you change cleanup behavior:
 1. Update cleanup logic in `action.yml`.
 2. Update or extend verification logic in `.github/workflows/test.yml`.
 3. Update the root `README.md` input docs/examples if behavior changed.
+4. Update `docs/MIGRATIONS.md` if the change is breaking or materially alters defaults.
 
 Important safety notes:
 
