@@ -30,6 +30,7 @@ This action helps by:
 - Reporting disk usage before and after cleanup.
 - Supporting an aggressive default `max` mode (remove almost everything, with optional skips).
 - Supporting an opt-in `custom` mode (remove only selected components).
+- Allowing the runner swapfile to be resized or removed explicitly with a single opt-in input.
 - Running cleanup tasks in parallel to reduce runtime.
 
 ## Quick start
@@ -54,6 +55,7 @@ jobs:
         uses: justinthelaw/maximize-github-runner-space@latest
         with:
           skip-components: java,browsers,docker-engine
+          swapfile-size: 2G
 
       - name: Continue With Your Build
         run: echo "Build steps go here"
@@ -101,6 +103,17 @@ jobs:
 - Nothing is removed unless a `remove-*` input is set to `'true'`.
 - Best choice when you want precise control.
 
+### Swapfile management
+
+Use `swapfile-size` only when you want to change the runner's existing swapfile. If the input is omitted, the action leaves the original swapfile untouched. It accepts:
+
+- `0` to remove `/mnt/swapfile`.
+- Decimal sizes such as `1.5GiB`.
+- Unit-suffixed values such as `512MiB`, `2G`, or `0.5TiB`.
+- A plain number like `2`, which is interpreted as GiB.
+
+If the requested size would exceed the safe free space available on `/mnt`, the action exits with an error and leaves the existing swapfile unchanged. When the size is accepted, the configured swapfile remains available for the rest of the job.
+
 `skip-components` accepts a comma-separated list. Current component names:
 
 ```text
@@ -114,7 +127,6 @@ cached-node
 cached-python
 cached-pypy
 cached-ruby
-swapfile
 swift
 julia
 java
@@ -162,10 +174,11 @@ All `remove-*` inputs are optional toggles. In `cleanup-profile: max`, every com
 
 ### Profiles and global options
 
-| Input             | Default | Description                                                    |
-| ----------------- | ------- | -------------------------------------------------------------- |
-| `cleanup-profile` | `max`   | Cleanup mode: `max` (default) or `custom`.                     |
-| `skip-components` | N/A     | Comma-separated components to keep when `cleanup-profile=max`. |
+| Input             | Default | Description                                                                                   |
+| ----------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `cleanup-profile` | `max`   | Cleanup mode: `max` (default) or `custom`.                                                    |
+| `skip-components` | N/A     | Comma-separated components to keep when `cleanup-profile=max`.                                |
+| `swapfile-size`   | empty   | Optional swapfile size (`0`, `1.5GiB`, `512MiB`, or a plain GiB value like `2`). Leaves swap untouched when omitted. |
 
 ### Component toggles
 
@@ -273,9 +286,9 @@ For grouped areas like browsers and toolcache, listing a subcomponent in `skip-c
 
 | Input                   | Component        | Removes                                              |
 | ----------------------- | ---------------- | ---------------------------------------------------- |
-| `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                  |
-| `remove-swapfile`       | `swapfile`       | swapfile at `/mnt/swapfile` and swap entry           |
-| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs) |
+| `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                                                                 |
+| `swapfile-size`         | N/A              | Reconfigures `/mnt/swapfile` only when set; `0` removes it, otherwise the requested size is applied or the action fails before changing swap |
+| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs)                                            |
 
 ## Compatibility
 

@@ -28,10 +28,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Capture Initial Swapfile State
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          initial_swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          echo "INITIAL_SWAP_BYTES=${initial_swap_bytes}" >> "$GITHUB_ENV"
+
       - name: Custom Profile Test, with No Toggles
         uses: ./
         with:
           cleanup-profile: custom
+
+      - name: Verify Swapfile Left Untouched
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          if [ "$swap_bytes" -ne "$INITIAL_SWAP_BYTES" ]; then
+            echo "Expected swapfile to remain at ${INITIAL_SWAP_BYTES} bytes when swapfile-size is omitted, got ${swap_bytes} bytes"
+            exit 1
+          fi
 
   max-with-skip:
     runs-on: ubuntu-latest
@@ -75,6 +94,90 @@ jobs:
             exit 1
           fi
 
+
+  swapfile-resize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resize Swapfile
+        uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: 1.5GiB
+
+      - name: Verify Resized Swapfile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          if [ "$swap_bytes" -ne $((3 * 1024 * 1024 * 1024 / 2)) ]; then
+            echo "Expected /mnt/swapfile to be 1.5 GiB, got ${swap_bytes} bytes"
+            exit 1
+          fi
+
+  swapfile-remove:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Remove Swapfile via Size Input
+        uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: 0
+
+      - name: Verify Swapfile Removal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f "/mnt/swapfile" ] || swapon --show | grep -q '/mnt/swapfile'; then
+            echo 'Swapfile was not removed by swapfile-size=0'
+            exit 1
+          fi
+
+  swapfile-oversize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Capture Initial Swapfile Size
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          initial_swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          echo "INITIAL_SWAP_BYTES=${initial_swap_bytes}" >> "$GITHUB_ENV"
+
+      - name: Request Oversized Swapfile
+        id: oversized_swap
+        continue-on-error: true
+        uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: 1000TiB
+
+      - name: Verify Oversized Request Fails And Keeps Existing Swapfile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.oversized_swap.outcome }}" != "failure" ]; then
+            echo 'Expected oversized swapfile request to fail'
+            exit 1
+          fi
+
+          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          if [ "$swap_bytes" -ne "$INITIAL_SWAP_BYTES" ]; then
+            echo "Expected oversized swapfile request to keep ${INITIAL_SWAP_BYTES} bytes, got ${swap_bytes} bytes"
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -92,7 +195,6 @@ jobs:
           - remove-cached-python
           - remove-cached-pypy
           - remove-cached-ruby
-          - remove-swapfile
           - remove-swift
           - remove-julia
           - remove-java
@@ -151,7 +253,6 @@ jobs:
           remove-cached-python: ${{ matrix.option == 'remove-cached-python' && 'true' || 'false' }}
           remove-cached-pypy: ${{ matrix.option == 'remove-cached-pypy' && 'true' || 'false' }}
           remove-cached-ruby: ${{ matrix.option == 'remove-cached-ruby' && 'true' || 'false' }}
-          remove-swapfile: ${{ matrix.option == 'remove-swapfile' && 'true' || 'false' }}
           remove-swift: ${{ matrix.option == 'remove-swift' && 'true' || 'false' }}
           remove-julia: ${{ matrix.option == 'remove-julia' && 'true' || 'false' }}
           remove-java: ${{ matrix.option == 'remove-java' && 'true' || 'false' }}
@@ -237,12 +338,6 @@ jobs:
               tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
               if [ -d "$tools_dir" ] && [ "$(ls -A "$tools_dir")" != "" ]; then
                 echo 'Cached tools were not removed'
-                exit 1
-              fi
-              ;;
-            remove-swapfile)
-              if [ -f "/mnt/swapfile" ] || swapon --show | grep -q '/mnt/swapfile'; then
-                echo 'Swapfile was not removed'
                 exit 1
               fi
               ;;

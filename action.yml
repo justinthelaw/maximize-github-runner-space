@@ -35,10 +35,10 @@ inputs:
     description: "Removes cached setup-action tools. (frees ~8 GB)"
     required: false
     default: "false"
-  remove-swapfile:
-    description: "Removes the swapfile. (frees ~4 GB)"
+  swapfile-size:
+    description: "Optional swapfile size. Accepts 0, 1.5GiB, 512MiB, or a plain GiB value like 2. Leaves the runner swapfile untouched when omitted."
     required: false
-    default: "false"
+    default: ""
 
   # Additional high-impact removals
   remove-swift:
@@ -257,7 +257,7 @@ runs:
         REMOVE_HASKELL: ${{ inputs.remove-haskell }}
         REMOVE_CODEQL: ${{ inputs.remove-codeql }}
         REMOVE_CACHED_TOOLS: ${{ inputs.remove-cached-tools }}
-        REMOVE_SWAPFILE: ${{ inputs.remove-swapfile }}
+        SWAPFILE_SIZE: ${{ inputs.swapfile-size }}
         REMOVE_SWIFT: ${{ inputs.remove-swift }}
         REMOVE_JULIA: ${{ inputs.remove-julia }}
         REMOVE_JAVA: ${{ inputs.remove-java }}
@@ -315,6 +315,12 @@ runs:
           [[ ",${csv}," == *",${item},"* ]]
         }
 
+        parse_swapfile_size_bytes() {
+          local raw="${1:-}"
+
+          python3 -c $'import re\nimport sys\nfrom decimal import Decimal, InvalidOperation, ROUND_HALF_UP\n\nraw = sys.argv[1].strip()\nmatch = re.fullmatch(r"([0-9]+(?:\\.[0-9]+)?)([kmgt]i?b?)?", raw, re.IGNORECASE)\nif not match:\n    raise SystemExit(1)\n\ntry:\n    value = Decimal(match.group(1))\nexcept InvalidOperation:\n    raise SystemExit(1)\n\nif value < 0:\n    raise SystemExit(1)\n\nunit = (match.group(2) or "gib").lower()\nmultipliers = {\n    "k": 1024,\n    "kb": 1024,\n    "ki": 1024,\n    "kib": 1024,\n    "m": 1024 ** 2,\n    "mb": 1024 ** 2,\n    "mi": 1024 ** 2,\n    "mib": 1024 ** 2,\n    "g": 1024 ** 3,\n    "gb": 1024 ** 3,\n    "gi": 1024 ** 3,\n    "gib": 1024 ** 3,\n    "t": 1024 ** 4,\n    "tb": 1024 ** 4,\n    "ti": 1024 ** 4,\n    "tib": 1024 ** 4,\n}\n\nbytes_value = (value * multipliers[unit]).to_integral_value(rounding=ROUND_HALF_UP)\nprint(int(bytes_value))' "$raw"
+        }
+
         should_enable() {
           local component="$1"
           local custom_value="$2"
@@ -352,7 +358,22 @@ runs:
         COMPONENT_ANDROID=$(should_enable "android" "${REMOVE_ANDROID}")
         COMPONENT_HASKELL=$(should_enable "haskell" "${REMOVE_HASKELL}")
         COMPONENT_CODEQL=$(should_enable "codeql" "${REMOVE_CODEQL}")
-        COMPONENT_SWAPFILE=$(should_enable "swapfile" "${REMOVE_SWAPFILE}")
+        COMPONENT_SWAPFILE="false"
+        SWAPFILE_MODE="keep"
+        SWAPFILE_SIZE_INPUT_NORMALIZED=$(echo "${SWAPFILE_SIZE}" | tr -d '[:space:]')
+        SWAPFILE_DESIRED_BYTES=""
+        if [[ -n "${SWAPFILE_SIZE_INPUT_NORMALIZED}" ]]; then
+          SWAPFILE_DESIRED_BYTES=$(parse_swapfile_size_bytes "${SWAPFILE_SIZE_INPUT_NORMALIZED}") || {
+            echo "::error::Invalid swapfile-size '${SWAPFILE_SIZE}'. Use values like 0, 1.5GiB, 512MiB, or 2."
+            exit 1
+          }
+          COMPONENT_SWAPFILE="true"
+          if [[ "${SWAPFILE_DESIRED_BYTES}" == "0" ]]; then
+            SWAPFILE_MODE="remove"
+          else
+            SWAPFILE_MODE="ensure"
+          fi
+        fi
         COMPONENT_SWIFT=$(should_enable "swift" "${REMOVE_SWIFT}")
         COMPONENT_JULIA=$(should_enable "julia" "${REMOVE_JULIA}")
         COMPONENT_JAVA=$(should_enable "java" "${REMOVE_JAVA}")
@@ -455,6 +476,9 @@ runs:
         COMPONENT_CODEQL=${COMPONENT_CODEQL}
         COMPONENT_CACHED_TOOLS=${COMPONENT_CACHED_TOOLS}
         COMPONENT_SWAPFILE=${COMPONENT_SWAPFILE}
+        SWAPFILE_MODE=${SWAPFILE_MODE}
+        SWAPFILE_DESIRED_BYTES=${SWAPFILE_DESIRED_BYTES}
+        SWAPFILE_SIZE_INPUT_NORMALIZED=${SWAPFILE_SIZE_INPUT_NORMALIZED}
         COMPONENT_SWIFT=${COMPONENT_SWIFT}
         COMPONENT_JULIA=${COMPONENT_JULIA}
         COMPONENT_JAVA=${COMPONENT_JAVA}
@@ -592,13 +616,15 @@ runs:
           echo "No cleanup options selected; this run will only report disk space."
         fi
 
-        echo -n "Scheduled for removal: "
+        echo -n "Scheduled operations: "
         [[ "$COMPONENT_DOTNET" == "true" ]] && echo -n "dotnet "
         [[ "$COMPONENT_ANDROID" == "true" ]] && echo -n "android "
         [[ "$COMPONENT_HASKELL" == "true" ]] && echo -n "haskell "
         [[ "$COMPONENT_CODEQL" == "true" ]] && echo -n "codeql "
         [[ "$COMPONENT_CACHED_TOOLS" == "true" ]] && echo -n "cached-tools "
-        [[ "$COMPONENT_SWAPFILE" == "true" ]] && echo -n "swapfile "
+        if [[ "$COMPONENT_SWAPFILE" == "true" ]]; then
+          echo -n "swapfile(${SWAPFILE_SIZE_INPUT_NORMALIZED}) "
+        fi
         [[ "$COMPONENT_SWIFT" == "true" ]] && echo -n "swift "
         [[ "$COMPONENT_JULIA" == "true" ]] && echo -n "julia "
         [[ "$COMPONENT_JAVA" == "true" ]] && echo -n "java "
@@ -1214,10 +1240,87 @@ runs:
 
         if [[ "$COMPONENT_SWAPFILE" == "true" ]]; then
           {
-            echo "Removing swapfile..."
-            sudo swapoff -a 2>/dev/null || true
-            sudo rm -f /mnt/swapfile 2>/dev/null || true
-            update_progress "Swapfile removal" "completed"
+            humanize_bytes() {
+              numfmt --to=iec --suffix=B "$1"
+            }
+
+            disable_managed_swapfile() {
+              if swapon --show=NAME --noheadings 2>/dev/null | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+                sudo swapoff /mnt/swapfile 2>/dev/null || true
+              fi
+            }
+
+            remove_managed_swapfile() {
+              disable_managed_swapfile
+              sudo sed -i '\|^/mnt/swapfile[[:space:]]\+none[[:space:]]\+swap[[:space:]]|d' /etc/fstab 2>/dev/null || true
+              sudo rm -f /mnt/swapfile 2>/dev/null || true
+            }
+
+            select_swapfile_size() {
+              local requested_bytes="$1"
+              local existing_bytes=0
+              local available_bytes reserve_bytes max_target_bytes
+
+              if [[ -f /mnt/swapfile ]]; then
+                existing_bytes=$(stat -c %s /mnt/swapfile 2>/dev/null || echo 0)
+              fi
+
+              available_bytes=$(df --output=avail -B1 /mnt | tail -n1 | tr -d '[:space:]')
+              reserve_bytes=$((512 * 1024 * 1024))
+              max_target_bytes=$((available_bytes + existing_bytes - reserve_bytes))
+              if (( max_target_bytes < 0 )); then
+                max_target_bytes=0
+              fi
+
+              if (( requested_bytes <= max_target_bytes )); then
+                echo "$requested_bytes"
+                return 0
+              fi
+
+              echo "::error::Requested swapfile-size $(humanize_bytes "$requested_bytes") exceeds the safe free space available on /mnt. Existing swapfile left unchanged." >&2
+              return 1
+            }
+
+            create_swapfile() {
+              local target_bytes="$1"
+              local mib_count remainder_bytes
+
+              remove_managed_swapfile
+
+              echo "Creating swapfile at /mnt/swapfile with size $(humanize_bytes "$target_bytes")..."
+              if ! sudo fallocate -l "$target_bytes" /mnt/swapfile 2>/dev/null; then
+                mib_count=$((target_bytes / 1024 / 1024))
+                if (( mib_count > 0 )); then
+                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count="$mib_count" status=none
+                else
+                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1 count=0 status=none
+                fi
+                remainder_bytes=$((target_bytes - mib_count * 1024 * 1024))
+                if (( remainder_bytes > 0 )); then
+                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1 count="$remainder_bytes" seek=$((mib_count * 1024 * 1024)) conv=notrunc status=none
+                fi
+              fi
+
+              sudo chmod 600 /mnt/swapfile
+              sudo mkswap /mnt/swapfile >/dev/null
+              sudo swapon /mnt/swapfile
+              if ! grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
+                echo '/mnt/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+              fi
+            }
+
+            if [[ "$SWAPFILE_MODE" == "remove" ]]; then
+              echo "Removing swapfile..."
+              remove_managed_swapfile
+              update_progress "Swapfile management" "removed"
+            elif [[ "$SWAPFILE_MODE" == "ensure" ]]; then
+              selected_swapfile_size=$(select_swapfile_size "$SWAPFILE_DESIRED_BYTES")
+              create_swapfile "$selected_swapfile_size"
+              update_progress "Swapfile management" "configured"
+            else
+              update_progress "Swapfile management" "skipped"
+            fi
+
             echo "Updated memory status:"
             free -h
           } &
