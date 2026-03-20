@@ -33,8 +33,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          initial_swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
-          echo "INITIAL_SWAP_BYTES=${initial_swap_bytes}" >> "$GITHUB_ENV"
+          if [ -f "/mnt/swapfile" ]; then
+            echo "INITIAL_SWAPFILE_PRESENT=1" >> "$GITHUB_ENV"
+            echo "INITIAL_SWAPFILE_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
+          else
+            echo "INITIAL_SWAPFILE_PRESENT=0" >> "$GITHUB_ENV"
+            echo "INITIAL_SWAPFILE_BYTES=0" >> "$GITHUB_ENV"
+          fi
+
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+            echo "INITIAL_SWAPFILE_ACTIVE=1" >> "$GITHUB_ENV"
+          else
+            echo "INITIAL_SWAPFILE_ACTIVE=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Custom Profile Test, with No Toggles
         uses: ./
@@ -46,9 +57,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
-          if [ "$swap_bytes" -ne "$INITIAL_SWAP_BYTES" ]; then
-            echo "Expected swapfile to remain at ${INITIAL_SWAP_BYTES} bytes when swapfile-size is omitted, got ${swap_bytes} bytes"
+          if [ -f "/mnt/swapfile" ]; then
+            current_present=1
+            current_bytes=$(stat -c %s /mnt/swapfile)
+          else
+            current_present=0
+            current_bytes=0
+          fi
+
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+            current_active=1
+          else
+            current_active=0
+          fi
+
+          if [ "$current_present" != "$INITIAL_SWAPFILE_PRESENT" ] || \
+             [ "$current_bytes" != "$INITIAL_SWAPFILE_BYTES" ] || \
+             [ "$current_active" != "$INITIAL_SWAPFILE_ACTIVE" ]; then
+            echo "Expected swapfile state to remain unchanged when swapfile-size is omitted. Initial: present=${INITIAL_SWAPFILE_PRESENT}, bytes=${INITIAL_SWAPFILE_BYTES}, active=${INITIAL_SWAPFILE_ACTIVE}. Current: present=${current_present}, bytes=${current_bytes}, active=${current_active}."
             exit 1
           fi
 
@@ -112,9 +138,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
+          if [ ! -f "/mnt/swapfile" ]; then
+            echo 'Expected /mnt/swapfile to be created'
+            exit 1
+          fi
+
+          swap_bytes=$(stat -c %s /mnt/swapfile)
           if [ "$swap_bytes" -ne $((3 * 1024 * 1024 * 1024 / 2)) ]; then
             echo "Expected /mnt/swapfile to be 1.5 GiB, got ${swap_bytes} bytes"
+            exit 1
+          fi
+
+          if ! swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+            echo 'Expected /mnt/swapfile to be active swap'
             exit 1
           fi
 
@@ -146,13 +182,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Capture Initial Swapfile Size
+      - name: Capture Initial Swapfile State
         shell: bash
         run: |
           set -euo pipefail
 
-          initial_swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
-          echo "INITIAL_SWAP_BYTES=${initial_swap_bytes}" >> "$GITHUB_ENV"
+          if [ -f "/mnt/swapfile" ]; then
+            echo "INITIAL_SWAPFILE_PRESENT=1" >> "$GITHUB_ENV"
+            echo "INITIAL_SWAPFILE_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
+          else
+            echo "INITIAL_SWAPFILE_PRESENT=0" >> "$GITHUB_ENV"
+            echo "INITIAL_SWAPFILE_BYTES=0" >> "$GITHUB_ENV"
+          fi
+
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+            echo "INITIAL_SWAPFILE_ACTIVE=1" >> "$GITHUB_ENV"
+          else
+            echo "INITIAL_SWAPFILE_ACTIVE=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Request Oversized Swapfile
         id: oversized_swap
@@ -172,9 +219,24 @@ jobs:
             exit 1
           fi
 
-          swap_bytes=$(swapon --show=NAME,SIZE --bytes --noheadings | awk '$1 == "/mnt/swapfile" { print $2; found=1 } END { if (!found) exit 1 }')
-          if [ "$swap_bytes" -ne "$INITIAL_SWAP_BYTES" ]; then
-            echo "Expected oversized swapfile request to keep ${INITIAL_SWAP_BYTES} bytes, got ${swap_bytes} bytes"
+          if [ -f "/mnt/swapfile" ]; then
+            current_present=1
+            current_bytes=$(stat -c %s /mnt/swapfile)
+          else
+            current_present=0
+            current_bytes=0
+          fi
+
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+            current_active=1
+          else
+            current_active=0
+          fi
+
+          if [ "$current_present" != "$INITIAL_SWAPFILE_PRESENT" ] || \
+             [ "$current_bytes" != "$INITIAL_SWAPFILE_BYTES" ] || \
+             [ "$current_active" != "$INITIAL_SWAPFILE_ACTIVE" ]; then
+            echo "Expected oversized swapfile request to keep the initial swap state. Initial: present=${INITIAL_SWAPFILE_PRESENT}, bytes=${INITIAL_SWAPFILE_BYTES}, active=${INITIAL_SWAPFILE_ACTIVE}. Current: present=${current_present}, bytes=${current_bytes}, active=${current_active}."
             exit 1
           fi
 
