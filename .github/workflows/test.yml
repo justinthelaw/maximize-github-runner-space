@@ -120,6 +120,138 @@ jobs:
             exit 1
           fi
 
+  max-skip-cached-node-precedence:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Capture Pre-Action Toolcache State
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
+          echo "TOOLS_DIR=${tools_dir}" >> "$GITHUB_ENV"
+
+          if [ -d "${tools_dir}/node" ] || [ -d "${tools_dir}/Node" ]; then
+            echo "NODE_CACHE_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "NODE_CACHE_PRE=0" >> "$GITHUB_ENV"
+          fi
+
+          if [ -d "${tools_dir}/Python" ] || [ -d "${tools_dir}/python" ]; then
+            echo "PYTHON_CACHE_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON_CACHE_PRE=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Max Profile Skip Cached Node
+        uses: ./
+        with:
+          cleanup-profile: max
+          skip-components: "  CACHED-Node  "
+
+      - name: Verify Cached Node Is Kept But Cached Python Can Be Removed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${NODE_CACHE_PRE}" = "1" ] && [ ! -d "${TOOLS_DIR}/node" ] && [ ! -d "${TOOLS_DIR}/Node" ]; then
+            echo 'Node toolcache should have been skipped but is missing'
+            exit 1
+          fi
+
+          if [ "${PYTHON_CACHE_PRE}" = "1" ] && ([ -d "${TOOLS_DIR}/Python" ] || [ -d "${TOOLS_DIR}/python" ]); then
+            echo 'Python toolcache should have been removed when only cached-node is skipped'
+            exit 1
+          fi
+
+  max-skip-firefox-precedence:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Capture Pre-Action Browser State
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v firefox >/dev/null 2>&1; then
+            echo "FIREFOX_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "FIREFOX_PRE=0" >> "$GITHUB_ENV"
+          fi
+
+          if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then
+            echo "CHROME_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "CHROME_PRE=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Max Profile Skip Firefox
+        uses: ./
+        with:
+          cleanup-profile: max
+          skip-components: "  FireFox "
+
+      - name: Verify Firefox Is Kept But Chrome Can Be Removed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${FIREFOX_PRE}" = "1" ] && ! command -v firefox >/dev/null 2>&1; then
+            echo 'Firefox should have been skipped but is missing'
+            exit 1
+          fi
+
+          if [ "${CHROME_PRE}" = "1" ] && (command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1); then
+            echo 'Chrome should have been removed when only firefox is skipped'
+            exit 1
+          fi
+
+  custom-grouped-subgroup-precedence:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Capture Pre-Action Browser State
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v firefox >/dev/null 2>&1; then
+            echo "FIREFOX_PRE=1" >> "$GITHUB_ENV"
+          else
+            echo "FIREFOX_PRE=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Custom Profile Grouped + Subgroup Browsers
+        uses: ./
+        with:
+          cleanup-profile: custom
+          remove-browsers: "true"
+          remove-firefox: "true"
+
+      - name: Verify Grouped Browser Removal Takes Precedence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_ops=1
+          actual_ops="$(cat /tmp/total_ops)"
+          if [ "${actual_ops}" -ne "${expected_ops}" ]; then
+            echo "Expected grouped cleanup precedence to schedule ${expected_ops} operation, got ${actual_ops}"
+            exit 1
+          fi
+
+          if [ "${FIREFOX_PRE}" = "1" ] && command -v firefox >/dev/null 2>&1; then
+            echo 'Firefox should be removed by grouped browser cleanup'
+            exit 1
+          fi
+
   invalid-input-validation:
     runs-on: ubuntu-latest
     strategy:

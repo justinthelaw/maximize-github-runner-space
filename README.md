@@ -187,6 +187,15 @@ All `remove-*` inputs are optional toggles. In `cleanup-profile: max`, every com
 Each row lists the `remove-*` input, its `skip-components` name, and the primary removal targets.
 For grouped areas like browsers and toolcache, listing a subcomponent in `skip-components` automatically disables the group removal so only non-skipped subcomponents are removed.
 
+### CI-verified interaction guarantees
+
+The CI workflow includes targeted interaction tests beyond single-input toggles. These lock in:
+
+- `cleanup-profile: max` + `skip-components: cached-node` keeps Node toolcache while still allowing other toolcache families (for example Python) to be removed.
+- `cleanup-profile: max` + `skip-components: firefox` keeps Firefox while still allowing other browser artifacts (for example Chrome) to be removed.
+- `cleanup-profile: custom` + `remove-browsers: "true"` + `remove-firefox: "true"` uses grouped precedence (`remove-browsers`) so subgroup removals are not scheduled separately.
+- `skip-components` normalization behavior for whitespace and mixed case values.
+
 **Toolchains and SDKs**
 
 | Input            | Component | Removes                                                                                          |

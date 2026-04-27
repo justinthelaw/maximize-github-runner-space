@@ -13,7 +13,7 @@ This document is for action maintainers and contributors. If you only need to us
 ## Repository structure
 
 - `action.yml`: Composite action inputs and cleanup implementation.
-- `.github/workflows/test.yml`: Matrix tests for input behavior and max-profile skip behavior.
+- `.github/workflows/test.yml`: Matrix tests for input behavior, max-profile skip behavior, and grouped/subgroup precedence interactions.
 - `.github/workflows/lint.yml`: Pre-commit checks in CI.
 - `.github/workflows/release.yml`: Automated release PR and tagging flow.
 - `release-please-config.json`: Release Please configuration.
@@ -37,6 +37,7 @@ When you change cleanup behavior:
 
 1. Update cleanup logic in `action.yml`.
 2. Update or extend verification logic in `.github/workflows/test.yml`.
+   - Include targeted interaction coverage whenever you change grouped logic (`browsers` vs subcomponents, `cached-tools` vs per-language caches, or `max` + `skip-components` precedence).
 3. Update the root `README.md` input docs/examples if behavior changed.
 4. Update `docs/MIGRATIONS.md` if the change is breaking or materially alters defaults.
 

@@ -9,7 +9,7 @@
 ## Repository Map
 
 - `action.yml`: Action metadata, inputs, and all cleanup logic.
-- `.github/workflows/test.yml`: CI matrix tests; each run enables exactly one removal input and verifies expected state.
+- `.github/workflows/test.yml`: CI matrix tests plus focused interaction jobs for grouped/subgroup precedence and `skip-components` normalization.
 - `README.md`: User-facing usage and caveats.
 
 ## Scripts / Execution Surfaces
@@ -24,7 +24,7 @@
 - Environment assumptions: GitHub-hosted Ubuntu runner, `bash`, `sudo`, `apt-get`, `docker` available.
 - Operations are destructive (`rm -rf`, package purges, swap resize/removal/recreation when explicitly requested). Keep changes tightly scoped and idempotent.
 - The action uses parallel cleanup jobs and temporary progress files in `/tmp` (`/tmp/total_ops`, `/tmp/completed_ops`, `/tmp/component_flags.env`).
-- Boolean removal inputs default to `'false'`; CI validates behavior one input at a time via matrix and includes dedicated swapfile resize/remove/oversize-failure coverage plus no-input coverage for leaving swap untouched, and those checks must tolerate runners that start with or without `/mnt/swapfile`.
+- Boolean removal inputs default to `'false'`; CI validates behavior one input at a time via matrix, includes dedicated grouped/subgroup precedence and `max` + `skip-components` interaction coverage, and includes swapfile resize/remove/oversize-failure coverage plus no-input coverage for leaving swap untouched. Swap checks must tolerate runners that start with or without `/mnt/swapfile`.
 - When changing removal targets or swapfile behavior, update both:
   - `action.yml` removal logic
   - `.github/workflows/test.yml` verification checks
