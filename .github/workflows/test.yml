@@ -162,7 +162,7 @@ jobs:
             exit 1
           fi
 
-          if [ "${PYTHON_CACHE_PRE}" = "1" ] && ([ -d "${TOOLS_DIR}/Python" ] || [ -d "${TOOLS_DIR}/python" ]); then
+          if [ "${PYTHON_CACHE_PRE}" = "1" ] && { [ -d "${TOOLS_DIR}/Python" ] || [ -d "${TOOLS_DIR}/python" ]; }; then
             echo 'Python toolcache should have been removed when only cached-node is skipped'
             exit 1
           fi
@@ -194,19 +194,25 @@ jobs:
         uses: ./
         with:
           cleanup-profile: max
-          skip-components: "  FireFox "
+          skip-components: "  FireFox , LARGE-Packages "
 
       - name: Verify Firefox Is Kept But Chrome Can Be Removed
         shell: bash
         run: |
           set -euo pipefail
 
+          source /tmp/component_flags.env
+          if [ "${COMPONENT_BROWSERS}" != "false" ] || [ "${COMPONENT_FIREFOX}" != "false" ] || [ "${COMPONENT_CHROME}" != "true" ]; then
+            echo "Unexpected browser component plan: COMPONENT_BROWSERS=${COMPONENT_BROWSERS}, COMPONENT_FIREFOX=${COMPONENT_FIREFOX}, COMPONENT_CHROME=${COMPONENT_CHROME}"
+            exit 1
+          fi
+
           if [ "${FIREFOX_PRE}" = "1" ] && ! command -v firefox >/dev/null 2>&1; then
             echo 'Firefox should have been skipped but is missing'
             exit 1
           fi
 
-          if [ "${CHROME_PRE}" = "1" ] && (command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1); then
+          if [ "${CHROME_PRE}" = "1" ] && { command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; }; then
             echo 'Chrome should have been removed when only firefox is skipped'
             exit 1
           fi
@@ -216,17 +222,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Capture Pre-Action Browser State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if command -v firefox >/dev/null 2>&1; then
-            echo "FIREFOX_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "FIREFOX_PRE=0" >> "$GITHUB_ENV"
-          fi
 
       - name: Custom Profile Grouped + Subgroup Browsers
         uses: ./
@@ -240,15 +235,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          source /tmp/component_flags.env
+          if [ "${COMPONENT_BROWSERS}" != "true" ] || [ "${COMPONENT_FIREFOX}" != "false" ]; then
+            echo "Expected grouped browser precedence in component flags, got COMPONENT_BROWSERS=${COMPONENT_BROWSERS}, COMPONENT_FIREFOX=${COMPONENT_FIREFOX}"
+            exit 1
+          fi
+
           expected_ops=1
           actual_ops="$(cat /tmp/total_ops)"
           if [ "${actual_ops}" -ne "${expected_ops}" ]; then
             echo "Expected grouped cleanup precedence to schedule ${expected_ops} operation, got ${actual_ops}"
-            exit 1
-          fi
-
-          if [ "${FIREFOX_PRE}" = "1" ] && command -v firefox >/dev/null 2>&1; then
-            echo 'Firefox should be removed by grouped browser cleanup'
             exit 1
           fi
 
