@@ -498,62 +498,79 @@ runs:
           TOOLCACHE_DIR="/opt/hostedtoolcache"
         fi
 
-        cat > /tmp/component_flags.env <<FLAGS
-        COMPONENT_DOTNET=${COMPONENT_DOTNET}
-        COMPONENT_ANDROID=${COMPONENT_ANDROID}
-        COMPONENT_HASKELL=${COMPONENT_HASKELL}
-        COMPONENT_CODEQL=${COMPONENT_CODEQL}
-        COMPONENT_CACHED_TOOLS=${COMPONENT_CACHED_TOOLS}
-        COMPONENT_SWAPFILE=${COMPONENT_SWAPFILE}
-        SWAPFILE_MODE=${SWAPFILE_MODE}
-        SWAPFILE_DESIRED_BYTES=${SWAPFILE_DESIRED_BYTES}
-        SWAPFILE_SIZE_INPUT_NORMALIZED=${SWAPFILE_SIZE_INPUT_NORMALIZED}
-        COMPONENT_SWIFT=${COMPONENT_SWIFT}
-        COMPONENT_JULIA=${COMPONENT_JULIA}
-        COMPONENT_JAVA=${COMPONENT_JAVA}
-        COMPONENT_BROWSERS=${COMPONENT_BROWSERS}
-        COMPONENT_POWERSHELL=${COMPONENT_POWERSHELL}
-        COMPONENT_MINICONDA=${COMPONENT_MINICONDA}
-        COMPONENT_HOMEBREW=${COMPONENT_HOMEBREW}
-        COMPONENT_VCPKG=${COMPONENT_VCPKG}
-        COMPONENT_CACHED_GO=${COMPONENT_CACHED_GO}
-        COMPONENT_CACHED_NODE=${COMPONENT_CACHED_NODE}
-        COMPONENT_CACHED_PYTHON=${COMPONENT_CACHED_PYTHON}
-        COMPONENT_CACHED_PYPY=${COMPONENT_CACHED_PYPY}
-        COMPONENT_CACHED_RUBY=${COMPONENT_CACHED_RUBY}
-        COMPONENT_CHROME=${COMPONENT_CHROME}
-        COMPONENT_CHROMIUM=${COMPONENT_CHROMIUM}
-        COMPONENT_EDGE=${COMPONENT_EDGE}
-        COMPONENT_FIREFOX=${COMPONENT_FIREFOX}
-        COMPONENT_WEBDRIVERS=${COMPONENT_WEBDRIVERS}
-        COMPONENT_SELENIUM=${COMPONENT_SELENIUM}
-        COMPONENT_AWS_CLI=${COMPONENT_AWS_CLI}
-        COMPONENT_AWS_SAM_CLI=${COMPONENT_AWS_SAM_CLI}
-        COMPONENT_AZURE_CLI=${COMPONENT_AZURE_CLI}
-        COMPONENT_GH_CLI=${COMPONENT_GH_CLI}
-        COMPONENT_GCLOUD_CLI=${COMPONENT_GCLOUD_CLI}
-        COMPONENT_AZCOPY=${COMPONENT_AZCOPY}
-        COMPONENT_KUBECTL=${COMPONENT_KUBECTL}
-        COMPONENT_HELM=${COMPONENT_HELM}
-        COMPONENT_KIND=${COMPONENT_KIND}
-        COMPONENT_MINIKUBE=${COMPONENT_MINIKUBE}
-        COMPONENT_KUSTOMIZE=${COMPONENT_KUSTOMIZE}
-        COMPONENT_DOCKER_ENGINE=${COMPONENT_DOCKER_ENGINE}
-        COMPONENT_BUILDAH=${COMPONENT_BUILDAH}
-        COMPONENT_PODMAN=${COMPONENT_PODMAN}
-        COMPONENT_MAVEN=${COMPONENT_MAVEN}
-        COMPONENT_GRADLE=${COMPONENT_GRADLE}
-        COMPONENT_ANT=${COMPONENT_ANT}
-        COMPONENT_PHP=${COMPONENT_PHP}
-        COMPONENT_RUST=${COMPONENT_RUST}
-        COMPONENT_POSTGRESQL=${COMPONENT_POSTGRESQL}
-        COMPONENT_MYSQL=${COMPONENT_MYSQL}
-        COMPONENT_APACHE=${COMPONENT_APACHE}
-        COMPONENT_NGINX=${COMPONENT_NGINX}
-        COMPONENT_DOCKER_IMAGES=${COMPONENT_DOCKER_IMAGES}
-        COMPONENT_LARGE_PACKAGES=${COMPONENT_LARGE_PACKAGES}
-        TOOLCACHE_DIR=${TOOLCACHE_DIR}
-        FLAGS
+        state_parent="${RUNNER_TEMP:-/tmp}"
+        mkdir -p "$state_parent"
+        RUNNER_SPACE_CLEANUP_STATE_DIR=$(mktemp -d "${state_parent%/}/runner-space-cleanup.XXXXXX")
+        echo "RUNNER_SPACE_CLEANUP_STATE_DIR=${RUNNER_SPACE_CLEANUP_STATE_DIR}" >> "$GITHUB_ENV"
+        COMPONENT_FLAGS_FILE="${RUNNER_SPACE_CLEANUP_STATE_DIR}/component_flags.env"
+        TOTAL_OPS_FILE="${RUNNER_SPACE_CLEANUP_STATE_DIR}/total_ops"
+        COMPLETED_OPS_FILE="${RUNNER_SPACE_CLEANUP_STATE_DIR}/completed_ops"
+        COMPLETED_OPS_LOCK_FILE="${RUNNER_SPACE_CLEANUP_STATE_DIR}/completed_ops.lock"
+
+        write_state_value() {
+          local name="$1"
+          local value="$2"
+          printf '%s=%q\n' "$name" "$value" >> "$COMPONENT_FLAGS_FILE"
+        }
+
+        : > "$COMPONENT_FLAGS_FILE"
+        write_state_value "COMPONENT_DOTNET" "$COMPONENT_DOTNET"
+        write_state_value "COMPONENT_ANDROID" "$COMPONENT_ANDROID"
+        write_state_value "COMPONENT_HASKELL" "$COMPONENT_HASKELL"
+        write_state_value "COMPONENT_CODEQL" "$COMPONENT_CODEQL"
+        write_state_value "COMPONENT_CACHED_TOOLS" "$COMPONENT_CACHED_TOOLS"
+        write_state_value "COMPONENT_SWAPFILE" "$COMPONENT_SWAPFILE"
+        write_state_value "SWAPFILE_MODE" "$SWAPFILE_MODE"
+        write_state_value "SWAPFILE_DESIRED_BYTES" "$SWAPFILE_DESIRED_BYTES"
+        write_state_value "SWAPFILE_SIZE_INPUT_NORMALIZED" "$SWAPFILE_SIZE_INPUT_NORMALIZED"
+        write_state_value "COMPONENT_SWIFT" "$COMPONENT_SWIFT"
+        write_state_value "COMPONENT_JULIA" "$COMPONENT_JULIA"
+        write_state_value "COMPONENT_JAVA" "$COMPONENT_JAVA"
+        write_state_value "COMPONENT_BROWSERS" "$COMPONENT_BROWSERS"
+        write_state_value "COMPONENT_POWERSHELL" "$COMPONENT_POWERSHELL"
+        write_state_value "COMPONENT_MINICONDA" "$COMPONENT_MINICONDA"
+        write_state_value "COMPONENT_HOMEBREW" "$COMPONENT_HOMEBREW"
+        write_state_value "COMPONENT_VCPKG" "$COMPONENT_VCPKG"
+        write_state_value "COMPONENT_CACHED_GO" "$COMPONENT_CACHED_GO"
+        write_state_value "COMPONENT_CACHED_NODE" "$COMPONENT_CACHED_NODE"
+        write_state_value "COMPONENT_CACHED_PYTHON" "$COMPONENT_CACHED_PYTHON"
+        write_state_value "COMPONENT_CACHED_PYPY" "$COMPONENT_CACHED_PYPY"
+        write_state_value "COMPONENT_CACHED_RUBY" "$COMPONENT_CACHED_RUBY"
+        write_state_value "COMPONENT_CHROME" "$COMPONENT_CHROME"
+        write_state_value "COMPONENT_CHROMIUM" "$COMPONENT_CHROMIUM"
+        write_state_value "COMPONENT_EDGE" "$COMPONENT_EDGE"
+        write_state_value "COMPONENT_FIREFOX" "$COMPONENT_FIREFOX"
+        write_state_value "COMPONENT_WEBDRIVERS" "$COMPONENT_WEBDRIVERS"
+        write_state_value "COMPONENT_SELENIUM" "$COMPONENT_SELENIUM"
+        write_state_value "COMPONENT_AWS_CLI" "$COMPONENT_AWS_CLI"
+        write_state_value "COMPONENT_AWS_SAM_CLI" "$COMPONENT_AWS_SAM_CLI"
+        write_state_value "COMPONENT_AZURE_CLI" "$COMPONENT_AZURE_CLI"
+        write_state_value "COMPONENT_GH_CLI" "$COMPONENT_GH_CLI"
+        write_state_value "COMPONENT_GCLOUD_CLI" "$COMPONENT_GCLOUD_CLI"
+        write_state_value "COMPONENT_AZCOPY" "$COMPONENT_AZCOPY"
+        write_state_value "COMPONENT_KUBECTL" "$COMPONENT_KUBECTL"
+        write_state_value "COMPONENT_HELM" "$COMPONENT_HELM"
+        write_state_value "COMPONENT_KIND" "$COMPONENT_KIND"
+        write_state_value "COMPONENT_MINIKUBE" "$COMPONENT_MINIKUBE"
+        write_state_value "COMPONENT_KUSTOMIZE" "$COMPONENT_KUSTOMIZE"
+        write_state_value "COMPONENT_DOCKER_ENGINE" "$COMPONENT_DOCKER_ENGINE"
+        write_state_value "COMPONENT_BUILDAH" "$COMPONENT_BUILDAH"
+        write_state_value "COMPONENT_PODMAN" "$COMPONENT_PODMAN"
+        write_state_value "COMPONENT_MAVEN" "$COMPONENT_MAVEN"
+        write_state_value "COMPONENT_GRADLE" "$COMPONENT_GRADLE"
+        write_state_value "COMPONENT_ANT" "$COMPONENT_ANT"
+        write_state_value "COMPONENT_PHP" "$COMPONENT_PHP"
+        write_state_value "COMPONENT_RUST" "$COMPONENT_RUST"
+        write_state_value "COMPONENT_POSTGRESQL" "$COMPONENT_POSTGRESQL"
+        write_state_value "COMPONENT_MYSQL" "$COMPONENT_MYSQL"
+        write_state_value "COMPONENT_APACHE" "$COMPONENT_APACHE"
+        write_state_value "COMPONENT_NGINX" "$COMPONENT_NGINX"
+        write_state_value "COMPONENT_DOCKER_IMAGES" "$COMPONENT_DOCKER_IMAGES"
+        write_state_value "COMPONENT_LARGE_PACKAGES" "$COMPONENT_LARGE_PACKAGES"
+        write_state_value "TOOLCACHE_DIR" "$TOOLCACHE_DIR"
+        write_state_value "TOTAL_OPS_FILE" "$TOTAL_OPS_FILE"
+        write_state_value "COMPLETED_OPS_FILE" "$COMPLETED_OPS_FILE"
+        write_state_value "COMPLETED_OPS_LOCK_FILE" "$COMPLETED_OPS_LOCK_FILE"
 
         TOTAL_OPS=0
         for flag in \
@@ -612,22 +629,22 @@ runs:
           fi
         done
 
-        echo "$TOTAL_OPS" > /tmp/total_ops
-        echo "0" > /tmp/completed_ops
-        : > /tmp/completed_ops.lock
+        echo "$TOTAL_OPS" > "$TOTAL_OPS_FILE"
+        echo "0" > "$COMPLETED_OPS_FILE"
+        : > "$COMPLETED_OPS_LOCK_FILE"
 
-        cat > /tmp/progress.sh <<'PROGRESS'
+        cat > "${RUNNER_SPACE_CLEANUP_STATE_DIR}/progress.sh" <<'PROGRESS'
         update_progress() {
           local operation="$1"
           local status="$2"
           local completed total percent
 
-          exec 9>/tmp/completed_ops.lock
+          exec 9>"$COMPLETED_OPS_LOCK_FILE"
           flock -x 9
-          completed=$(cat /tmp/completed_ops 2>/dev/null || echo "0")
-          total=$(cat /tmp/total_ops 2>/dev/null || echo "0")
+          completed=$(cat "$COMPLETED_OPS_FILE" 2>/dev/null || echo "0")
+          total=$(cat "$TOTAL_OPS_FILE" 2>/dev/null || echo "0")
           completed=$((completed + 1))
-          echo "$completed" > /tmp/completed_ops
+          echo "$completed" > "$COMPLETED_OPS_FILE"
           flock -u 9
 
           if [[ "$total" -gt 0 ]]; then
@@ -705,8 +722,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        source /tmp/component_flags.env
-        source /tmp/progress.sh
+        : "${RUNNER_SPACE_CLEANUP_STATE_DIR:?Cleanup state directory is not set}"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/component_flags.env"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/progress.sh"
 
         echo "=== Starting Parallel File System Cleanup ==="
         PIDS=()
@@ -716,6 +734,23 @@ runs:
           if [[ -n "$target" && "$target" != "/" ]]; then
             sudo rm -rf "$target" 2>/dev/null || true
           fi
+        }
+
+        remove_binary() {
+          local name="$1"
+          local path
+          path=$(command -v "$name" 2>/dev/null || true)
+          case "$path" in
+            /bin/*|/usr/bin/*|/usr/local/bin/*|/opt/*|/snap/bin/*)
+              sudo rm -f "$path" 2>/dev/null || true
+              ;;
+            "")
+              ;;
+            *)
+              echo "Skipping ${name} at non-runner path: ${path}"
+              ;;
+          esac
+          sudo rm -f "/usr/local/bin/${name}" "/usr/bin/${name}" 2>/dev/null || true
         }
 
         if [[ "$COMPONENT_DOTNET" == "true" ]]; then
@@ -752,8 +787,20 @@ runs:
             echo "Removing Haskell artifacts..."
             safe_rm /opt/ghc
             safe_rm /usr/local/.ghcup
+            safe_rm /home/runner/.ghcup
+            safe_rm /home/runner/.cabal
+            safe_rm /home/runner/.stack
+            remove_binary ghc
+            remove_binary ghci
+            remove_binary ghcup
+            remove_binary cabal
+            remove_binary stack
+            remove_binary haddock
+            remove_binary runghc
+            remove_binary runhaskell
             if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
               safe_rm "${TOOLCACHE_DIR}/ghc"
+              safe_rm "${TOOLCACHE_DIR}/GHC"
             fi
             update_progress "Haskell removal" "completed"
           } &
@@ -793,8 +840,12 @@ runs:
             safe_rm /usr/share/swift
             safe_rm /usr/local/share/swift
             safe_rm /usr/lib/swift
+            remove_binary swift
+            remove_binary swiftc
+            remove_binary sourcekit-lsp
             if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
               safe_rm "${TOOLCACHE_DIR}/swift"
+              safe_rm "${TOOLCACHE_DIR}/Swift"
             fi
             update_progress "Swift removal" "completed"
           } &
@@ -844,6 +895,9 @@ runs:
           {
             echo "Removing vcpkg..."
             safe_rm /usr/local/share/vcpkg
+            safe_rm /home/runner/.cache/vcpkg
+            safe_rm /home/runner/.vcpkg
+            remove_binary vcpkg
             update_progress "vcpkg removal" "completed"
           } &
           PIDS+=($!)
@@ -916,7 +970,13 @@ runs:
             safe_rm /usr/local/cargo
             safe_rm /home/runner/.cargo
             safe_rm /home/runner/.rustup
-            sudo rm -f /usr/local/bin/rustc /usr/local/bin/cargo /usr/local/bin/rustup 2>/dev/null || true
+            remove_binary rustc
+            remove_binary cargo
+            remove_binary rustup
+            remove_binary rustdoc
+            remove_binary rustfmt
+            remove_binary cargo-clippy
+            remove_binary clippy-driver
             update_progress "Rust removal" "completed"
           } &
           PIDS+=($!)
@@ -933,8 +993,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        source /tmp/component_flags.env
-        source /tmp/progress.sh
+        : "${RUNNER_SPACE_CLEANUP_STATE_DIR:?Cleanup state directory is not set}"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/component_flags.env"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/progress.sh"
 
         echo "=== Package Manager Cleanup ==="
         APT_DIRTY=0
@@ -955,9 +1016,17 @@ runs:
           local name="$1"
           local path
           path=$(command -v "$name" 2>/dev/null || true)
-          if [[ -n "$path" ]]; then
-            sudo rm -f "$path" 2>/dev/null || true
-          fi
+          case "$path" in
+            /bin/*|/usr/bin/*|/usr/local/bin/*|/opt/*|/snap/bin/*)
+              sudo rm -f "$path" 2>/dev/null || true
+              ;;
+            "")
+              ;;
+            *)
+              echo "Skipping ${name} at non-runner path: ${path}"
+              ;;
+          esac
+          sudo rm -f "/usr/local/bin/${name}" "/usr/bin/${name}" 2>/dev/null || true
         }
 
         if [[ "$COMPONENT_LARGE_PACKAGES" == "true" ]]; then
@@ -966,7 +1035,9 @@ runs:
           apt_purge '^llvm-.*' 'php.*'
           apt_purge '^mongodb-.*' '^mysql-.*'
           apt_purge azure-cli google-cloud-sdk google-cloud-cli \
-            google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri \
+            google-chrome-stable microsoft-edge-stable firefox \
+            chromium chromium-browser chromium-codecs-ffmpeg-extra \
+            powershell mono-devel libgl1-mesa-dri \
             --fix-missing
           update_progress "Large packages removal" "completed"
         fi
@@ -989,7 +1060,7 @@ runs:
         if [[ "$COMPONENT_BROWSERS" == "true" ]]; then
           echo "Removing browsers and webdriver packages..."
           apt_purge google-chrome-stable microsoft-edge-stable firefox \
-            chromium-browser chromium-codecs-ffmpeg-extra
+            chromium chromium-browser chromium-codecs-ffmpeg-extra
           safe_rm /opt/google/chrome
           safe_rm /opt/microsoft/msedge
           safe_rm /usr/lib/chromium
@@ -998,6 +1069,16 @@ runs:
           safe_rm /usr/local/share/edge_driver
           safe_rm /usr/local/share/gecko_driver
           safe_rm /usr/share/java/selenium-server.jar
+          remove_binary google-chrome
+          remove_binary google-chrome-stable
+          remove_binary chromium
+          remove_binary chromium-browser
+          remove_binary microsoft-edge
+          remove_binary microsoft-edge-stable
+          remove_binary firefox
+          remove_binary chromedriver
+          remove_binary msedgedriver
+          remove_binary geckodriver
           if command -v snap >/dev/null 2>&1; then
             sudo snap remove firefox 2>/dev/null || true
             sudo snap remove chromium 2>/dev/null || true
@@ -1016,7 +1097,7 @@ runs:
 
         if [[ "$COMPONENT_CHROMIUM" == "true" ]]; then
           echo "Removing Chromium..."
-          apt_purge chromium-browser chromium-codecs-ffmpeg-extra
+          apt_purge chromium chromium-browser chromium-codecs-ffmpeg-extra
           safe_rm /usr/lib/chromium
           remove_binary chromium-browser
           remove_binary chromium
@@ -1073,7 +1154,9 @@ runs:
         if [[ "$COMPONENT_AWS_CLI" == "true" ]]; then
           echo "Removing AWS CLI..."
           safe_rm /usr/local/aws-cli
+          safe_rm /usr/local/sessionmanagerplugin
           remove_binary aws
+          remove_binary session-manager-plugin
           sudo rm -f /usr/local/bin/aws /usr/local/bin/aws_completer 2>/dev/null || true
           update_progress "AWS CLI removal" "completed"
         fi
@@ -1107,12 +1190,14 @@ runs:
           safe_rm /opt/google-cloud-cli
           remove_binary gcloud
           remove_binary gsutil
+          remove_binary bq
           update_progress "Google Cloud CLI removal" "completed"
         fi
 
         if [[ "$COMPONENT_AZCOPY" == "true" ]]; then
           echo "Removing AzCopy..."
           remove_binary azcopy
+          remove_binary azcopy10
           sudo rm -f /usr/local/bin/azcopy /usr/local/bin/azcopy10 2>/dev/null || true
           update_progress "AzCopy removal" "completed"
         fi
@@ -1202,33 +1287,40 @@ runs:
 
         if [[ "$COMPONENT_POSTGRESQL" == "true" ]]; then
           echo "Removing PostgreSQL..."
-          apt_purge '^postgresql-.*'
+          apt_purge postgresql postgresql-common postgresql-client-common '^postgresql-.*'
           safe_rm /var/lib/postgresql
           safe_rm /etc/postgresql
           safe_rm /usr/lib/postgresql
+          remove_binary psql
+          remove_binary pg_config
           update_progress "PostgreSQL removal" "completed"
         fi
 
         if [[ "$COMPONENT_MYSQL" == "true" ]]; then
           echo "Removing MySQL/MariaDB..."
-          apt_purge '^mysql-.*' '^mariadb-.*'
+          apt_purge mysql-common '^mysql-.*' '^mariadb-.*'
           safe_rm /var/lib/mysql
           safe_rm /etc/mysql
+          remove_binary mysql
+          remove_binary mysqld
+          remove_binary mariadb
           update_progress "MySQL removal" "completed"
         fi
 
         if [[ "$COMPONENT_APACHE" == "true" ]]; then
           echo "Removing Apache HTTP Server..."
-          apt_purge apache2 apache2-utils apache2-bin
+          apt_purge apache2 apache2-utils apache2-bin apache2-data
           safe_rm /etc/apache2
           safe_rm /var/www
+          remove_binary apache2
           update_progress "Apache removal" "completed"
         fi
 
         if [[ "$COMPONENT_NGINX" == "true" ]]; then
           echo "Removing Nginx..."
-          apt_purge nginx nginx-common
+          apt_purge nginx nginx-common nginx-core
           safe_rm /etc/nginx
+          remove_binary nginx
           update_progress "Nginx removal" "completed"
         fi
 
@@ -1243,8 +1335,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        source /tmp/component_flags.env
-        source /tmp/progress.sh
+        : "${RUNNER_SPACE_CLEANUP_STATE_DIR:?Cleanup state directory is not set}"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/component_flags.env"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/progress.sh"
 
         echo "=== System Cleanup ==="
         PIDS=()
@@ -1368,10 +1461,15 @@ runs:
             docker-buildx-plugin docker-compose-plugin moby-engine moby-cli \
             2>/dev/null || true
           sudo rm -f /usr/bin/docker /usr/local/bin/docker 2>/dev/null || true
+          sudo rm -f /usr/bin/docker-compose /usr/local/bin/docker-compose 2>/dev/null || true
+          sudo rm -f /usr/bin/docker-buildx /usr/local/bin/docker-buildx 2>/dev/null || true
+          sudo rm -f /usr/bin/docker-credential-ecr-login /usr/local/bin/docker-credential-ecr-login 2>/dev/null || true
           safe_rm /var/lib/docker
           safe_rm /var/lib/containerd
           safe_rm /etc/docker
           safe_rm /usr/lib/docker
+          safe_rm /usr/libexec/docker
+          safe_rm /usr/local/lib/docker
           sudo apt-get autoremove -y 2>/dev/null || true
           sudo apt-get clean 2>/dev/null || true
           update_progress "Docker Engine removal" "completed"
@@ -1384,17 +1482,18 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        : "${RUNNER_SPACE_CLEANUP_STATE_DIR:?Cleanup state directory is not set}"
+        source "${RUNNER_SPACE_CLEANUP_STATE_DIR}/component_flags.env"
 
-        completed=$(cat /tmp/completed_ops 2>/dev/null || echo "0")
-        total=$(cat /tmp/total_ops 2>/dev/null || echo "0")
+        completed=$(cat "$COMPLETED_OPS_FILE" 2>/dev/null || echo "0")
+        total=$(cat "$TOTAL_OPS_FILE" 2>/dev/null || echo "0")
 
         echo "=== Cleanup Summary ==="
         echo "All operations completed: $completed/$total"
         echo "Timestamp: $(date)"
         echo
 
-        rm -f /tmp/component_flags.env /tmp/progress.sh
-        rm -f /tmp/total_ops /tmp/completed_ops /tmp/completed_ops.lock
+        rm -rf "$RUNNER_SPACE_CLEANUP_STATE_DIR"
 
     - name: Disk Space Report (AFTER)
       shell: bash

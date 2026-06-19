@@ -23,7 +23,7 @@
 
 - Environment assumptions: GitHub-hosted Ubuntu runner, `bash`, `sudo`, `apt-get`, `docker` available.
 - Operations are destructive (`rm -rf`, package purges, swap resize/removal/recreation when explicitly requested). Keep changes tightly scoped and idempotent.
-- The action uses parallel cleanup jobs and temporary progress files in `/tmp` (`/tmp/total_ops`, `/tmp/completed_ops`, `/tmp/component_flags.env`).
+- The action uses parallel cleanup jobs and a per-run state directory under `${RUNNER_TEMP:-/tmp}` for progress files (`total_ops`, `completed_ops`, `component_flags.env`).
 - Boolean removal inputs default to `'false'`; CI validates behavior one input at a time via matrix, includes dedicated grouped/subgroup precedence and `max` + `skip-components` interaction coverage, and includes swapfile resize/remove/oversize-failure coverage plus no-input coverage for leaving swap untouched. Swap checks must tolerate runners that start with or without `/mnt/swapfile`.
 - When changing removal targets or swapfile behavior, update both:
   - `action.yml` removal logic
