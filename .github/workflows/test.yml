@@ -13,11 +13,84 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  static-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate Action Metadata and Shell
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          expected_checkout = "uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0"
+          workflows = sorted(Path(".github/workflows").glob("*.yml"))
+          workflows.extend(sorted(Path(".github/workflows").glob("*.yaml")))
+          for workflow in workflows:
+              workflow_text = workflow.read_text(encoding="utf-8")
+              for line_number, line in enumerate(workflow_text.splitlines(), start=1):
+                  stripped = line.strip()
+                  if stripped.startswith("uses: actions/checkout@") and expected_checkout not in stripped:
+                      raise SystemExit(f"Unpinned or stale checkout reference at {workflow}:{line_number}: {line.strip()}")
+
+          action_text = Path("action.yml").read_text(encoding="utf-8")
+          disallowed_temp_paths = (
+              "/tmp/component_flags.env",
+              "/tmp/progress.sh",
+              "/tmp/total_ops",
+              "/tmp/completed_ops",
+          )
+          for token in disallowed_temp_paths:
+              if token in action_text:
+                  raise SystemExit(f"Found fixed temp state path in action.yml: {token}")
+
+          def extract_run_blocks(path):
+              lines = path.read_text(encoding="utf-8").splitlines()
+              index = 0
+              while index < len(lines):
+                  line = lines[index]
+                  stripped = line.lstrip()
+                  indent = len(line) - len(stripped)
+                  if stripped == "run: |":
+                      index += 1
+                      content_indent = indent + 2
+                      block = []
+                      while index < len(lines):
+                          candidate = lines[index]
+                          if candidate.strip():
+                              candidate_indent = len(candidate) - len(candidate.lstrip())
+                              if candidate_indent <= indent:
+                                  break
+                              block.append(candidate[content_indent:])
+                          else:
+                              block.append("")
+                          index += 1
+                      yield "\n".join(block) + "\n"
+                      continue
+                  index += 1
+
+          checked = 0
+          for checked, script in enumerate(extract_run_blocks(Path("action.yml")), start=1):
+              result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False)
+              if result.returncode != 0:
+                  raise SystemExit(f"action.yml run block {checked} failed bash -n:\n{result.stderr}")
+
+          if checked == 0:
+              raise SystemExit("No action.yml run blocks were found")
+
+          print(f"Validated {checked} action.yml run blocks.")
+          PY
+
   default-max:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Max Profile Test
         uses: ./
@@ -26,7 +99,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Initial Swapfile State
         shell: bash
@@ -82,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Pre-Action State
         shell: bash
@@ -124,7 +197,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Pre-Action Toolcache State
         shell: bash
@@ -171,7 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Pre-Action Browser State
         shell: bash
@@ -215,7 +288,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Pre-Action Browser State
         shell: bash
@@ -272,7 +345,7 @@ jobs:
             skip_components: dotnet,not-a-real-component
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Run Action with Invalid Inputs
         id: invalid_input_run
@@ -297,7 +370,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Resize Swapfile
         uses: ./
@@ -330,7 +403,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Remove Swapfile via Size Input
         uses: ./
@@ -352,7 +425,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Capture Initial Swapfile State
         shell: bash
@@ -469,7 +542,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Custom Profile Test, with Various Toggles
         uses: ./
@@ -544,7 +617,15 @@ jobs:
               fi
               ;;
             remove-haskell)
-              if [ -d "/opt/ghc" ] || [ -d "/usr/local/.ghcup" ]; then
+              if [ -d "/opt/ghc" ] || \
+                 [ -d "/usr/local/.ghcup" ] || \
+                 [ -d "/home/runner/.ghcup" ] || \
+                 [ -d "/home/runner/.cabal" ] || \
+                 [ -d "/home/runner/.stack" ] || \
+                 command -v ghc >/dev/null 2>&1 || \
+                 command -v ghcup >/dev/null 2>&1 || \
+                 command -v cabal >/dev/null 2>&1 || \
+                 command -v stack >/dev/null 2>&1; then
                 echo 'Haskell artifacts were not removed'
                 exit 1
               fi
@@ -563,7 +644,7 @@ jobs:
               fi
               ;;
             remove-large-packages)
-              if dpkg -l | grep -E 'azure-cli|google-cloud-sdk|google-cloud-cli|google-chrome-stable|firefox|powershell'; then
+              if dpkg -l | grep -E 'azure-cli|google-cloud-sdk|google-cloud-cli|google-chrome-stable|microsoft-edge-stable|chromium|firefox|powershell'; then
                 echo 'Large packages were not removed'
                 exit 1
               fi
@@ -596,9 +677,14 @@ jobs:
             remove-browsers)
               if command -v google-chrome >/dev/null 2>&1 || \
                  command -v google-chrome-stable >/dev/null 2>&1 || \
+                 command -v chromium >/dev/null 2>&1 || \
+                 command -v chromium-browser >/dev/null 2>&1 || \
                  command -v microsoft-edge >/dev/null 2>&1 || \
                  command -v microsoft-edge-stable >/dev/null 2>&1 || \
-                 command -v firefox >/dev/null 2>&1; then
+                 command -v firefox >/dev/null 2>&1 || \
+                 command -v chromedriver >/dev/null 2>&1 || \
+                 command -v geckodriver >/dev/null 2>&1 || \
+                 command -v msedgedriver >/dev/null 2>&1; then
                 echo 'Browsers were not removed'
                 exit 1
               fi
@@ -623,7 +709,10 @@ jobs:
               fi
               ;;
             remove-vcpkg)
-              if [ -d "/usr/local/share/vcpkg" ]; then
+              if [ -d "/usr/local/share/vcpkg" ] || \
+                 [ -d "/home/runner/.cache/vcpkg" ] || \
+                 [ -d "/home/runner/.vcpkg" ] || \
+                 command -v vcpkg >/dev/null 2>&1; then
                 echo 'vcpkg was not removed'
                 exit 1
               fi
@@ -672,7 +761,10 @@ jobs:
               ;;
             remove-chromium)
               if command -v chromium >/dev/null 2>&1 || \
-                 command -v chromium-browser >/dev/null 2>&1; then
+                 command -v chromium-browser >/dev/null 2>&1 || \
+                 { dpkg-query -W -f='${Package} ${Status}\n' \
+                     chromium chromium-browser chromium-codecs-ffmpeg-extra 2>/dev/null || true; } | \
+                   grep -q 'install ok installed'; then
                 echo 'Chromium was not removed'
                 exit 1
               fi
@@ -705,7 +797,9 @@ jobs:
               fi
               ;;
             remove-aws-cli)
-              if command -v aws >/dev/null 2>&1; then
+              if command -v aws >/dev/null 2>&1 || \
+                 command -v session-manager-plugin >/dev/null 2>&1 || \
+                 [ -d "/usr/local/sessionmanagerplugin" ]; then
                 echo 'AWS CLI was not removed'
                 exit 1
               fi
@@ -729,13 +823,15 @@ jobs:
               fi
               ;;
             remove-gcloud-cli)
-              if command -v gcloud >/dev/null 2>&1; then
+              if command -v gcloud >/dev/null 2>&1 || \
+                 command -v gsutil >/dev/null 2>&1 || \
+                 command -v bq >/dev/null 2>&1; then
                 echo 'Google Cloud CLI was not removed'
                 exit 1
               fi
               ;;
             remove-azcopy)
-              if command -v azcopy >/dev/null 2>&1; then
+              if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
                 echo 'AzCopy was not removed'
                 exit 1
               fi
@@ -771,7 +867,13 @@ jobs:
               fi
               ;;
             remove-docker-engine)
-              if command -v docker >/dev/null 2>&1; then
+              if command -v docker >/dev/null 2>&1 || \
+                 command -v docker-compose >/dev/null 2>&1 || \
+                 command -v docker-buildx >/dev/null 2>&1 || \
+                 command -v docker-credential-ecr-login >/dev/null 2>&1 || \
+                 [ -d "/var/lib/docker" ] || \
+                 [ -d "/var/lib/containerd" ] || \
+                 [ -d "/etc/docker" ]; then
                 echo 'Docker Engine was not removed'
                 exit 1
               fi
@@ -813,19 +915,33 @@ jobs:
               fi
               ;;
             remove-rust)
-              if command -v rustc >/dev/null 2>&1 || command -v cargo >/dev/null 2>&1; then
+              if command -v rustc >/dev/null 2>&1 || \
+                 command -v cargo >/dev/null 2>&1 || \
+                 command -v rustup >/dev/null 2>&1 || \
+                 command -v rustdoc >/dev/null 2>&1 || \
+                 command -v rustfmt >/dev/null 2>&1 || \
+                 command -v cargo-clippy >/dev/null 2>&1 || \
+                 command -v clippy-driver >/dev/null 2>&1; then
                 echo 'Rust toolchain was not removed'
                 exit 1
               fi
               ;;
             remove-postgresql)
-              if command -v psql >/dev/null 2>&1 || [ -d "/var/lib/postgresql" ]; then
+              if command -v psql >/dev/null 2>&1 || \
+                 command -v pg_config >/dev/null 2>&1 || \
+                 [ -d "/var/lib/postgresql" ] || \
+                 [ -d "/etc/postgresql" ] || \
+                 [ -d "/usr/lib/postgresql" ]; then
                 echo 'PostgreSQL was not removed'
                 exit 1
               fi
               ;;
             remove-mysql)
-              if command -v mysql >/dev/null 2>&1 || [ -d "/var/lib/mysql" ]; then
+              if command -v mysql >/dev/null 2>&1 || \
+                 command -v mysqld >/dev/null 2>&1 || \
+                 command -v mariadb >/dev/null 2>&1 || \
+                 [ -d "/var/lib/mysql" ] || \
+                 [ -d "/etc/mysql" ]; then
                 echo 'MySQL/MariaDB was not removed'
                 exit 1
               fi

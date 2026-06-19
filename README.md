@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Free Runner Space
         # NOTE: Use a specific tag or commit shasum for immutability
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Free Runner Space
         # NOTE: Use a specific tag or commit shasum for immutability
@@ -176,10 +176,10 @@ All `remove-*` inputs are optional toggles. In `cleanup-profile: max`, every com
 
 ### Profiles and global options
 
-| Input             | Default | Description                                                                                   |
-| ----------------- | ------- | --------------------------------------------------------------------------------------------- |
-| `cleanup-profile` | `max`   | Cleanup mode: `max` (default) or `custom`.                                                    |
-| `skip-components` | N/A     | Comma-separated components to keep when `cleanup-profile=max`.                                |
+| Input             | Default | Description                                                                                                          |
+| ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `cleanup-profile` | `max`   | Cleanup mode: `max` (default) or `custom`.                                                                           |
+| `skip-components` | N/A     | Comma-separated components to keep when `cleanup-profile=max`.                                                       |
 | `swapfile-size`   | empty   | Optional swapfile size (`0`, `1.5GiB`, `512MiB`, or a plain GiB value like `2`). Leaves swap untouched when omitted. |
 
 ### Component toggles
@@ -202,11 +202,11 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 | ---------------- | --------- | ------------------------------------------------------------------------------------------------ |
 | `remove-dotnet`  | `dotnet`  | `/usr/share/dotnet`, `/usr/lib/dotnet`, `/etc/dotnet`, toolcache `dotnet`, `~/.dotnet`           |
 | `remove-android` | `android` | `/usr/local/lib/android`, `/usr/local/share/android`, `/opt/android*`, `~/.android`, `~/.gradle` |
-| `remove-haskell` | `haskell` | `/opt/ghc`, `/usr/local/.ghcup`, toolcache `ghc`                                                 |
+| `remove-haskell` | `haskell` | `/opt/ghc`, GHCup/Cabal/Stack caches and binaries, toolcache `ghc`                               |
 | `remove-swift`   | `swift`   | `/usr/share/swift`, `/usr/local/share/swift`, `/usr/lib/swift`, toolcache `swift`                |
 | `remove-julia`   | `julia`   | `/usr/local/julia*`, `/usr/share/julia`, toolcache `Julia`                                       |
 | `remove-java`    | `java`    | `openjdk-*` packages, `/usr/lib/jvm`, toolcache `Java`                                           |
-| `remove-rust`    | `rust`    | `/usr/local/rustup`, `/usr/local/cargo`, `~/.cargo`, `~/.rustup`, `rustc/cargo` binaries         |
+| `remove-rust`    | `rust`    | `/usr/local/rustup`, `/usr/local/cargo`, `~/.cargo`, `~/.rustup`, Rust/Cargo/Rustfmt binaries    |
 
 **Code scanning**
 
@@ -227,11 +227,11 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 
 **Package managers**
 
-| Input              | Component   | Removes                               |
-| ------------------ | ----------- | ------------------------------------- |
-| `remove-miniconda` | `miniconda` | `CONDA` root, `~/.conda`, conda cache |
-| `remove-homebrew`  | `homebrew`  | `/home/linuxbrew`                     |
-| `remove-vcpkg`     | `vcpkg`     | `/usr/local/share/vcpkg`              |
+| Input              | Component   | Removes                                                |
+| ------------------ | ----------- | ------------------------------------------------------ |
+| `remove-miniconda` | `miniconda` | `CONDA` root, `~/.conda`, conda cache                  |
+| `remove-homebrew`  | `homebrew`  | `/home/linuxbrew`                                      |
+| `remove-vcpkg`     | `vcpkg`     | `/usr/local/share/vcpkg`, vcpkg binary and user caches |
 
 **Browsers and drivers**
 
@@ -247,14 +247,14 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 
 **Cloud CLIs**
 
-| Input                | Component     | Removes                                                                          |
-| -------------------- | ------------- | -------------------------------------------------------------------------------- |
-| `remove-aws-cli`     | `aws-cli`     | `/usr/local/aws-cli`, `aws` binary                                               |
-| `remove-aws-sam-cli` | `aws-sam-cli` | `/usr/local/aws-sam-cli`, `sam` binary                                           |
-| `remove-azure-cli`   | `azure-cli`   | `azure-cli` package, `/opt/az`, `az` binary                                      |
-| `remove-gh-cli`      | `gh-cli`      | `gh` package and binary                                                          |
-| `remove-gcloud-cli`  | `gcloud-cli`  | `google-cloud-*` packages, `/usr/lib/google-cloud-sdk`, `gcloud/gsutil` binaries |
-| `remove-azcopy`      | `azcopy`      | `azcopy` binary                                                                  |
+| Input                | Component     | Removes                                                                             |
+| -------------------- | ------------- | ----------------------------------------------------------------------------------- |
+| `remove-aws-cli`     | `aws-cli`     | `/usr/local/aws-cli`, AWS Session Manager plugin, `aws` binary                      |
+| `remove-aws-sam-cli` | `aws-sam-cli` | `/usr/local/aws-sam-cli`, `sam` binary                                              |
+| `remove-azure-cli`   | `azure-cli`   | `azure-cli` package, `/opt/az`, `az` binary                                         |
+| `remove-gh-cli`      | `gh-cli`      | `gh` package and binary                                                             |
+| `remove-gcloud-cli`  | `gcloud-cli`  | `google-cloud-*` packages, `/usr/lib/google-cloud-sdk`, `gcloud/gsutil/bq` binaries |
+| `remove-azcopy`      | `azcopy`      | `azcopy` binary                                                                     |
 
 **Kubernetes and DevOps**
 
@@ -268,12 +268,12 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 
 **Containers**
 
-| Input                  | Component       | Removes                                                            |
-| ---------------------- | --------------- | ------------------------------------------------------------------ |
-| `remove-docker-images` | `docker-images` | cached Docker images, build cache, volumes                         |
-| `remove-docker-engine` | `docker-engine` | Docker packages, `/var/lib/docker`, `/etc/docker`, `docker` binary |
-| `remove-buildah`       | `buildah`       | `buildah` package and binary                                       |
-| `remove-podman`        | `podman`        | `podman` package and binary, `/var/lib/containers`                 |
+| Input                  | Component       | Removes                                                                                 |
+| ---------------------- | --------------- | --------------------------------------------------------------------------------------- |
+| `remove-docker-images` | `docker-images` | cached Docker images, build cache, volumes                                              |
+| `remove-docker-engine` | `docker-engine` | Docker packages, CLI plugins/helpers, `/var/lib/docker`, `/etc/docker`, `docker` binary |
+| `remove-buildah`       | `buildah`       | `buildah` package and binary                                                            |
+| `remove-podman`        | `podman`        | `podman` package and binary, `/var/lib/containers`                                      |
 
 **Project/build tools**
 
@@ -295,11 +295,11 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 
 **Misc**
 
-| Input                   | Component        | Removes                                              |
-| ----------------------- | ---------------- | ---------------------------------------------------- |
-| `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                                                                 |
+| Input                   | Component        | Removes                                                                                                                                      |
+| ----------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                                                                                                          |
 | `swapfile-size`         | N/A              | Reconfigures `/mnt/swapfile` only when set; `0` removes it, otherwise the requested size is applied or the action fails before changing swap |
-| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs)                                            |
+| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs)                                                                                         |
 
 ## Compatibility
 

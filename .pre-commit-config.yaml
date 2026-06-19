@@ -4,7 +4,7 @@ default_stages: [pre-commit, pre-push]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: check-added-large-files
         name: Large Files Check
@@ -39,7 +39,7 @@ repos:
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.18.1
+    rev: v0.22.1
     hooks:
       - id: markdownlint-cli2
         name: Markdown Lint
@@ -48,7 +48,7 @@ repos:
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/adrienverge/yamllint.git
-    rev: v1.37.1
+    rev: v1.38.0
     hooks:
       - id: yamllint
         name: YAML Lint
@@ -56,7 +56,7 @@ repos:
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.11
+    rev: v1.7.12
     hooks:
       - id: actionlint
         name: GitHub Workflow Lint
