@@ -1,4 +1,4 @@
-minimum_pre_commit_version: "3.7.0"
+minimum_pre_commit_version: "4.6.0"
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit, pre-push]
 
@@ -39,7 +39,7 @@ repos:
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.22.1
+    rev: v0.23.1
     hooks:
       - id: markdownlint-cli2
         name: Markdown Lint
