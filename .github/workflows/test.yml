@@ -28,7 +28,7 @@ jobs:
           from pathlib import Path
           import subprocess
 
-          expected_checkout = "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0"
+          expected_checkout = "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
           workflows = sorted(Path(".github/workflows").glob("*.yml"))
           workflows.extend(sorted(Path(".github/workflows").glob("*.yaml")))
           for workflow in workflows:
