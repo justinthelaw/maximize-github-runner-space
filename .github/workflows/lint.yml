@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - main
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,7 +26,8 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Install Pre-Commit
+        run: python -m pip install pre-commit==4.6.0
+
       - name: Run Pre-Commits
-        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
-        with:
-          extra_args: --all-files --hook-stage pre-commit
+        run: pre-commit run --all-files --hook-stage pre-push

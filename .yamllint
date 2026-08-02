@@ -13,11 +13,11 @@ rules:
   commas: enable
   comments:
     level: warning
+    min-spaces-from-content: 1
   comments-indentation:
     level: warning
   document-end: disable
-  document-start:
-    level: warning
+  document-start: disable
   empty-lines: enable
   empty-values: disable
   float-values: disable
@@ -32,4 +32,5 @@ rules:
   quoted-strings: disable
   trailing-spaces: enable
   truthy:
+    check-keys: false
     level: warning

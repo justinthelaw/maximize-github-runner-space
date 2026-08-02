@@ -15,9 +15,6 @@ This document is for action maintainers and contributors. If you only need to us
 - `action.yml`: Composite action inputs and cleanup implementation.
 - `.github/workflows/test.yml`: Matrix tests for input behavior, max-profile skip behavior, and grouped/subgroup precedence interactions.
 - `.github/workflows/lint.yml`: Pre-commit checks in CI.
-- `.github/workflows/release.yml`: Automated release PR and tagging flow.
-- `release-please-config.json`: Release Please configuration.
-- `.release-please-manifest.json`: Version manifest for Release Please.
 - `README.md`: End-user usage and input documentation.
 - `docs/MIGRATIONS.md`: Migration notes for breaking changes between releases.
 
@@ -52,7 +49,7 @@ Important safety notes:
 Run before pushing:
 
 ```bash
-pre-commit run --all-files
+pre-commit run --all-files --hook-stage pre-push
 ```
 
 At minimum, ensure:
@@ -61,20 +58,9 @@ At minimum, ensure:
 - Workflow lint (`actionlint`) passes.
 - Docs match current action inputs and behavior.
 
-## Release process (Release Please)
+## Commit guidance
 
-This repository uses [release-please](https://github.com/googleapis/release-please-action) to automate release PRs and tagging.
-
-### How it works
-
-- Commits merge into `main`.
-- The `release-please` workflow opens or updates a release PR.
-- The release PR updates `CHANGELOG.md` and version metadata.
-- Merging the release PR creates a GitHub release and tag.
-
-### Conventional commit guidance
-
-Use conventional-style commits when possible to generate clearer changelogs:
+Use conventional-style commits when possible to keep project history and release notes clear:
 
 - `feat:` for user-facing enhancements.
 - `fix:` for bug fixes.
@@ -87,5 +73,5 @@ Include in each PR:
 
 - What changed and why.
 - Any risk from removed packages/paths/toolchains.
-- Validation results (`pre-commit run --all-files`).
+- Validation results (`pre-commit run --all-files --hook-stage pre-push`).
 - Documentation updates when behavior changed.

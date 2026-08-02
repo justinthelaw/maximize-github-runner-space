@@ -18,7 +18,6 @@
   },
   "ignores": [
     "LICENSE",
-    ".github/",
     ".git/"
   ]
 }

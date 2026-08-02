@@ -2,12 +2,13 @@
 
 ## Supported Versions
 
-Only the latest state of `main` is supported.
+The latest state of `main` and the latest published minor release receive security fixes.
 
-| Version       | Supported |
-| ------------- | --------- |
-| `main`        | Yes       |
-| Older commits | No        |
+| Version                | Supported |
+| ---------------------- | --------- |
+| `main`                 | Yes       |
+| Latest published minor | Yes       |
+| Older minor releases   | No        |
 
 ## Reporting a Vulnerability
 

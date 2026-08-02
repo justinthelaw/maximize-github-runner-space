@@ -4,6 +4,7 @@ permissions:
   contents: read
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - main
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   static-validation:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,6 +39,14 @@ jobs:
                   stripped = line.strip()
                   if stripped.startswith("uses: actions/checkout@") and expected_checkout not in stripped:
                       raise SystemExit(f"Unpinned or stale checkout reference at {workflow}:{line_number}: {line.strip()}")
+                  if stripped.startswith("uses:"):
+                      action_ref = stripped.removeprefix("uses:").strip().split()[0]
+                      if not action_ref.startswith("./"):
+                          if "@" not in action_ref:
+                              raise SystemExit(f"Remote action has no revision at {workflow}:{line_number}: {line.strip()}")
+                          revision = action_ref.rsplit("@", 1)[-1]
+                          if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
+                              raise SystemExit(f"Remote action is not pinned to a full SHA at {workflow}:{line_number}: {line.strip()}")
 
           action_text = Path("action.yml").read_text(encoding="utf-8")
           disallowed_temp_paths = (
@@ -88,6 +98,7 @@ jobs:
 
   default-max:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,6 +108,7 @@ jobs:
 
   no-op-custom:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -153,6 +165,7 @@ jobs:
 
   max-with-skip:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -195,6 +208,7 @@ jobs:
 
   max-skip-cached-node-precedence:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -242,6 +256,7 @@ jobs:
 
   max-skip-firefox-precedence:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -267,7 +282,7 @@ jobs:
         uses: ./
         with:
           cleanup-profile: max
-          skip-components: "  FireFox , LARGE-Packages "
+          skip-components: "  FireFox  "
 
       - name: Verify Firefox Is Kept But Chrome Can Be Removed
         shell: bash
@@ -286,6 +301,7 @@ jobs:
 
   custom-grouped-subgroup-precedence:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -331,18 +347,30 @@ jobs:
 
   invalid-input-validation:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         scenario:
           - name: invalid-cleanup-profile
             cleanup_profile: invalid-profile
             skip_components: ""
+            swapfile_size: ""
           - name: invalid-skip-components
             cleanup_profile: max
             skip_components: not-a-real-component
+            swapfile_size: ""
           - name: mixed-valid-invalid-skip-components
             cleanup_profile: max
             skip_components: dotnet,not-a-real-component
+            swapfile_size: ""
+          - name: undersized-swapfile
+            cleanup_profile: custom
+            skip_components: ""
+            swapfile_size: 1B
+          - name: overflowing-swapfile
+            cleanup_profile: custom
+            skip_components: ""
+            swapfile_size: 100000000000000000000TiB
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -354,6 +382,7 @@ jobs:
         with:
           cleanup-profile: ${{ matrix.scenario.cleanup_profile }}
           skip-components: ${{ matrix.scenario.skip_components }}
+          swapfile-size: ${{ matrix.scenario.swapfile_size }}
 
       - name: Verify Invalid Inputs Fail Early
         shell: bash
@@ -365,9 +394,39 @@ jobs:
             exit 1
           fi
 
+  conda-root-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create Traversal Fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TEST_SENTINEL=${RUNNER_TEMP}/conda-safety-sentinel" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/conda-safety-sentinel"
+          touch "${RUNNER_TEMP}/conda-safety-sentinel/keep"
+          relative_sentinel=$(realpath --relative-to="$RUNNER_TOOL_CACHE" "${RUNNER_TEMP}/conda-safety-sentinel")
+          echo "TEST_CONDA=${RUNNER_TOOL_CACHE}/${relative_sentinel}" >> "$GITHUB_ENV"
+
+      - name: Reject Traversing CONDA Root
+        uses: ./
+        env:
+          CONDA: ${{ env.TEST_CONDA }}
+        with:
+          cleanup-profile: custom
+          remove-miniconda: "true"
+
+      - name: Verify Unrelated Directory Was Kept
+        shell: bash
+        run: test -f "${TEST_SENTINEL}/keep"
+
 
   swapfile-resize:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -401,6 +460,7 @@ jobs:
 
   swapfile-remove:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -423,6 +483,7 @@ jobs:
 
   swapfile-oversize:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -487,6 +548,7 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         option:

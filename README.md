@@ -23,7 +23,7 @@ This action removes optional preinstalled SDKs, toolchains, and caches so your w
 
 ## Why use this action?
 
-GitHub-hosted Ubuntu runners often start with many gigabytes consumed by preinstalled software. That is convenient for general use, but it can block large workflows (for example, Docker image builds, Android/iOS builds, or large monorepo test runs).
+GitHub-hosted Ubuntu runners often start with many gigabytes consumed by preinstalled software. That is convenient for general use, but it can block large workflows (for example, Docker image builds, Android builds, or large monorepo test runs).
 
 This action helps by:
 
@@ -48,11 +48,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free Runner Space
-        # NOTE: Use a specific tag or commit shasum for immutability
-        uses: justinthelaw/maximize-github-runner-space@latest
+        # Pin a full commit SHA instead when your policy requires immutability.
+        uses: justinthelaw/maximize-github-runner-space@v0.10.0
         with:
           skip-components: java,browsers,docker-engine
           swapfile-size: 2G
@@ -72,11 +72,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free Runner Space
-        # NOTE: Use a specific tag or commit shasum for immutability
-        uses: justinthelaw/maximize-github-runner-space@latest
+        # Pin a full commit SHA instead when your policy requires immutability.
+        uses: justinthelaw/maximize-github-runner-space@v0.10.0
         with:
           cleanup-profile: custom
           remove-android: "true"
@@ -111,6 +111,8 @@ Use `swapfile-size` only when you want to change the runner's existing swapfile.
 - Decimal sizes such as `1.5GiB`.
 - Unit-suffixed values such as `512MiB`, `2G`, or `0.5TiB`.
 - A plain number like `2`, which is interpreted as GiB.
+
+Positive sizes must be at least 1 MiB and fit in signed 64-bit byte arithmetic.
 
 If the requested size would exceed the safe free space available on `/mnt`, the action exits with an error and leaves the existing swapfile unchanged. When the size is accepted, the configured swapfile remains available for the rest of the job.
 
@@ -192,7 +194,8 @@ For grouped areas like browsers and toolcache, listing a subcomponent in `skip-c
 The CI workflow includes targeted interaction tests beyond single-input toggles. These lock in:
 
 - `cleanup-profile: max` + `skip-components: cached-node` keeps Node toolcache while still allowing other toolcache families (for example Python) to be removed.
-- `cleanup-profile: max` + `skip-components: firefox,large-packages` keeps Firefox while still allowing other browser artifacts (for example Chrome) to be removed.
+- `cleanup-profile: max` + `skip-components: firefox` keeps Firefox while still allowing other browser artifacts (for example Chrome) to be removed.
+- The legacy `large-packages` bulk purge is suppressed when a skipped component overlaps its package list; dedicated non-skipped component cleanups still run.
 - `cleanup-profile: custom` + `remove-browsers: "true"` + `remove-firefox: "true"` uses grouped precedence (`remove-browsers`) so subgroup removals are not scheduled separately.
 - `skip-components` normalization behavior for whitespace and mixed case values.
 
@@ -299,7 +302,7 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 | ----------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `remove-powershell`     | `powershell`     | `powershell` package, `pwsh` binary                                                                                                          |
 | `swapfile-size`         | N/A              | Reconfigures `/mnt/swapfile` only when set; `0` removes it, otherwise the requested size is applied or the action fails before changing swap |
-| `remove-large-packages` | `large-packages` | Legacy bulk apt purge (overlaps with several inputs)                                                                                         |
+| `remove-large-packages` | `large-packages` | Legacy bulk apt purge; suppressed in `max` when an overlapping component is skipped                                                          |
 
 ## Compatibility
 
@@ -309,7 +312,7 @@ The CI workflow includes targeted interaction tests beyond single-input toggles.
 
 ## Contributing
 
-See [CONTRIBUTING guide](/docs/CONTRIBUTING.md) for development and release workflow details.
+See [CONTRIBUTING guide](/docs/CONTRIBUTING.md) for development and contribution guidance.
 
 ## Migration Guide
 
