@@ -36,7 +36,7 @@ inputs:
     required: false
     default: "false"
   swapfile-size:
-    description: "Optional swapfile size. Accepts 0, 1.5GiB, 512MiB, or a plain GiB value like 2. Leaves the runner swapfile untouched when omitted."
+    description: "Optional swapfile size. Accepts 0 or a positive size of at least 1 MiB, such as 1.5GiB, 512MiB, or a plain GiB value like 2. Leaves the runner swapfile untouched when omitted."
     required: false
     default: ""
 
@@ -318,7 +318,7 @@ runs:
         parse_swapfile_size_bytes() {
           local raw="${1:-}"
 
-          python3 -c $'import re\nimport sys\nfrom decimal import Decimal, InvalidOperation, ROUND_HALF_UP\n\nraw = sys.argv[1].strip()\nmatch = re.fullmatch(r"([0-9]+(?:\\.[0-9]+)?)([kmgt]i?b?)?", raw, re.IGNORECASE)\nif not match:\n    raise SystemExit(1)\n\ntry:\n    value = Decimal(match.group(1))\nexcept InvalidOperation:\n    raise SystemExit(1)\n\nif value < 0:\n    raise SystemExit(1)\n\nunit = (match.group(2) or "gib").lower()\nmultipliers = {\n    "k": 1024,\n    "kb": 1024,\n    "ki": 1024,\n    "kib": 1024,\n    "m": 1024 ** 2,\n    "mb": 1024 ** 2,\n    "mi": 1024 ** 2,\n    "mib": 1024 ** 2,\n    "g": 1024 ** 3,\n    "gb": 1024 ** 3,\n    "gi": 1024 ** 3,\n    "gib": 1024 ** 3,\n    "t": 1024 ** 4,\n    "tb": 1024 ** 4,\n    "ti": 1024 ** 4,\n    "tib": 1024 ** 4,\n}\n\nbytes_value = (value * multipliers[unit]).to_integral_value(rounding=ROUND_HALF_UP)\nprint(int(bytes_value))' "$raw"
+          python3 -c $'import re\nimport sys\nfrom decimal import Decimal, InvalidOperation, ROUND_HALF_UP\n\nraw = sys.argv[1].strip()\nmatch = re.fullmatch(r"([0-9]+(?:\\.[0-9]+)?)([kmgt]i?b?)?", raw, re.IGNORECASE)\nif not match:\n    raise SystemExit(1)\n\ntry:\n    value = Decimal(match.group(1))\nexcept InvalidOperation:\n    raise SystemExit(1)\n\nif value < 0:\n    raise SystemExit(1)\n\nunit = (match.group(2) or "gib").lower()\nmultipliers = {\n    "k": 1024,\n    "kb": 1024,\n    "ki": 1024,\n    "kib": 1024,\n    "m": 1024 ** 2,\n    "mb": 1024 ** 2,\n    "mi": 1024 ** 2,\n    "mib": 1024 ** 2,\n    "g": 1024 ** 3,\n    "gb": 1024 ** 3,\n    "gi": 1024 ** 3,\n    "gib": 1024 ** 3,\n    "t": 1024 ** 4,\n    "tb": 1024 ** 4,\n    "ti": 1024 ** 4,\n    "tib": 1024 ** 4,\n}\n\nbytes_value = int((value * multipliers[unit]).to_integral_value(rounding=ROUND_HALF_UP))\nif bytes_value != 0 and bytes_value < 1024 ** 2:\n    raise SystemExit(1)\nif bytes_value > 2 ** 63 - 1:\n    raise SystemExit(1)\nprint(bytes_value)' "$raw"
         }
 
         should_enable() {
@@ -475,6 +475,15 @@ runs:
         COMPONENT_NGINX=$(should_enable "nginx" "${REMOVE_NGINX}")
         COMPONENT_DOCKER_IMAGES=$(should_enable "docker-images" "${REMOVE_DOCKER_IMAGES}")
         COMPONENT_LARGE_PACKAGES=$(should_enable "large-packages" "${REMOVE_LARGE_PACKAGES}")
+        if [[ "${CLEANUP_PROFILE}" == "max" && "${COMPONENT_LARGE_PACKAGES}" == "true" ]]; then
+          for overlapping_component in \
+            dotnet php mysql azure-cli gcloud-cli browsers chrome chromium edge firefox powershell; do
+            if csv_contains "$SKIP_COMPONENTS_NORMALIZED" "$overlapping_component"; then
+              COMPONENT_LARGE_PACKAGES="false"
+              break
+            fi
+          done
+        fi
 
         if [[ "$COMPONENT_CACHED_TOOLS" == "true" ]]; then
           COMPONENT_CACHED_GO="false"
@@ -870,10 +879,16 @@ runs:
         if [[ "$COMPONENT_MINICONDA" == "true" ]]; then
           {
             echo "Removing Miniconda..."
-            conda_root="${CONDA:-/usr/share/miniconda}"
-            if [[ -n "$conda_root" && "$conda_root" != "/" ]]; then
-              safe_rm "$conda_root"
-            fi
+            conda_root=$(realpath -m -- "${CONDA:-/usr/share/miniconda}")
+            toolcache_root=$(realpath -m -- "${TOOLCACHE_DIR:-/opt/hostedtoolcache}")
+            case "$conda_root" in
+              /usr/share/miniconda|"${toolcache_root}"/*)
+                safe_rm "$conda_root"
+                ;;
+              *)
+                echo "Skipping unexpected CONDA root: ${conda_root}"
+                ;;
+            esac
             safe_rm /home/runner/.conda
             sudo rm -f /home/runner/.condarc 2>/dev/null || true
             safe_rm /home/runner/.cache/conda
@@ -1049,7 +1064,9 @@ runs:
           safe_rm /usr/lib/jvm
           safe_rm /usr/local/lib/jvm
           if [[ -n "${TOOLCACHE_DIR:-}" && "${TOOLCACHE_DIR}" != "/" ]]; then
-            safe_rm "${TOOLCACHE_DIR}"/Java*
+            for java_cache in "${TOOLCACHE_DIR}"/Java*; do
+              [[ -e "$java_cache" ]] && safe_rm "$java_cache"
+            done
           fi
           sudo update-alternatives --remove-all java 2>/dev/null || true
           sudo update-alternatives --remove-all javac 2>/dev/null || true
@@ -1368,28 +1385,23 @@ runs:
 
             disable_managed_swapfile() {
               if swapon --show=NAME --noheadings 2>/dev/null | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
-                sudo swapoff /mnt/swapfile 2>/dev/null || true
+                sudo swapoff /mnt/swapfile
               fi
             }
 
             remove_managed_swapfile() {
               disable_managed_swapfile
-              sudo sed -i '\|^/mnt/swapfile[[:space:]]\+none[[:space:]]\+swap[[:space:]]|d' /etc/fstab 2>/dev/null || true
-              sudo rm -f /mnt/swapfile 2>/dev/null || true
+              sudo sed -i '\|^/mnt/swapfile[[:space:]]\+none[[:space:]]\+swap[[:space:]]|d' /etc/fstab
+              sudo rm -f /mnt/swapfile
             }
 
             select_swapfile_size() {
               local requested_bytes="$1"
-              local existing_bytes=0
               local available_bytes reserve_bytes max_target_bytes
-
-              if [[ -f /mnt/swapfile ]]; then
-                existing_bytes=$(stat -c %s /mnt/swapfile 2>/dev/null || echo 0)
-              fi
 
               available_bytes=$(df --output=avail -B1 /mnt | tail -n1 | tr -d '[:space:]')
               reserve_bytes=$((512 * 1024 * 1024))
-              max_target_bytes=$((available_bytes + existing_bytes - reserve_bytes))
+              max_target_bytes=$((available_bytes - reserve_bytes))
               if (( max_target_bytes < 0 )); then
                 max_target_bytes=0
               fi
@@ -1405,27 +1417,68 @@ runs:
 
             create_swapfile() {
               local target_bytes="$1"
-              local mib_count remainder_bytes
+              local mib_count remainder_bytes replacement_path backup_path
+              local old_swap_active=0
 
-              remove_managed_swapfile
+              replacement_path=$(sudo mktemp /mnt/swapfile.new.XXXXXX)
+              backup_path="/mnt/swapfile.previous.$$"
 
               echo "Creating swapfile at /mnt/swapfile with size $(humanize_bytes "$target_bytes")..."
-              if ! sudo fallocate -l "$target_bytes" /mnt/swapfile 2>/dev/null; then
+              if ! sudo fallocate -l "$target_bytes" "$replacement_path" 2>/dev/null; then
                 mib_count=$((target_bytes / 1024 / 1024))
                 if (( mib_count > 0 )); then
-                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count="$mib_count" status=none
+                  if ! sudo dd if=/dev/zero of="$replacement_path" bs=1M count="$mib_count" status=none; then
+                    sudo rm -f "$replacement_path"
+                    return 1
+                  fi
                 else
-                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1 count=0 status=none
+                  sudo dd if=/dev/zero of="$replacement_path" bs=1 count=0 status=none
                 fi
                 remainder_bytes=$((target_bytes - mib_count * 1024 * 1024))
                 if (( remainder_bytes > 0 )); then
-                  sudo dd if=/dev/zero of=/mnt/swapfile bs=1 count="$remainder_bytes" seek=$((mib_count * 1024 * 1024)) conv=notrunc status=none
+                  if ! sudo dd if=/dev/zero of="$replacement_path" bs=1 count="$remainder_bytes" seek=$((mib_count * 1024 * 1024)) conv=notrunc status=none; then
+                    sudo rm -f "$replacement_path"
+                    return 1
+                  fi
                 fi
               fi
 
-              sudo chmod 600 /mnt/swapfile
-              sudo mkswap /mnt/swapfile >/dev/null
-              sudo swapon /mnt/swapfile
+              sudo chmod 600 "$replacement_path"
+              if ! sudo mkswap "$replacement_path" >/dev/null; then
+                sudo rm -f "$replacement_path"
+                return 1
+              fi
+
+              if swapon --show=NAME --noheadings 2>/dev/null | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+                old_swap_active=1
+              fi
+              if ! disable_managed_swapfile; then
+                sudo rm -f "$replacement_path"
+                return 1
+              fi
+
+              if [[ -e /mnt/swapfile ]] && ! sudo mv /mnt/swapfile "$backup_path"; then
+                [[ "$old_swap_active" == "1" ]] && sudo swapon /mnt/swapfile
+                sudo rm -f "$replacement_path"
+                return 1
+              fi
+
+              if ! sudo mv "$replacement_path" /mnt/swapfile; then
+                [[ -e "$backup_path" ]] && sudo mv "$backup_path" /mnt/swapfile
+                [[ "$old_swap_active" == "1" ]] && sudo swapon /mnt/swapfile
+                return 1
+              fi
+
+              if ! sudo swapon /mnt/swapfile; then
+                sudo rm -f /mnt/swapfile
+                if [[ -e "$backup_path" ]]; then
+                  sudo mv "$backup_path" /mnt/swapfile
+                  [[ "$old_swap_active" == "1" ]] && sudo swapon /mnt/swapfile
+                fi
+                return 1
+              fi
+
+              sudo rm -f "$backup_path"
               if ! grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
                 echo '/mnt/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
               fi

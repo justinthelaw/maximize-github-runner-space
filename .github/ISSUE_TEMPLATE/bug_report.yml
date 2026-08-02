@@ -22,7 +22,7 @@ body:
     id: workflow
     attributes:
       label: Workflow Snippet
-      description: Include the step that runs this action
+      description: Include the step that runs this action and redact any secrets or private values
       render: yaml
     validations:
       required: true
@@ -60,6 +60,6 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Include the relevant run output
+      description: Include the relevant run output after redacting tokens, credentials, and private paths
     validations:
       required: true

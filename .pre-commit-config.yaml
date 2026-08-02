@@ -52,7 +52,7 @@ repos:
     hooks:
       - id: yamllint
         name: YAML Lint
-        args: ["-c=.yamllint"]
+        args: ["--strict", "-c=.yamllint"]
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/rhysd/actionlint

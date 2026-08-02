@@ -4,7 +4,7 @@ Describe what changed and why.
 
 ## Validation
 
-- [ ] `pre-commit run --all-files`
+- [ ] `pre-commit run --all-files --hook-stage pre-push`
 - [ ] Test workflow assertions remain accurate
 - [ ] README and docs updated for behavior changes
 

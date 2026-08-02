@@ -5,6 +5,20 @@ This document captures breaking changes and notable behavior shifts between rele
 ## Table of Contents
 
 - [0.6.x -> 0.7.0](#06x---070)
+- [0.7.x -> 0.8.0](#07x---080)
+- [0.8.x -> 0.9.0](#08x---090)
+
+## 0.8.x -> 0.9.0
+
+Invalid `cleanup-profile` values and unknown `skip-components` entries now fail before cleanup begins. Correct misspelled or obsolete values instead of relying on them being ignored.
+
+## 0.7.x -> 0.8.0
+
+Swapfile management is now explicitly opt-in through `swapfile-size`:
+
+- Replace `remove-swapfile: "true"` with `swapfile-size: 0`.
+- Remove `swapfile` from `skip-components`; omitting `swapfile-size` now leaves the runner swapfile unchanged.
+- To resize swap instead of removing it, set a positive size such as `2G`.
 
 ## 0.6.x -> 0.7.0
 
