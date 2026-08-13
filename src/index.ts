@@ -6,6 +6,7 @@ import {
   createUnsupportedOperation,
 } from "./operations.js";
 import { createPlan } from "./planner.js";
+import { readActionInput } from "./inputs.js";
 import { createLinuxAdapter } from "./platforms/linux.js";
 import { createMacOSAdapter } from "./platforms/macos.js";
 import { createWindowsAdapter } from "./platforms/windows.js";
@@ -30,7 +31,7 @@ async function adapterForPlatform(context: RuntimeContext): Promise<Adapter> {
 }
 
 async function run(): Promise<void> {
-  const plan = createPlan((name) => core.getInput(name));
+  const plan = createPlan(readActionInput);
   const context = await createRuntimeContext();
 
   if (!context.isGitHubHosted) {
