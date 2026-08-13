@@ -169,7 +169,10 @@ jobs:
           test -d "${RUNNER_TOOL_CACHE}/node"
           test ! -e "${RUNNER_TOOL_CACHE}/Python"
           command -v firefox >/dev/null
-          ! command -v google-chrome >/dev/null 2>&1
+          if command -v google-chrome >/dev/null 2>&1; then
+            echo "google-chrome should have been removed" >&2
+            exit 1
+          fi
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
