@@ -63,6 +63,7 @@ test("the public outputs are stable and documented", async () => {
     "available-bytes-before",
     "available-bytes-after",
     "reclaimed-bytes",
+    "failed-operations",
     "platform",
     "architecture",
   ]);

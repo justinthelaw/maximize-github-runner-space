@@ -10,11 +10,16 @@ import { createMacOSAdapter } from "../src/platforms/macos.js";
 import {
   classifyPostgreSqlServiceInventory,
   createWindowsAdapter,
+  createWindowsServiceCoordinator,
   isMissingWindowsService,
   isStoppedWindowsService,
   isStrictWindowsDescendant,
+  managedDirectoryUninstallOperation,
   PINNED_WINDOWS_WEB_SERVICE_NAMES,
   POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
+  type WindowsManagedPathProbe,
+  type WindowsServiceControl,
+  windowsPaths,
 } from "../src/platforms/windows.js";
 import { prepareOperations } from "../src/operations.js";
 import { createPlan } from "../src/planner.js";
@@ -320,7 +325,7 @@ test("Windows Docker engine cleanup owns its image data without a redundant prun
     false,
   );
   assert.equal(
-    prepared.find(({ id }) => id === "windows:docker:service")?.phase,
+    prepared.find(({ id }) => id === "windows:services:stop")?.phase,
     "preflight",
   );
   assert.equal(
@@ -455,7 +460,7 @@ test("Windows PostgreSQL cleanup has a fatal service-stop precondition", async (
     await adapter.operations(planFor("postgresql")),
     planFor("postgresql"),
   );
-  const stop = prepared.find(({ id }) => id === "windows:postgresql:services");
+  const stop = prepared.find(({ id }) => id === "windows:services:stop");
   assert.equal(stop?.phase, "preflight");
   assert.equal(stop?.fatal, true);
 });
@@ -468,13 +473,13 @@ test("Windows Apache and Nginx cleanup have exact fatal service-stop preconditio
   for (const expected of [
     {
       component: "apache" as const,
-      serviceId: "windows:apache:service",
+      serviceId: "windows:services:stop",
       packageId: "windows:choco:apache:apache-httpd",
       residualId: "windows:residual:apache:C:\\tools\\Apache24",
     },
     {
       component: "nginx" as const,
-      serviceId: "windows:nginx:service",
+      serviceId: "windows:services:stop",
       packageId: "windows:choco:nginx:nginx",
     },
   ]) {
@@ -508,6 +513,185 @@ test("Windows Apache and Nginx cleanup have exact fatal service-stop preconditio
   }
 });
 
+test("Windows service coordination discovers the complete selected set before stopping", async () => {
+  const calls: string[] = [];
+  const stopped = new Set<string>();
+  const inventoryOutput = [
+    "SERVICE_NAME: postgresql-x64-16",
+    "SERVICE_NAME: docker",
+  ].join("\r\n");
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => {
+      calls.push("exists");
+      return true;
+    },
+    inventory: async () => {
+      calls.push("inventory");
+      return result(inventoryOutput);
+    },
+    query: async (name) => {
+      calls.push(`query:${name}`);
+      return result(
+        stopped.has(name) ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n",
+      );
+    },
+    stop: async (name) => {
+      calls.push(`stop:${name}`);
+      stopped.add(name);
+      return result("");
+    },
+    delete: async (name) => {
+      calls.push(`delete:${name}`);
+      return result("");
+    },
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache", "nginx", "postgresql", "docker-engine"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  const operationResult = await operation.run();
+  assert.equal(operationResult.status, "removed");
+
+  const firstStop = calls.findIndex((call) => call.startsWith("stop:"));
+  assert.notEqual(firstStop, -1);
+  assert.deepEqual(
+    calls.slice(0, firstStop).filter((call) => call !== "exists"),
+    [
+      "inventory",
+      "query:docker",
+      "query:Apache",
+      "query:nginx",
+      "query:postgresql-x64-16",
+      "inventory",
+      "query:docker",
+      "query:Apache",
+      "query:nginx",
+      "query:postgresql-x64-16",
+    ],
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.startsWith("stop:")),
+    ["stop:docker", "stop:Apache", "stop:nginx", "stop:postgresql-x64-16"],
+  );
+  assert.equal(calls.at(-1), "delete:docker");
+});
+
+test("Windows service coordination rejects later discovery failure before any stop", async () => {
+  const calls: string[] = [];
+  let nginxQueries = 0;
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: docker\r\n"),
+    query: async (name) => {
+      calls.push(`query:${name}`);
+      if (name === "nginx" && ++nginxQueries === 2) {
+        return result("", 5, "Access is denied");
+      }
+      return result("STATE : 4 RUNNING\r\n");
+    },
+    stop: async (name) => {
+      calls.push(`stop:${name}`);
+      return result("");
+    },
+    delete: async () => result(""),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache", "nginx"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  const operationResult = await operation.run();
+  assert.equal(operationResult.status, "failed");
+  assert.equal(
+    calls.some((call) => call.startsWith("stop:")),
+    false,
+  );
+});
+
+test("Windows service coordination rejects PostgreSQL membership changes after stop", async () => {
+  let inventories = 0;
+  const stopped = new Set<string>();
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => {
+      inventories += 1;
+      return result(
+        inventories < 3
+          ? "SERVICE_NAME: postgresql-x64-16\r\n"
+          : "SERVICE_NAME: postgresql-x64-16\r\nSERVICE_NAME: postgresql-x64-17\r\n",
+      );
+    },
+    query: async (name) =>
+      result(
+        stopped.has(name) ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n",
+      ),
+    stop: async (name) => {
+      stopped.add(name);
+      return result("");
+    },
+    delete: async () => result(""),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("postgresql"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  const operationResult = await operation.run();
+  assert.equal(operationResult.status, "failed");
+  assert.match(operationResult.detail ?? "", /changed or reactivated/);
+});
+
+test("Windows service coordination recognizes canonical stopped output without mutation", async () => {
+  let stops = 0;
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: docker\r\n"),
+    query: async () => result("        STATE              : 1  STOPPED\r\n"),
+    stop: async () => {
+      stops += 1;
+      return result("");
+    },
+    delete: async () => result(""),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  const operationResult = await operation.run();
+  assert.equal(operationResult.status, "removed");
+  assert.equal(stops, 0);
+});
+
 test("Windows manual path removers participate in complete-plan validation", async () => {
   const adapter = await createWindowsAdapter(contextFor("windows"));
   const plan = planFor("miniconda", "php", "docker-engine");
@@ -524,6 +708,95 @@ test("Windows manual path removers participate in complete-plan validation", asy
     manualPathOperations.every(({ validate }) => validate !== undefined),
     true,
   );
+});
+
+test("Windows managed uninstall rejects a junction root and linked uninstaller", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  const stats = (
+    kind: "directory" | "file",
+    link = false,
+  ): Awaited<ReturnType<WindowsManagedPathProbe["lstat"]>> => ({
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file",
+    isSymbolicLink: () => link,
+    dev: 1n,
+    ino: kind === "directory" ? 2n : 3n,
+    size: 4n,
+    mtimeNs: 5n,
+  });
+  for (const probe of [
+    {
+      lstat: async (path: string) => {
+        assert.equal(path, root);
+        return stats("directory", true);
+      },
+    },
+    {
+      lstat: async (path: string) => {
+        if (path === root) return stats("directory");
+        assert.equal(path, executable);
+        return stats("file", true);
+      },
+    },
+  ] satisfies readonly WindowsManagedPathProbe[]) {
+    let executed = false;
+    const operation = managedDirectoryUninstallOperation({
+      context: contextFor("windows"),
+      component: "miniconda",
+      id: "miniconda-test",
+      description: "test Miniconda",
+      target: root,
+      uninstaller: "Uninstall-Miniconda3.exe",
+      args: ["/S"],
+      probe,
+      execute: async () => {
+        executed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await assert.rejects(operation.validate(), /unexpected target type/);
+    assert.equal(executed, false);
+  }
+});
+
+test("Windows managed uninstall rechecks file identity immediately before spawn", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  let executableChecks = 0;
+  let executed = false;
+  const probe: WindowsManagedPathProbe = {
+    lstat: async (path) => ({
+      isDirectory: () => path === root,
+      isFile: () => path === executable,
+      isSymbolicLink: () => false,
+      dev: 1n,
+      ino: path === root ? 2n : ++executableChecks === 1 ? 3n : 99n,
+      size: 4n,
+      mtimeNs: 5n,
+    }),
+  };
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-test",
+    description: "test Miniconda",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe,
+    execute: async () => {
+      executed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /changed after plan validation/);
+  assert.equal(executed, false);
 });
 
 test("swapfile discovery distinguishes absence from command failure", () => {

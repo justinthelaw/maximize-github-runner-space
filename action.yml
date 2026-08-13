@@ -247,6 +247,8 @@ outputs:
     description: "Available bytes on the runner system volume after cleanup"
   reclaimed-bytes:
     description: "Net additional available bytes after cleanup"
+  failed-operations:
+    description: "Number of best-effort cleanup operations that reported failure"
   platform:
     description: "Detected platform: linux, macos, or windows"
   architecture:

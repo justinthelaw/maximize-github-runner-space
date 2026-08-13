@@ -98,7 +98,7 @@ async function run(): Promise<void> {
   core.info(`Scheduled operations: ${operations.length}`);
 
   const results = await executeOperations(operations);
-  reportResults(results);
+  const operationCounts = reportResults(results);
 
   const after = await availableBytes(context);
   const reclaimed = after > before ? after - before : 0n;
@@ -108,13 +108,13 @@ async function run(): Promise<void> {
   core.setOutput("available-bytes-before", before.toString());
   core.setOutput("available-bytes-after", after.toString());
   core.setOutput("reclaimed-bytes", reclaimed.toString());
+  core.setOutput("failed-operations", operationCounts.failed.toString());
   core.setOutput("platform", context.platform);
   core.setOutput("architecture", context.architecture);
 
-  const failures = results.filter((result) => result.status === "failed");
-  if (failures.length > 0) {
+  if (operationCounts.failed > 0) {
     core.warning(
-      `${failures.length} cleanup operation(s) failed. Cleanup remains best-effort for backward compatibility.`,
+      `${operationCounts.failed} cleanup operation(s) failed. Cleanup remains best-effort for backward compatibility.`,
     );
   }
 }

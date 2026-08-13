@@ -45,6 +45,7 @@ runs:
         BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
         AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
         RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
         PLATFORM: ${{ steps.cleanup.outputs.platform }}
         ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
         EXPECTED_PLATFORM: ${{ inputs.expected-platform }}
@@ -54,6 +55,7 @@ runs:
         [[ "$BEFORE" =~ ^[0-9]+$ ]]
         [[ "$AFTER" =~ ^[0-9]+$ ]]
         [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+        [[ "$FAILED_OPERATIONS" == 0 ]]
         [[ "$PLATFORM" == "$EXPECTED_PLATFORM" ]]
         [[ "$ARCHITECTURE" == "$EXPECTED_ARCHITECTURE" ]]
         if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
@@ -68,6 +70,7 @@ runs:
         BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
         AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
         RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
         PLATFORM: ${{ steps.cleanup.outputs.platform }}
         ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
         EXPECTED_PLATFORM: ${{ inputs.expected-platform }}
@@ -76,6 +79,7 @@ runs:
         if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
         if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
         if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
+        if ($env:FAILED_OPERATIONS -ne '0') { throw 'A bounded cleanup operation failed.' }
         if ($env:PLATFORM -ne $env:EXPECTED_PLATFORM) { throw 'Platform mismatch.' }
         if ($env:ARCHITECTURE -ne $env:EXPECTED_ARCHITECTURE) { throw 'Architecture mismatch.' }
         if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
@@ -94,6 +98,7 @@ runs:
 
     - name: Exercise verified Homebrew cleanup on macOS
       if: runner.os == 'macOS'
+      id: homebrew-cleanup
       uses: ./
       env:
         PATH: ${{ runner.temp }}/untrusted-bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
@@ -105,8 +110,11 @@ runs:
     - name: Verify the Homebrew package and prefix boundary on macOS
       if: runner.os == 'macOS'
       shell: bash
+      env:
+        FAILED_OPERATIONS: ${{ steps.homebrew-cleanup.outputs.failed-operations }}
       run: |
         set -euo pipefail
+        [[ "$FAILED_OPERATIONS" == 0 ]]
         if command -v gh >/dev/null 2>&1; then
           echo "GitHub CLI was not removed through verified Homebrew" >&2
           exit 1

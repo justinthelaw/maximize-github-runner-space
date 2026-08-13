@@ -16,6 +16,7 @@
   repository-specific or private values, but keep the image identifiers intact.
 - Include the action tag or full commit SHA, the cleanup step's workflow snippet, and every supplied input.
 - Include any `available-bytes-before`, `available-bytes-after`,
-  `reclaimed-bytes`, `platform`, and `architecture` outputs the action emitted.
+  `reclaimed-bytes`, `failed-operations`, `platform`, and `architecture` outputs
+  the action emitted.
   Fatal failures can occur before outputs are emitted.
 - Include the action's per-operation summary and relevant failure logs with credentials and other secrets removed.

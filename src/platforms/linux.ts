@@ -1,5 +1,13 @@
 import { constants } from "node:fs";
-import { access, lstat, mkdir, readdir, realpath } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import {
   commandExists,
@@ -555,6 +563,8 @@ export function createLinuxServiceStopOperation(
 const LINUXBREW_PREFIX = "/home/linuxbrew/.linuxbrew";
 const LINUXBREW_CANDIDATE = `${LINUXBREW_PREFIX}/bin/brew`;
 const LINUXBREW_EXECUTABLE = `${LINUXBREW_PREFIX}/Homebrew/bin/brew`;
+const LINUXBREW_CONFIG_ROOT = "/tmp";
+const LINUXBREW_CONFIG_DIRECTORY_PREFIX = `${LINUXBREW_CONFIG_ROOT}/maximize-github-runner-space-brew-config-`;
 
 interface LinuxBrewPathStats {
   isFile(): boolean;
@@ -634,6 +644,8 @@ type LinuxBrewRunner = (
   args: readonly string[],
   environment: NodeJS.ProcessEnv,
 ) => Promise<CommandResult>;
+type LinuxBrewConfigDirectoryFactory = () => Promise<string>;
+type LinuxBrewConfigDirectoryRemover = (path: string) => Promise<void>;
 
 function linuxBrewMutablePaths(context: RuntimeContext): {
   readonly cache: string;
@@ -643,7 +655,10 @@ function linuxBrewMutablePaths(context: RuntimeContext): {
   return { cache, logs: posix.join(cache, "Logs") };
 }
 
-function linuxBrewEnvironment(context: RuntimeContext): NodeJS.ProcessEnv {
+function linuxBrewEnvironment(
+  context: RuntimeContext,
+  configDirectory: string,
+): NodeJS.ProcessEnv {
   const paths = linuxBrewMutablePaths(context);
   return {
     HOME: context.home,
@@ -657,9 +672,11 @@ function linuxBrewEnvironment(context: RuntimeContext): NodeJS.ProcessEnv {
     CI: "true",
     GITHUB_ACTIONS: "true",
     XDG_CACHE_HOME: posix.join(context.home, ".cache"),
-    // /dev/null cannot contain Homebrew's user brew.env. The system and
-    // definition-prefix configuration files are separately required absent.
-    XDG_CONFIG_HOME: "/dev/null",
+    // Homebrew expects this to be a directory even when no user brew.env is
+    // present. The caller creates a fresh action-owned directory for each
+    // invocation; system and prefix configuration are separately required
+    // absent below.
+    XDG_CONFIG_HOME: configDirectory,
     HOMEBREW_PREFIX: LINUXBREW_PREFIX,
     HOMEBREW_REPOSITORY: `${LINUXBREW_PREFIX}/Homebrew`,
     HOMEBREW_CELLAR: `${LINUXBREW_PREFIX}/Cellar`,
@@ -671,6 +688,51 @@ function linuxBrewEnvironment(context: RuntimeContext): NodeJS.ProcessEnv {
     HOMEBREW_NO_AUTOREMOVE: "1",
   };
 }
+
+async function assertLinuxBrewConfigDirectory(
+  path: string,
+  context: RuntimeContext,
+  requireEmpty = false,
+): Promise<void> {
+  const normalized = posix.normalize(path);
+  const name = posix.basename(normalized);
+  const expectedPrefix = posix.basename(LINUXBREW_CONFIG_DIRECTORY_PREFIX);
+  if (
+    path !== normalized ||
+    dirname(normalized) !== LINUXBREW_CONFIG_ROOT ||
+    !name.startsWith(expectedPrefix) ||
+    name.length <= expectedPrefix.length
+  ) {
+    throw new Error(`Refusing unsafe Linuxbrew config directory: '${path}'.`);
+  }
+
+  await assertSafeDirectoryTarget(path, [LINUXBREW_CONFIG_ROOT], context);
+  const stat = await lstat(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(
+      `Refusing non-directory Linuxbrew config target: '${path}'.`,
+    );
+  }
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new Error(`Refusing unowned Linuxbrew config directory: '${path}'.`);
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(
+      `Refusing shared Linuxbrew config directory permissions: '${path}'.`,
+    );
+  }
+  if (requireEmpty && (await readdir(path)).length !== 0) {
+    throw new Error(
+      `Refusing non-empty Linuxbrew config directory: '${path}'.`,
+    );
+  }
+}
+
+const NODE_LINUX_BREW_CONFIG_DIRECTORY_FACTORY: LinuxBrewConfigDirectoryFactory =
+  async () => await mkdtemp(LINUXBREW_CONFIG_DIRECTORY_PREFIX);
+
+const NODE_LINUX_BREW_CONFIG_DIRECTORY_REMOVER: LinuxBrewConfigDirectoryRemover =
+  async (path) => await rm(path, { recursive: true, force: true });
 
 const LINUXBREW_CONFIG_FILES = [
   "/etc/homebrew/brew.env",
@@ -710,6 +772,8 @@ export function createLinuxHomebrewCleanupOperation(
       timeoutMs: 10 * 60_000,
     }),
   inspectConfig: LinuxBrewConfigProbe = NODE_LINUX_BREW_CONFIG_PROBE,
+  createConfigDirectory: LinuxBrewConfigDirectoryFactory = NODE_LINUX_BREW_CONFIG_DIRECTORY_FACTORY,
+  removeConfigDirectory: LinuxBrewConfigDirectoryRemover = NODE_LINUX_BREW_CONFIG_DIRECTORY_REMOVER,
 ): Operation {
   let validationComplete = false;
   let validatedExecutable: ResolvedLinuxBrew | undefined;
@@ -769,11 +833,55 @@ export function createLinuxHomebrewCleanupOperation(
       // A recursive prefix removal or `uninstall --force` would therefore own
       // workflow additions, not definition content. Native cleanup removes
       // only stale package-manager artifacts and retains current packages.
-      const result = await execute(
-        LINUXBREW_CANDIDATE,
-        ["cleanup", "--prune=120"],
-        linuxBrewEnvironment(context),
-      );
+      let configDirectory: string;
+      try {
+        configDirectory = await createConfigDirectory();
+        await assertLinuxBrewConfigDirectory(configDirectory, context, true);
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: `could not create a safe Linuxbrew config directory: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+
+      let result: CommandResult | undefined;
+      let executionError: unknown;
+      try {
+        result = await execute(
+          LINUXBREW_CANDIDATE,
+          ["cleanup", "--prune=120"],
+          linuxBrewEnvironment(context, configDirectory),
+        );
+      } catch (error) {
+        executionError = error;
+      }
+
+      let removalError: unknown;
+      try {
+        await assertLinuxBrewConfigDirectory(configDirectory, context);
+        await removeConfigDirectory(configDirectory);
+      } catch (error) {
+        removalError = error;
+      }
+
+      if (executionError !== undefined) {
+        return {
+          status: "failed",
+          detail: `Linuxbrew cleanup could not execute: ${executionError instanceof Error ? executionError.message : String(executionError)}${removalError === undefined ? "" : `; temporary config cleanup failed: ${removalError instanceof Error ? removalError.message : String(removalError)}`}`,
+        };
+      }
+      if (removalError !== undefined) {
+        return {
+          status: "failed",
+          detail: `temporary Linuxbrew config cleanup failed: ${removalError instanceof Error ? removalError.message : String(removalError)}`,
+        };
+      }
+      if (result === undefined) {
+        return {
+          status: "failed",
+          detail: "Linuxbrew cleanup returned no command result",
+        };
+      }
       return result.exitCode === 0
         ? {
             status: "removed",

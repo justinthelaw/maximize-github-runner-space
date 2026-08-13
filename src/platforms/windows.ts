@@ -1,4 +1,4 @@
-import { access, mkdir, readdir } from "node:fs/promises";
+import { access, lstat, mkdir, readdir } from "node:fs/promises";
 import { win32 } from "node:path";
 import { runCommand } from "../command.js";
 import { COMPONENTS } from "../components.js";
@@ -119,9 +119,37 @@ export function isStoppedWindowsService(result: CommandResult): boolean {
   );
 }
 
-interface WindowsServiceStopResult {
-  readonly status: "stopped" | "missing" | "failed";
-  readonly detail?: string;
+interface WindowsServiceTarget {
+  readonly component: ComponentId;
+  readonly serviceName: string;
+  readonly unregister: boolean;
+}
+
+interface WindowsPathStats {
+  isDirectory(): boolean;
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+}
+
+export interface WindowsManagedPathProbe {
+  lstat(path: string): Promise<WindowsPathStats>;
+}
+
+interface WindowsServiceSnapshot extends WindowsServiceTarget {
+  readonly status: "present" | "missing";
+  readonly state: number;
+}
+
+export interface WindowsServiceControl {
+  exists(): Promise<boolean>;
+  inventory(): Promise<CommandResult>;
+  query(serviceName: string): Promise<CommandResult>;
+  stop(serviceName: string): Promise<CommandResult>;
+  delete(serviceName: string): Promise<CommandResult>;
 }
 const DEFINITION_POWERSHELL_MODULES = [
   "DockerMsftProvider",
@@ -136,7 +164,7 @@ const DEFINITION_POWERSHELL_MODULES = [
   "AWSPowershell",
 ] as const;
 
-interface WindowsPaths {
+export interface WindowsPaths {
   readonly drive: string;
   readonly systemRoot: string;
   readonly system32: string;
@@ -183,7 +211,7 @@ function absoluteEnvironmentPath(name: string, fallback: string): string {
     : fallback;
 }
 
-function windowsPaths(): WindowsPaths {
+export function windowsPaths(): WindowsPaths {
   // Every supported standard Windows runner definition uses C: for the OS and
   // image-owned software roots. Never let workflow-controlled HOME/SystemDrive
   // redirect system cleanup to another volume.
@@ -254,81 +282,231 @@ function failureDetail(
   return stderr.trim() || `${win32.basename(executable)} exited ${exitCode}`;
 }
 
-async function ensureWindowsServiceStopped(
+function windowsServiceControl(paths: WindowsPaths): WindowsServiceControl {
+  return {
+    exists: async () => await pathExists(paths.serviceControl),
+    inventory: async () =>
+      await runCommand(
+        paths.serviceControl,
+        POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
+        {
+          silent: true,
+          timeoutMs: 30_000,
+        },
+      ),
+    query: async (serviceName) =>
+      await runCommand(paths.serviceControl, ["query", serviceName], {
+        silent: true,
+        timeoutMs: 30_000,
+      }),
+    stop: async (serviceName) =>
+      await runCommand(paths.serviceControl, ["stop", serviceName], {
+        silent: true,
+        timeoutMs: 30_000,
+      }),
+    delete: async (serviceName) =>
+      await runCommand(paths.serviceControl, ["delete", serviceName], {
+        silent: true,
+        timeoutMs: 30_000,
+      }),
+  };
+}
+
+function selectedFixedWindowsServices(
+  plan: CleanupPlan,
+): readonly WindowsServiceTarget[] {
+  const definitions = [
+    {
+      component: "docker-engine",
+      serviceName: "docker",
+      unregister: true,
+    },
+    {
+      component: "apache",
+      serviceName: PINNED_WINDOWS_WEB_SERVICE_NAMES.apache,
+      unregister: false,
+    },
+    {
+      component: "nginx",
+      serviceName: PINNED_WINDOWS_WEB_SERVICE_NAMES.nginx,
+      unregister: false,
+    },
+  ] as const satisfies readonly WindowsServiceTarget[];
+  return definitions.filter(({ component }) => plan.enabled.has(component));
+}
+
+function windowsServiceFailure(
   paths: WindowsPaths,
   serviceName: string,
-): Promise<WindowsServiceStopResult> {
-  const serviceFailure = (result: CommandResult): string =>
+  result: CommandResult,
+): Error {
+  return new Error(
     `${serviceName}: ${failureDetail(
       result.stderr || result.stdout,
       paths.serviceControl,
       result.exitCode,
-    )}`;
-  const initial = await runCommand(
-    paths.serviceControl,
-    ["query", serviceName],
-    { silent: true, timeoutMs: 30_000 },
+    )}`,
   );
-  if (isMissingWindowsService(initial)) return { status: "missing" };
-  if (initial.exitCode !== 0) {
-    return { status: "failed", detail: serviceFailure(initial) };
-  }
-  if (isStoppedWindowsService(initial)) return { status: "stopped" };
-
-  const stop = await runCommand(paths.serviceControl, ["stop", serviceName], {
-    silent: true,
-    timeoutMs: 30_000,
-  });
-  if (isMissingWindowsService(stop)) return { status: "missing" };
-  if (stop.exitCode !== 0) {
-    return { status: "failed", detail: serviceFailure(stop) };
-  }
-
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const status = await runCommand(
-      paths.serviceControl,
-      ["query", serviceName],
-      { silent: true, timeoutMs: 5_000 },
-    );
-    if (isMissingWindowsService(status)) return { status: "missing" };
-    if (status.exitCode !== 0) {
-      return { status: "failed", detail: serviceFailure(status) };
-    }
-    if (isStoppedWindowsService(status)) return { status: "stopped" };
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  return {
-    status: "failed",
-    detail: `${serviceName} did not stop within 30 seconds`,
-  };
 }
 
-function fixedWindowsServiceStopOperation(
+async function discoverWindowsServices(
   paths: WindowsPaths,
-  component: ComponentId,
-  serviceName: string,
-  description: string,
-): Operation {
+  plan: CleanupPlan,
+  control: WindowsServiceControl,
+): Promise<readonly WindowsServiceSnapshot[]> {
+  if (!(await control.exists())) throw new Error("sc.exe is unavailable");
+
+  const targets = [...selectedFixedWindowsServices(plan)];
+  if (plan.enabled.has("postgresql")) {
+    const inventory = await control.inventory();
+    if (inventory.exitCode !== 0) {
+      throw windowsServiceFailure(paths, "PostgreSQL inventory", inventory);
+    }
+    const classified = classifyPostgreSqlServiceInventory(
+      `${inventory.stdout}\n${inventory.stderr}`,
+    );
+    if (classified.status === "unsafe") throw new Error(classified.detail);
+    targets.push(
+      ...classified.serviceNames.map((serviceName) => ({
+        component: "postgresql" as const,
+        serviceName,
+        unregister: false,
+      })),
+    );
+  }
+
+  const snapshots: WindowsServiceSnapshot[] = [];
+  for (const target of targets) {
+    const result = await control.query(target.serviceName);
+    if (isMissingWindowsService(result)) {
+      snapshots.push({ ...target, status: "missing", state: 0 });
+      continue;
+    }
+    if (result.exitCode !== 0) {
+      throw windowsServiceFailure(paths, target.serviceName, result);
+    }
+    const stateText = /^\s*STATE\s*:\s*(\d+)\s+[A-Z_]+\b/im.exec(
+      result.stdout,
+    )?.[1];
+    const state = stateText === undefined ? undefined : Number(stateText);
+    if (state === undefined || !Number.isSafeInteger(state)) {
+      throw new Error(
+        `${target.serviceName}: sc.exe returned no service state`,
+      );
+    }
+    snapshots.push({ ...target, status: "present", state });
+  }
+  return snapshots;
+}
+
+function sameWindowsServiceSnapshot(
+  left: readonly WindowsServiceSnapshot[],
+  right: readonly WindowsServiceSnapshot[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (target, index) =>
+        target.component === right[index]?.component &&
+        target.serviceName === right[index]?.serviceName &&
+        target.unregister === right[index]?.unregister &&
+        target.status === right[index]?.status &&
+        target.state === right[index]?.state,
+    )
+  );
+}
+
+async function stopWindowsService(
+  paths: WindowsPaths,
+  target: WindowsServiceSnapshot,
+  control: WindowsServiceControl,
+): Promise<void> {
+  if (target.status === "missing") return;
+  if (target.state === 1) return;
+  const stop = await control.stop(target.serviceName);
+  if (isMissingWindowsService(stop)) return;
+  if (stop.exitCode !== 0) {
+    throw windowsServiceFailure(paths, target.serviceName, stop);
+  }
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const status = await control.query(target.serviceName);
+    if (isMissingWindowsService(status) || isStoppedWindowsService(status)) {
+      return;
+    }
+    if (status.exitCode !== 0) {
+      throw windowsServiceFailure(paths, target.serviceName, status);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`${target.serviceName} did not stop within 30 seconds`);
+}
+
+export function createWindowsServiceCoordinator(
+  paths: WindowsPaths,
+  plan: CleanupPlan,
+  control: WindowsServiceControl = windowsServiceControl(paths),
+): Operation | undefined {
+  const fixed = selectedFixedWindowsServices(plan);
+  if (fixed.length === 0 && !plan.enabled.has("postgresql")) return undefined;
+  const component = fixed[0]?.component ?? "postgresql";
+  let validated: readonly WindowsServiceSnapshot[] | undefined;
+  const validate = async (): Promise<void> => {
+    validated = await discoverWindowsServices(paths, plan, control);
+  };
   return createFunctionOperation({
-    id: `windows:${component}:service`,
+    id: "windows:services:stop",
     component,
-    description,
+    description: "Stop selected Windows services before cleanup",
     phase: "preflight",
-    dedupeKey: `windows:service:${serviceName.toLowerCase()}`,
+    dedupeKey: "windows:services:stop",
     fatal: true,
+    validate,
     run: async (): Promise<OperationResult> => {
-      if (!(await pathExists(paths.serviceControl))) {
-        return { status: "failed", detail: "sc.exe is unavailable" };
-      }
-      const result = await ensureWindowsServiceStopped(paths, serviceName);
-      if (result.status === "missing") return { status: "not-found" };
-      if (result.status === "failed") {
+      try {
+        validated ??= await discoverWindowsServices(paths, plan, control);
+        const immediate = await discoverWindowsServices(paths, plan, control);
+        if (!sameWindowsServiceSnapshot(validated, immediate)) {
+          return {
+            status: "failed",
+            detail: "Windows service inventory changed after plan validation",
+          };
+        }
+        for (const target of immediate) {
+          await stopWindowsService(paths, target, control);
+        }
+        const stopped = await discoverWindowsServices(paths, plan, control);
+        if (
+          stopped.length !== immediate.length ||
+          stopped.some(
+            (target, index) =>
+              target.component !== immediate[index]?.component ||
+              target.serviceName !== immediate[index]?.serviceName ||
+              target.unregister !== immediate[index]?.unregister ||
+              (target.status === "present" && target.state !== 1),
+          )
+        ) {
+          return {
+            status: "failed",
+            detail:
+              "Windows service inventory changed or reactivated after stop",
+          };
+        }
+        for (const target of immediate) {
+          if (!target.unregister || target.status === "missing") continue;
+          const deleted = await control.delete(target.serviceName);
+          if (deleted.exitCode !== 0 && !isMissingWindowsService(deleted)) {
+            throw windowsServiceFailure(paths, target.serviceName, deleted);
+          }
+        }
+        return immediate.some(({ status }) => status === "present")
+          ? { status: "removed" }
+          : { status: "not-found" };
+      } catch (error) {
         return {
           status: "failed",
-          detail: result.detail ?? `${serviceName}: service stop failed`,
+          detail: error instanceof Error ? error.message : String(error),
         };
       }
-      return { status: "removed", detail: `${serviceName} is stopped` };
     },
   });
 }
@@ -864,7 +1042,7 @@ async function validateExactTarget(
   await validateRemovePathTarget(target, [win32.dirname(target)], context);
 }
 
-function managedDirectoryUninstallOperation(options: {
+export function managedDirectoryUninstallOperation(options: {
   readonly context: RuntimeContext;
   readonly component: ComponentId;
   readonly id: string;
@@ -872,31 +1050,118 @@ function managedDirectoryUninstallOperation(options: {
   readonly target: string;
   readonly uninstaller: string;
   readonly args: readonly string[];
+  readonly probe?: WindowsManagedPathProbe;
+  readonly execute?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
 }): Operation {
+  const probe = options.probe ?? {
+    lstat: async (path: string) => await lstat(path, { bigint: true }),
+  };
+  const execute =
+    options.execute ??
+    (async (path: string, args: readonly string[]) =>
+      await runCommand(path, args, {
+        silent: true,
+        timeoutMs: 30 * 60_000,
+      }));
+  const executable = win32.join(options.target, options.uninstaller);
+  const identity = (stats: WindowsPathStats) => ({
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+  });
+  type ManagedTargets =
+    | { readonly status: "root-absent" }
+    | {
+        readonly status: "root-present";
+        readonly root: ReturnType<typeof identity>;
+        readonly uninstaller?: ReturnType<typeof identity>;
+      };
+  const inspectManagedTargets = async (): Promise<ManagedTargets> => {
+    await validateExactTarget(options.context, options.target);
+    let root: WindowsPathStats;
+    try {
+      root = await probe.lstat(options.target);
+      if (root.isSymbolicLink() || !root.isDirectory()) {
+        throw new Error(
+          `Refusing managed directory with an unexpected target type: '${options.target}'.`,
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { status: "root-absent" };
+      }
+      throw error;
+    }
+    try {
+      const uninstaller = await probe.lstat(executable);
+      if (uninstaller.isSymbolicLink() || !uninstaller.isFile()) {
+        throw new Error(
+          `Refusing managed uninstaller with an unexpected target type: '${executable}'.`,
+        );
+      }
+      return {
+        status: "root-present",
+        root: identity(root),
+        uninstaller: identity(uninstaller),
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { status: "root-present", root: identity(root) };
+      }
+      throw error;
+    }
+  };
+  let validatedState: ManagedTargets | undefined;
+  const sameIdentity = (
+    left: ReturnType<typeof identity> | undefined,
+    right: ReturnType<typeof identity> | undefined,
+  ): boolean =>
+    left?.dev === right?.dev &&
+    left?.ino === right?.ino &&
+    left?.size === right?.size &&
+    left?.mtimeNs === right?.mtimeNs;
+  const sameTargets = (left: ManagedTargets, right: ManagedTargets): boolean =>
+    left.status === right.status &&
+    (left.status === "root-absent" ||
+      (right.status === "root-present" &&
+        sameIdentity(left.root, right.root) &&
+        sameIdentity(left.uninstaller, right.uninstaller)));
   return createFunctionOperation({
     id: `windows:managed-directory:${options.component}:${options.id}`,
     component: options.component,
     description: options.description,
     phase: "package",
     dedupeKey: `path:${win32.normalize(options.target).toLowerCase()}`,
-    validate: async () =>
-      await validateExactTarget(options.context, options.target),
+    validate: async () => {
+      validatedState = await inspectManagedTargets();
+    },
     run: async (): Promise<OperationResult> => {
       try {
-        await validateExactTarget(options.context, options.target);
+        if (validatedState === undefined) {
+          validatedState = await inspectManagedTargets();
+        }
+        const immediateState = await inspectManagedTargets();
+        if (!sameTargets(immediateState, validatedState)) {
+          return {
+            status: "failed",
+            detail: "managed uninstaller changed after plan validation",
+          };
+        }
       } catch (error) {
         return {
           status: "failed",
           detail: error instanceof Error ? error.message : String(error),
         };
       }
-      if (!(await pathExists(options.target))) return { status: "not-found" };
-      const executable = win32.join(options.target, options.uninstaller);
-      if (await pathExists(executable)) {
-        const result = await runCommand(executable, options.args, {
-          silent: true,
-          timeoutMs: 30 * 60_000,
-        });
+      if (validatedState.status === "root-absent") {
+        return { status: "not-found" };
+      }
+      if (validatedState.uninstaller !== undefined) {
+        const result = await execute(executable, options.args);
         if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
           return {
             status: "failed",
@@ -927,106 +1192,6 @@ function residualPathOperation(
     dedupeKey: `path:${win32.normalize(target).toLowerCase()}`,
     validate: async () => await validateExactTarget(context, target),
     run: async () => await removeExactTarget(context, target),
-  });
-}
-
-function postgresqlServiceOperation(paths: WindowsPaths): Operation {
-  return createFunctionOperation({
-    id: "windows:postgresql:services",
-    component: "postgresql",
-    description: "Stop runner-image PostgreSQL services before cleanup",
-    phase: "preflight",
-    dedupeKey: "windows:postgresql:services",
-    fatal: true,
-    run: async (): Promise<OperationResult> => {
-      if (!(await pathExists(paths.serviceControl))) {
-        return { status: "failed", detail: "sc.exe is unavailable" };
-      }
-
-      const inventory = await runCommand(
-        paths.serviceControl,
-        POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
-        { silent: true, timeoutMs: 30_000 },
-      );
-      if (inventory.exitCode !== 0) {
-        if (isMissingWindowsService(inventory)) return { status: "not-found" };
-        return {
-          status: "failed",
-          detail: failureDetail(
-            inventory.stderr || inventory.stdout,
-            paths.serviceControl,
-            inventory.exitCode,
-          ),
-        };
-      }
-
-      const classified = classifyPostgreSqlServiceInventory(
-        `${inventory.stdout}\n${inventory.stderr}`,
-      );
-      if (classified.status === "unsafe") {
-        return {
-          status: "failed",
-          detail: classified.detail,
-        };
-      }
-      const { serviceNames } = classified;
-      if (serviceNames.length === 0) return { status: "not-found" };
-
-      for (const serviceName of serviceNames) {
-        const result = await ensureWindowsServiceStopped(paths, serviceName);
-        if (result.status === "failed") {
-          return {
-            status: "failed",
-            detail: result.detail ?? `${serviceName}: service stop failed`,
-          };
-        }
-      }
-
-      return {
-        status: "removed",
-        detail: `verified ${serviceNames.length} service(s) stopped`,
-      };
-    },
-  });
-}
-
-function dockerServiceOperation(paths: WindowsPaths): Operation {
-  return createFunctionOperation({
-    id: "windows:docker:service",
-    component: "docker-engine",
-    description: "Stop and unregister the Windows Docker service",
-    phase: "preflight",
-    dedupeKey: "windows:docker:service",
-    fatal: true,
-    run: async (): Promise<OperationResult> => {
-      if (!(await pathExists(paths.serviceControl))) {
-        return { status: "failed", detail: "sc.exe is unavailable" };
-      }
-      const service = await ensureWindowsServiceStopped(paths, "docker");
-      if (service.status === "missing") return { status: "not-found" };
-      if (service.status === "failed") {
-        return {
-          status: "failed",
-          detail: service.detail ?? "docker: service stop failed",
-        };
-      }
-
-      const deleted = await runCommand(
-        paths.serviceControl,
-        ["delete", "docker"],
-        { silent: true, timeoutMs: 30_000 },
-      );
-      return deleted.exitCode === 0
-        ? { status: "removed" }
-        : {
-            status: "failed",
-            detail: failureDetail(
-              deleted.stderr,
-              paths.serviceControl,
-              deleted.exitCode,
-            ),
-          };
-    },
   });
 }
 
@@ -1098,6 +1263,10 @@ export async function createWindowsAdapter(
     supportedComponents: SUPPORTED,
     operations: async (plan: CleanupPlan): Promise<readonly Operation[]> => {
       const operations: Operation[] = [];
+      const serviceCoordinator = createWindowsServiceCoordinator(paths, plan);
+      if (serviceCoordinator !== undefined) {
+        operations.push(serviceCoordinator);
+      }
       const addFixed = (
         component: ComponentId,
         target: string,
@@ -1462,20 +1631,6 @@ export async function createWindowsAdapter(
         ["apache", ["apache-httpd"]],
         ["nginx", ["nginx"]],
       ];
-      operations.push(
-        fixedWindowsServiceStopOperation(
-          paths,
-          "apache",
-          PINNED_WINDOWS_WEB_SERVICE_NAMES.apache,
-          "Stop and verify the runner-image Apache service",
-        ),
-        fixedWindowsServiceStopOperation(
-          paths,
-          "nginx",
-          PINNED_WINDOWS_WEB_SERVICE_NAMES.nginx,
-          "Stop and verify the runner-image Nginx service",
-        ),
-      );
       for (const [component, packageNames] of chocoComponents) {
         operations.push(
           chocolateyOperation(
@@ -1538,7 +1693,6 @@ export async function createWindowsAdapter(
           versionedDirectories(programRoot, /^\d+(?:\.\d+)*$/),
           versionedDirectories(dataRoot, /^\d+(?:\.\d+)*$/),
         ]);
-        operations.push(postgresqlServiceOperation(paths));
         if (programVersions.length === 0 && dataVersions.length === 0) {
           operations.push(
             notFoundOperation(
@@ -1574,7 +1728,6 @@ export async function createWindowsAdapter(
       }
 
       operations.push(dockerImagesOperation(paths));
-      operations.push(dockerServiceOperation(paths));
       operations.push(
         createRemovePathOperation({
           id: "windows:docker:data",

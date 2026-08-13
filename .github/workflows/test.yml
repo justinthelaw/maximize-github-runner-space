@@ -165,10 +165,12 @@ jobs:
       - name: Verify skipped children survived and sibling cleanup ran
         shell: bash
         env:
+          FAILED_OPERATIONS: ${{ steps.max-skip.outputs.failed-operations }}
           PLATFORM: ${{ steps.max-skip.outputs.platform }}
           ARCHITECTURE: ${{ steps.max-skip.outputs.architecture }}
         run: |
           set -euo pipefail
+          [[ "$FAILED_OPERATIONS" == 0 ]]
           [[ "$PLATFORM" == linux ]]
           [[ "$ARCHITECTURE" == x64 ]]
           test -d /usr/share/dotnet
@@ -194,6 +196,7 @@ jobs:
           BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
           AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
           RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
           PLATFORM: ${{ steps.cleanup.outputs.platform }}
           ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
         run: |
@@ -201,6 +204,7 @@ jobs:
           [[ "$BEFORE" =~ ^[0-9]+$ ]]
           [[ "$AFTER" =~ ^[0-9]+$ ]]
           [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          [[ "$FAILED_OPERATIONS" == 0 ]]
           [[ "$PLATFORM" == linux ]]
           [[ "$ARCHITECTURE" == x64 ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
@@ -294,6 +298,7 @@ jobs:
 
       - name: Exercise Windows PostgreSQL cleanup
         if: matrix.platform == 'windows' && matrix.architecture == 'x64'
+        id: postgresql-cleanup
         uses: ./
         with:
           cleanup-profile: custom
@@ -302,7 +307,12 @@ jobs:
       - name: Verify Windows PostgreSQL cleanup
         if: matrix.platform == 'windows' && matrix.architecture == 'x64'
         shell: pwsh
+        env:
+          FAILED_OPERATIONS: ${{ steps.postgresql-cleanup.outputs.failed-operations }}
         run: |
+          if ($env:FAILED_OPERATIONS -ne '0') {
+            throw 'A PostgreSQL cleanup operation failed.'
+          }
           $running = @(
             Get-Service -Name 'postgresql-*' -ErrorAction SilentlyContinue |
               Where-Object Status -ne 'Stopped'

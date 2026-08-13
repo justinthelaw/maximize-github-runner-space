@@ -309,6 +309,7 @@ protected. Under `custom`, only the exact string `"true"` enables a component.
 | `available-bytes-before` | Decimal byte count available before cleanup. |
 | `available-bytes-after` | Decimal byte count available after cleanup. |
 | `reclaimed-bytes` | Nonnegative decimal difference between the two measurements. |
+| `failed-operations` | Decimal count of best-effort cleanup operations that reported failure. Fatal failures stop the step instead. |
 | `platform` | Detected `linux`, `macos`, or `windows`. |
 | `architecture` | Detected `x64` or `arm64`. |
 

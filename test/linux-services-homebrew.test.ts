@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
+import { access, lstat, mkdtemp, rm } from "node:fs/promises";
 import test from "node:test";
 import {
   createLinuxAdapter,
@@ -239,6 +240,8 @@ test("Linuxbrew resolves only the definition-owned executable", async () => {
 
 test("Linux Homebrew cleanup preserves the prefix and workflow-installed packages", async () => {
   const executable = "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew";
+  let configDirectory: string | undefined;
+  let configDirectoryRemoved = false;
   const calls: {
     executable: string;
     args: readonly string[];
@@ -259,19 +262,38 @@ test("Linux Homebrew cleanup preserves the prefix and workflow-installed package
     async () => ({ executable }),
     async (resolved, args, environment) => {
       calls.push({ executable: resolved, args, environment });
+      const config = environment.XDG_CONFIG_HOME;
+      assert.equal(typeof config, "string");
+      assert.equal((await lstat(config as string)).isDirectory(), true);
       return commandResult("");
     },
     async () => undefined,
+    async () => {
+      configDirectory = await mkdtemp(
+        "/tmp/maximize-github-runner-space-brew-config-",
+      );
+      return configDirectory;
+    },
   );
   assert.ok(operation.validate);
   let result: Awaited<ReturnType<typeof operation.run>> | undefined;
   try {
     await operation.validate();
     result = await operation.run();
+    assert.notEqual(configDirectory, undefined);
+    try {
+      await access(configDirectory as string);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      configDirectoryRemoved = true;
+    }
   } finally {
     for (const [key, value] of Object.entries(poisoned)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
+    }
+    if (configDirectory !== undefined) {
+      await rm(configDirectory, { recursive: true, force: true });
     }
   }
   assert.equal(result?.status, "removed");
@@ -287,7 +309,12 @@ test("Linux Homebrew cleanup preserves the prefix and workflow-installed package
     "/home/runner/.cache/Homebrew",
   );
   assert.equal(calls[0]?.environment.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
-  assert.equal(calls[0]?.environment.XDG_CONFIG_HOME, "/dev/null");
+  assert.equal(calls[0]?.environment.XDG_CONFIG_HOME, configDirectory);
+  assert.match(
+    calls[0]?.environment.XDG_CONFIG_HOME ?? "",
+    /^\/tmp\/maximize-github-runner-space-brew-config-[^/]+$/,
+  );
+  assert.equal(configDirectoryRemoved, true);
   assert.equal(calls[0]?.environment.HOMEBREW_FORCE_BREW_WRAPPER, undefined);
   assert.equal(
     calls[0]?.args.some((argument) =>
@@ -362,6 +389,62 @@ test("Linux Homebrew cleanup fails closed if its executable changes", async () =
   const result = await operation.run();
   assert.equal(result.status, "failed");
   assert.equal(executed, false);
+});
+
+test("Linux Homebrew cleanup fails closed when config directory creation fails", async () => {
+  let executed = false;
+  let removed = false;
+  const operation = createLinuxHomebrewCleanupOperation(
+    contextFor("linux"),
+    async () => ({
+      executable: "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew",
+    }),
+    async () => {
+      executed = true;
+      return commandResult("");
+    },
+    async () => undefined,
+    async () => {
+      throw new Error("temporary storage unavailable");
+    },
+    async () => {
+      removed = true;
+    },
+  );
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /temporary storage unavailable/);
+  assert.equal(executed, false);
+  assert.equal(removed, false);
+});
+
+test("Linux Homebrew cleanup rejects a config directory outside fixed temporary ownership", async () => {
+  let executed = false;
+  let removed = false;
+  const operation = createLinuxHomebrewCleanupOperation(
+    contextFor("linux"),
+    async () => ({
+      executable: "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew",
+    }),
+    async () => {
+      executed = true;
+      return commandResult("");
+    },
+    async () => undefined,
+    async () => "/tmp/workflow-config",
+    async () => {
+      removed = true;
+    },
+  );
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /unsafe Linuxbrew config directory/);
+  assert.equal(executed, false);
+  assert.equal(removed, false);
 });
 
 test("Linux Homebrew cleanup fails closed if the verified file identity changes", async () => {

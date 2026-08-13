@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
 import test from "node:test";
+import { COMPONENTS } from "../src/components.js";
 import {
   createMacOSAdapter,
   resolveDefinitionBrewExecutable,
+  validateDefinitionBrewConfigRoot,
   type BrewConfigProbe,
+  type BrewConfigRootProbe,
   type BrewPathProbe,
   type MacOSBrewRunner,
 } from "../src/platforms/macos.js";
-import type { Architecture } from "../src/types.js";
+import type { Architecture, CleanupPlan, ComponentId } from "../src/types.js";
 import { contextFor, planFor } from "./helpers.js";
 
 const symlinkStats = {
@@ -140,6 +143,9 @@ test("macOS rejects a fixed Homebrew link redirected outside its definition pref
 });
 
 test("macOS Homebrew commands use a trusted environment and preserve unknown packages", async () => {
+  const configRoot =
+    "/private/tmp/maximize-github-runner-space-homebrew-unit-test";
+  const preflightEvents: string[] = [];
   const environmentNames = [
     "PATH",
     "TMPDIR",
@@ -206,7 +212,26 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
         return executable;
       },
       executeBrew: execute,
-      inspectBrewConfig: async () => undefined,
+      inspectBrewConfig: async (path) => {
+        preflightEvents.push(`inspect:${path}`);
+        return undefined;
+      },
+      createBrewConfigRoot: async (prefix) => {
+        assert.equal(
+          prefix,
+          "/private/tmp/maximize-github-runner-space-homebrew-",
+        );
+        preflightEvents.push("create");
+        return configRoot;
+      },
+      validateBrewConfigRoot: async (path, requireEmpty) => {
+        assert.equal(path, configRoot);
+        preflightEvents.push(`validate:${requireEmpty}`);
+      },
+      removeBrewConfigRoot: async (path) => {
+        assert.equal(path, configRoot);
+        preflightEvents.push(`remove:${path}`);
+      },
     });
     const operations = await adapter.operations(planFor("homebrew"));
     const configuration = operations.find(
@@ -218,12 +243,32 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
     const cleanup = operations.find(({ id }) => id === "brew:cleanup:homebrew");
     assert.ok(configuration);
     assert.ok(configuration.validate);
+    assert.equal(configuration.phase, "preflight");
+    assert.equal(configuration.fatal, true);
+    assert.deepEqual(preflightEvents, []);
     await configuration.validate();
+    assert.deepEqual(preflightEvents, [
+      "inspect:/etc/homebrew/brew.env",
+      "inspect:/opt/homebrew/etc/homebrew/brew.env",
+    ]);
     assert.equal((await configuration.run()).status, "removed");
+    assert.deepEqual(preflightEvents, [
+      "inspect:/etc/homebrew/brew.env",
+      "inspect:/opt/homebrew/etc/homebrew/brew.env",
+      "inspect:/etc/homebrew/brew.env",
+      "inspect:/opt/homebrew/etc/homebrew/brew.env",
+      "create",
+      "validate:true",
+    ]);
     assert.ok(packages);
     assert.ok(cleanup);
     assert.equal((await packages.run()).status, "removed");
     assert.equal((await cleanup.run()).status, "removed");
+    assert.equal(
+      preflightEvents.at(-1),
+      `remove:${configRoot}`,
+      "the final Homebrew operation must release its isolated configuration",
+    );
 
     assert.deepEqual(
       calls.map(({ args }) => args),
@@ -292,7 +337,7 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
       assert.equal(call.environment.HOME, "/Users/runner");
       assert.equal(call.environment.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
       assert.equal(call.environment.TMPDIR, "/private/tmp");
-      assert.equal(call.environment.XDG_CONFIG_HOME, "/dev/null");
+      assert.equal(call.environment.XDG_CONFIG_HOME, configRoot);
       assert.equal(call.environment.HOMEBREW_BREW_FILE, undefined);
       assert.equal(call.environment.HOMEBREW_PATH, undefined);
       assert.equal(call.environment.HOMEBREW_FORCE_BREW_WRAPPER, undefined);
@@ -313,6 +358,8 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
 
 test("macOS Homebrew cleanup is a no-op when the fixed candidate is absent", async () => {
   let executed = false;
+  let created = false;
+  let removed = false;
   const adapter = await createMacOSAdapter(contextFor("macos"), {
     resolveBrewExecutable: async () => undefined,
     executeBrew: async () => {
@@ -320,6 +367,14 @@ test("macOS Homebrew cleanup is a no-op when the fixed candidate is absent", asy
       return { exitCode: 0, stdout: "", stderr: "" };
     },
     inspectBrewConfig: async () => undefined,
+    createBrewConfigRoot: async () => {
+      created = true;
+      throw new Error("absent Homebrew must not create a configuration root");
+    },
+    removeBrewConfigRoot: async () => {
+      removed = true;
+      throw new Error("absent Homebrew must not remove a configuration root");
+    },
   });
   const operations = await adapter.operations(planFor("homebrew"));
   const homebrew = operations.filter(
@@ -330,6 +385,92 @@ test("macOS Homebrew cleanup is a no-op when the fixed candidate is absent", asy
     assert.equal((await operation.run()).status, "not-found");
   }
   assert.equal(executed, false);
+  assert.equal(created, false);
+  assert.equal(removed, false);
+});
+
+test("macOS releases its isolated configuration when Homebrew cleanup fails", async () => {
+  const configRoot =
+    "/private/tmp/maximize-github-runner-space-homebrew-cleanup-failure";
+  const removed: string[] = [];
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
+    executeBrew: async (_executable, args, environment) => {
+      assert.equal(environment.XDG_CONFIG_HOME, configRoot);
+      assert.deepEqual(args, ["cleanup", "--prune=all", "-s"]);
+      return { exitCode: 23, stdout: "", stderr: "simulated cleanup failure" };
+    },
+    inspectBrewConfig: async () => undefined,
+    createBrewConfigRoot: async () => configRoot,
+    validateBrewConfigRoot: async (path, requireEmpty) => {
+      assert.equal(path, configRoot);
+      assert.equal(typeof requireEmpty, "boolean");
+    },
+    removeBrewConfigRoot: async (path) => {
+      removed.push(path);
+    },
+  });
+  const operations = await adapter.operations(planFor("homebrew"));
+  const configuration = operations.find(
+    ({ id }) => id === "macos:brew:configuration",
+  );
+  const cleanup = operations.find(({ id }) => id === "brew:cleanup:homebrew");
+  assert.ok(configuration?.validate);
+  assert.ok(cleanup);
+  await configuration.validate();
+  assert.equal((await configuration.run()).status, "removed");
+  const result = await cleanup.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /simulated cleanup failure/);
+  assert.deepEqual(removed, [configRoot]);
+});
+
+test("macOS releases isolated Homebrew configuration when every package owner is protected", async () => {
+  const configRoot =
+    "/private/tmp/maximize-github-runner-space-homebrew-all-owners-protected";
+  const commands: string[][] = [];
+  const removed: string[] = [];
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
+    executeBrew: async (_executable, args, environment) => {
+      assert.equal(environment.XDG_CONFIG_HOME, configRoot);
+      commands.push([...args]);
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    inspectBrewConfig: async () => undefined,
+    createBrewConfigRoot: async () => configRoot,
+    validateBrewConfigRoot: async (path) => {
+      assert.equal(path, configRoot);
+    },
+    removeBrewConfigRoot: async (path) => {
+      removed.push(path);
+    },
+  });
+  const plan: CleanupPlan = {
+    profile: "max",
+    enabled: new Set<ComponentId>(["homebrew"]),
+    skipped: new Set<ComponentId>(
+      COMPONENTS.map(({ id }) => id).filter((id) => id !== "homebrew"),
+    ),
+    swapfileBytes: undefined,
+  };
+  const operations = await adapter.operations(plan);
+  const configuration = operations.find(
+    ({ id }) => id === "macos:brew:configuration",
+  );
+  const cleanup = operations.find(({ id }) => id === "brew:cleanup:homebrew");
+
+  assert.ok(configuration?.validate);
+  assert.ok(cleanup);
+  assert.equal(
+    operations.some(({ id }) => id === "brew:definition-packages"),
+    false,
+  );
+  await configuration.validate();
+  assert.equal((await configuration.run()).status, "removed");
+  assert.equal((await cleanup.run()).status, "removed");
+  assert.deepEqual(commands, [["cleanup", "--prune=all", "-s"]]);
+  assert.deepEqual(removed, [configRoot]);
 });
 
 test("macOS Homebrew rejects fixed configuration files before any command", async () => {
@@ -340,6 +481,7 @@ test("macOS Homebrew rejects fixed configuration files before any command", asyn
     return path === config ? fileStats : undefined;
   };
   let executed = false;
+  let created = false;
   const adapter = await createMacOSAdapter(contextFor("macos"), {
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async () => {
@@ -347,6 +489,10 @@ test("macOS Homebrew rejects fixed configuration files before any command", asyn
       return { exitCode: 0, stdout: "", stderr: "" };
     },
     inspectBrewConfig: inspectConfig,
+    createBrewConfigRoot: async () => {
+      created = true;
+      throw new Error("rejected configuration must prevent directory creation");
+    },
   });
   const operations = await adapter.operations(planFor("homebrew"));
   const configuration = operations.find(
@@ -358,6 +504,7 @@ test("macOS Homebrew rejects fixed configuration files before any command", asyn
     /configuration can override cleanup paths/,
   );
   assert.equal(executed, false);
+  assert.equal(created, false);
   assert.deepEqual(observed, [
     "/etc/homebrew/brew.env",
     "/opt/homebrew/etc/homebrew/brew.env",
@@ -368,6 +515,7 @@ test("macOS Homebrew rechecks fixed configuration files before package mutation"
   const config = "/etc/homebrew/brew.env";
   let inspections = 0;
   let executed = false;
+  let created = false;
   const adapter = await createMacOSAdapter(contextFor("macos"), {
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async () => {
@@ -378,6 +526,10 @@ test("macOS Homebrew rechecks fixed configuration files before package mutation"
       if (path !== config) return undefined;
       inspections += 1;
       return inspections === 1 ? undefined : fileStats;
+    },
+    createBrewConfigRoot: async () => {
+      created = true;
+      throw new Error("failed recheck must prevent directory creation");
     },
   });
   const operations = await adapter.operations(planFor("homebrew"));
@@ -390,4 +542,83 @@ test("macOS Homebrew rechecks fixed configuration files before package mutation"
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /configuration can override cleanup paths/);
   assert.equal(executed, false);
+  assert.equal(created, false);
+});
+
+test("macOS Homebrew rejects an isolated configuration root outside its fixed temporary parent", async () => {
+  let executed = false;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
+    executeBrew: async () => {
+      executed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    inspectBrewConfig: async () => undefined,
+    createBrewConfigRoot: async () =>
+      "/Users/runner/work/_temp/maximize-github-runner-space-homebrew-test",
+  });
+  const operations = await adapter.operations(planFor("homebrew"));
+  const configuration = operations.find(
+    ({ id }) => id === "macos:brew:configuration",
+  );
+  assert.ok(configuration?.validate);
+  await configuration.validate();
+  const result = await configuration.run();
+  assert.equal(result.status, "failed");
+  assert.match(
+    result.detail ?? "",
+    /Refusing unexpected Homebrew configuration directory/,
+  );
+  assert.equal(executed, false);
+});
+
+test("macOS validates isolated Homebrew configuration ownership, mode, and emptiness", async () => {
+  const path =
+    "/private/tmp/maximize-github-runner-space-homebrew-config-validation";
+  const directoryStats = {
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+    uid: typeof process.getuid === "function" ? process.getuid() : 0,
+    mode: 0o40700,
+  };
+  const validProbe: BrewConfigRootProbe = {
+    lstat: async (observed) => {
+      assert.equal(observed, path);
+      return directoryStats;
+    },
+    readdir: async (observed) => {
+      assert.equal(observed, path);
+      return [];
+    },
+  };
+  await validateDefinitionBrewConfigRoot(path, true, validProbe);
+
+  await assert.rejects(
+    validateDefinitionBrewConfigRoot(path, true, {
+      ...validProbe,
+      lstat: async () => ({ ...directoryStats, isSymbolicLink: () => true }),
+    }),
+    /non-directory/,
+  );
+  await assert.rejects(
+    validateDefinitionBrewConfigRoot(path, true, {
+      ...validProbe,
+      lstat: async () => ({ ...directoryStats, uid: directoryStats.uid + 1 }),
+    }),
+    /unowned/,
+  );
+  await assert.rejects(
+    validateDefinitionBrewConfigRoot(path, true, {
+      ...validProbe,
+      lstat: async () => ({ ...directoryStats, mode: 0o40755 }),
+    }),
+    /shared.*permissions/,
+  );
+  await assert.rejects(
+    validateDefinitionBrewConfigRoot(path, true, {
+      ...validProbe,
+      readdir: async () => ["homebrew"],
+    }),
+    /non-empty/,
+  );
 });

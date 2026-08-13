@@ -19,7 +19,16 @@ export function humanBytes(bytes: bigint): string {
   return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
 }
 
-export function reportResults(results: readonly OperationResult[]): void {
+export interface OperationCounts {
+  readonly removed: number;
+  readonly notFound: number;
+  readonly unsupported: number;
+  readonly failed: number;
+}
+
+export function reportResults(
+  results: readonly OperationResult[],
+): OperationCounts {
   const counts = new Map<OperationResult["status"], number>();
   for (const result of results) {
     counts.set(result.status, (counts.get(result.status) ?? 0) + 1);
@@ -27,4 +36,10 @@ export function reportResults(results: readonly OperationResult[]): void {
   core.info(
     `Operations: removed=${counts.get("removed") ?? 0}, not-found=${counts.get("not-found") ?? 0}, unsupported=${counts.get("unsupported") ?? 0}, failed=${counts.get("failed") ?? 0}`,
   );
+  return {
+    removed: counts.get("removed") ?? 0,
+    notFound: counts.get("not-found") ?? 0,
+    unsupported: counts.get("unsupported") ?? 0,
+    failed: counts.get("failed") ?? 0,
+  };
 }
