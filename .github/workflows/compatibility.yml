@@ -1,0 +1,92 @@
+name: Runner compatibility sweep
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * 1"
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-image-smoke:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          # actionlint v1.7.12 has not yet learned these official preview
+          # labels; keep this list aligned with GitHub's runner reference.
+          # .github/actionlint.yaml narrowly ignores only these preview labels.
+          - runner: ubuntu-slim
+            platform: linux
+            architecture: x64
+          - runner: ubuntu-22.04
+            platform: linux
+            architecture: x64
+          - runner: ubuntu-24.04
+            platform: linux
+            architecture: x64
+          - runner: ubuntu-26.04
+            platform: linux
+            architecture: x64
+          - runner: ubuntu-22.04-arm
+            platform: linux
+            architecture: arm64
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            architecture: arm64
+          - runner: ubuntu-26.04-arm
+            platform: linux
+            architecture: arm64
+          - runner: windows-2022
+            platform: windows
+            architecture: x64
+          - runner: windows-2025
+            platform: windows
+            architecture: x64
+          - runner: windows-2025-vs2026
+            platform: windows
+            architecture: x64
+          - runner: windows-11-arm
+            platform: windows
+            architecture: arm64
+          - runner: windows-11-vs2026-arm
+            platform: windows
+            architecture: arm64
+          - runner: macos-15-intel
+            platform: macos
+            architecture: x64
+          - runner: macos-26-intel
+            platform: macos
+            architecture: x64
+          - runner: macos-14
+            platform: macos
+            architecture: arm64
+          - runner: macos-15
+            platform: macos
+            architecture: arm64
+          - runner: macos-26
+            platform: macos
+            architecture: arm64
+          - runner: xcode-27
+            platform: macos
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Exercise the native adapter
+        uses: ./.github/actions/platform-smoke
+        with:
+          expected-platform: ${{ matrix.platform }}
+          expected-architecture: ${{ matrix.architecture }}

@@ -31,8 +31,17 @@ body:
     id: runner
     attributes:
       label: Runner Image
-      description: For example ubuntu-latest, ubuntu-24.04
+      description: Include the exact label and architecture, for example ubuntu-24.04-arm, windows-latest, or macos-15-intel
       placeholder: ubuntu-latest
+    validations:
+      required: true
+
+  - type: textarea
+    id: image
+    attributes:
+      label: Runner Image Block
+      description: Copy the complete Runner Image block from the Set up job log, including ImageOS, ImageVersion, and Included Software links; redact private values
+      render: text
     validations:
       required: true
 
@@ -52,9 +61,7 @@ body:
     id: disk
     attributes:
       label: Disk Usage Before and After
-      description: Include `df -h` output before and after action execution
-    validations:
-      required: true
+      description: Include available-bytes-before, available-bytes-after, reclaimed-bytes, and failed-operations when emitted; otherwise state that the action failed before outputs were emitted
 
   - type: textarea
     id: logs

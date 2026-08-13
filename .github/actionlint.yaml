@@ -1,0 +1,6 @@
+paths:
+  .github/workflows/compatibility.yml:
+    # actionlint 1.7.12 predates these official public preview labels. Keep the
+    # exception narrow so every other runner label is still checked normally.
+    ignore:
+      - 'label "(ubuntu-26\.04(?:-arm)?|windows-11-vs2026-arm|xcode-27)" is unknown'

@@ -1,0 +1,30 @@
+{
+  "name": "maximize-github-runner-space",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "Cross-platform GitHub Action for reclaiming hosted-runner disk space",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run clean:dist && ncc build src/index.ts --out dist --minify --no-source-map-register --license licenses.txt",
+    "postbuild": "node -e \"import('node:fs').then(({ appendFileSync, readFileSync }) => { const path = 'dist/index.js'; if (!readFileSync(path, 'utf8').endsWith('\\n')) appendFileSync(path, '\\n'); })\"",
+    "clean": "node -e \"import('node:fs').then(({rmSync}) => { rmSync('build', { recursive: true, force: true }); })\"",
+    "clean:dist": "node -e \"import('node:fs').then(({rmSync}) => { rmSync('dist', { recursive: true, force: true }); })\"",
+    "format": "prettier --write action.yml scripts src test package.json tsconfig.json",
+    "format:check": "prettier --check action.yml scripts src test package.json tsconfig.json",
+    "test": "npm run clean && tsc --project tsconfig.json && node --test \"build/test/*.test.js\"",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "check-dist": "npm run build && node scripts/check-dist.mjs"
+  },
+  "dependencies": {
+    "@actions/core": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@vercel/ncc": "0.45.0",
+    "prettier": "3.9.6",
+    "typescript": "5.9.3"
+  }
+}

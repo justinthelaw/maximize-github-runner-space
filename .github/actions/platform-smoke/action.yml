@@ -1,0 +1,122 @@
+name: Platform smoke test
+description: Exercise one bounded cleanup and verify native runner identity
+
+inputs:
+  expected-platform:
+    description: Expected action platform output
+    required: true
+  expected-architecture:
+    description: Expected action architecture output
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Assert AzCopy fixture exists on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: command -v azcopy >/dev/null
+
+    - name: Assert AzCopy fixture exists on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+          throw 'Expected the runner image to contain AzCopy.'
+        }
+
+    - name: Run a bounded native cleanup
+      id: cleanup
+      uses: ./
+      # These ordinary image variables are workflow-overridable and must never
+      # authorize cleanup. Every platform must instead use its fixed image-data
+      # record created during runner-image generation.
+      env:
+        ImageOS: workflow-spoof
+        ImageVersion: not-a-version
+      with:
+        cleanup-profile: custom
+        remove-azcopy: "true"
+
+    - name: Verify runtime and outputs on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+        AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+        RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
+        PLATFORM: ${{ steps.cleanup.outputs.platform }}
+        ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+        EXPECTED_PLATFORM: ${{ inputs.expected-platform }}
+        EXPECTED_ARCHITECTURE: ${{ inputs.expected-architecture }}
+      run: |
+        set -euo pipefail
+        [[ "$BEFORE" =~ ^[0-9]+$ ]]
+        [[ "$AFTER" =~ ^[0-9]+$ ]]
+        [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+        [[ "$FAILED_OPERATIONS" == 0 ]]
+        [[ "$PLATFORM" == "$EXPECTED_PLATFORM" ]]
+        [[ "$ARCHITECTURE" == "$EXPECTED_ARCHITECTURE" ]]
+        if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
+          echo "AzCopy was not removed" >&2
+          exit 1
+        fi
+
+    - name: Verify runtime and outputs on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+        AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+        RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
+        PLATFORM: ${{ steps.cleanup.outputs.platform }}
+        ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+        EXPECTED_PLATFORM: ${{ inputs.expected-platform }}
+        EXPECTED_ARCHITECTURE: ${{ inputs.expected-architecture }}
+      run: |
+        if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
+        if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
+        if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
+        if ($env:FAILED_OPERATIONS -ne '0') { throw 'A bounded cleanup operation failed.' }
+        if ($env:PLATFORM -ne $env:EXPECTED_PLATFORM) { throw 'Platform mismatch.' }
+        if ($env:ARCHITECTURE -ne $env:EXPECTED_ARCHITECTURE) { throw 'Architecture mismatch.' }
+        if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
+        if (Get-Command azcopy10 -ErrorAction SilentlyContinue) { throw 'AzCopy 10 alias was not removed.' }
+
+    - name: Prepare an untrusted Homebrew PATH shim on macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        command -v gh >/dev/null
+        command -v brew >/dev/null
+        install -d "${RUNNER_TEMP}/untrusted-bin"
+        printf '%s\n' '#!/bin/sh' 'exit 91' >"${RUNNER_TEMP}/untrusted-bin/brew"
+        chmod +x "${RUNNER_TEMP}/untrusted-bin/brew"
+
+    - name: Exercise verified Homebrew cleanup on macOS
+      if: runner.os == 'macOS'
+      id: homebrew-cleanup
+      uses: ./
+      env:
+        PATH: ${{ runner.temp }}/untrusted-bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+        HOMEBREW_RUBY_PATH: ${{ runner.temp }}/untrusted-ruby
+      with:
+        cleanup-profile: custom
+        remove-gh-cli: "true"
+
+    - name: Verify the Homebrew package and prefix boundary on macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      env:
+        FAILED_OPERATIONS: ${{ steps.homebrew-cleanup.outputs.failed-operations }}
+      run: |
+        set -euo pipefail
+        [[ "$FAILED_OPERATIONS" == 0 ]]
+        if command -v gh >/dev/null 2>&1; then
+          echo "GitHub CLI was not removed through verified Homebrew" >&2
+          exit 1
+        fi
+        command -v brew >/dev/null
