@@ -79,8 +79,10 @@ jobs:
           [[ "$BEFORE" =~ ^[0-9]+$ ]]
           [[ "$AFTER" =~ ^[0-9]+$ ]]
           [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
-          ! command -v azcopy >/dev/null 2>&1
-          ! command -v azcopy10 >/dev/null 2>&1
+          if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
+            echo "AzCopy was not removed" >&2
+            exit 1
+          fi
 
       - name: Verify outputs on Windows
         if: runner.os == 'Windows'
