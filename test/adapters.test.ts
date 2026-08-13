@@ -11,6 +11,7 @@ import {
   classifyPostgreSqlServiceInventory,
   createWindowsAdapter,
   createWindowsServiceCoordinator,
+  executableUninstallOperation,
   isMissingWindowsService,
   isStoppedWindowsService,
   isStrictWindowsDescendant,
@@ -18,6 +19,7 @@ import {
   PINNED_WINDOWS_WEB_SERVICE_NAMES,
   POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
   type WindowsManagedPathProbe,
+  type WindowsPathProbe,
   type WindowsServiceControl,
   windowsPaths,
 } from "../src/platforms/windows.js";
@@ -710,33 +712,177 @@ test("Windows manual path removers participate in complete-plan validation", asy
   );
 });
 
+function windowsPathStats(
+  kind: "directory" | "file",
+  options: {
+    readonly link?: boolean;
+    readonly ino?: bigint;
+  } = {},
+): Awaited<ReturnType<WindowsPathProbe["lstat"]>> {
+  return {
+    isDirectory: () => kind === "directory",
+    isFile: () => kind === "file",
+    isSymbolicLink: () => options.link ?? false,
+    dev: 1n,
+    ino: options.ino ?? (kind === "directory" ? 2n : 3n),
+    size: 4n,
+    mtimeNs: 5n,
+  };
+}
+
+test("Windows executable uninstall preflights all roots and executable types before spawn", async () => {
+  const safeRoot = "C:\\Program Files\\Mozilla Firefox";
+  const safeExecutable = `${safeRoot}\\uninstall\\helper.exe`;
+  const unsafeRoot = "C:\\Program Files (x86)\\Mozilla Firefox";
+  const unsafeExecutable = `${unsafeRoot}\\uninstall\\helper.exe`;
+  for (const unsafePath of [unsafeRoot, unsafeExecutable]) {
+    let executions = 0;
+    const probe: WindowsPathProbe = {
+      lstat: async (path) => {
+        if (path === safeRoot || path === unsafeRoot) {
+          return windowsPathStats("directory", {
+            link: path === unsafePath,
+          });
+        }
+        assert.ok(path === safeExecutable || path === unsafeExecutable);
+        return windowsPathStats("file", { link: path === unsafePath });
+      },
+    };
+    const operation = executableUninstallOperation({
+      context: contextFor("windows"),
+      component: "firefox",
+      id: "firefox-test",
+      description: "test Firefox",
+      candidates: [
+        { installationRoot: safeRoot, executable: safeExecutable },
+        { installationRoot: unsafeRoot, executable: unsafeExecutable },
+      ],
+      args: ["/S"],
+      probe,
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await assert.rejects(
+      operation.validate(),
+      /unexpected (installation root|executable) type/,
+    );
+    const result = await operation.run();
+    assert.equal(result.status, "failed");
+    assert.match(
+      result.detail ?? "",
+      /unexpected (installation root|executable) type/,
+    );
+    assert.equal(executions, 0);
+  }
+});
+
+test("Windows executable uninstall rejects root and file replacement immediately before spawn", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  for (const replacedPath of [installationRoot, executable]) {
+    let replacementChecks = 0;
+    let executed = false;
+    const probe: WindowsPathProbe = {
+      lstat: async (path) => {
+        assert.ok(path === installationRoot || path === executable);
+        const kind = path === installationRoot ? "directory" : "file";
+        if (path !== replacedPath) return windowsPathStats(kind);
+        replacementChecks += 1;
+        return windowsPathStats(kind, {
+          ino: replacementChecks < 3 ? 3n : 99n,
+        });
+      },
+    };
+    const operation = executableUninstallOperation({
+      context: contextFor("windows"),
+      component: "postgresql",
+      id: "postgresql-17-test",
+      description: "test PostgreSQL",
+      candidates: [{ installationRoot, executable }],
+      args: ["--mode", "unattended"],
+      probe,
+      execute: async () => {
+        executed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await operation.validate();
+    const result = await operation.run();
+    assert.equal(result.status, "failed");
+    assert.match(result.detail ?? "", /changed immediately before spawn/);
+    assert.equal(executed, false);
+  }
+});
+
+test("Windows executable uninstall preserves missing and reboot-required exit semantics", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  const missing = (): NodeJS.ErrnoException =>
+    Object.assign(new Error("missing"), { code: "ENOENT" });
+  for (const missingPath of [installationRoot, executable]) {
+    let executed = false;
+    const operation = executableUninstallOperation({
+      context: contextFor("windows"),
+      component: "postgresql",
+      id: "postgresql-17-test",
+      description: "test PostgreSQL",
+      candidates: [{ installationRoot, executable }],
+      args: ["--mode", "unattended"],
+      probe: {
+        lstat: async (path) => {
+          if (path === missingPath) throw missing();
+          assert.equal(path, installationRoot);
+          return windowsPathStats("directory");
+        },
+      },
+      execute: async () => {
+        executed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await operation.validate();
+    assert.equal((await operation.run()).status, "not-found");
+    assert.equal(executed, false);
+  }
+
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-17-test",
+    description: "test PostgreSQL",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStats(path === installationRoot ? "directory" : "file"),
+    },
+    execute: async () => ({ exitCode: 3010, stdout: "", stderr: "" }),
+  });
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+});
+
 test("Windows managed uninstall rejects a junction root and linked uninstaller", async () => {
   const root = "C:\\Miniconda";
   const executable = `${root}\\Uninstall-Miniconda3.exe`;
-  const stats = (
-    kind: "directory" | "file",
-    link = false,
-  ): Awaited<ReturnType<WindowsManagedPathProbe["lstat"]>> => ({
-    isDirectory: () => kind === "directory",
-    isFile: () => kind === "file",
-    isSymbolicLink: () => link,
-    dev: 1n,
-    ino: kind === "directory" ? 2n : 3n,
-    size: 4n,
-    mtimeNs: 5n,
-  });
   for (const probe of [
     {
       lstat: async (path: string) => {
         assert.equal(path, root);
-        return stats("directory", true);
+        return windowsPathStats("directory", { link: true });
       },
     },
     {
       lstat: async (path: string) => {
-        if (path === root) return stats("directory");
+        if (path === root) return windowsPathStats("directory");
         assert.equal(path, executable);
-        return stats("file", true);
+        return windowsPathStats("file", { link: true });
       },
     },
   ] satisfies readonly WindowsManagedPathProbe[]) {

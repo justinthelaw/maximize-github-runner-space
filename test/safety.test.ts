@@ -16,7 +16,12 @@ import {
   executeOperations,
   prepareOperations,
 } from "../src/operations.js";
-import { createSwapOperation } from "../src/platforms/linux.js";
+import {
+  createSwapOperation,
+  LINUX_SWAP_EXECUTABLES,
+  linuxSwapCommandEnvironment,
+  type LinuxSwapCommandInvocation,
+} from "../src/platforms/linux.js";
 import {
   assertSafeDirectoryTarget,
   assertSafeRemovalTarget,
@@ -225,6 +230,147 @@ test("the prepared swap operation validates its exact definition targets", async
   );
   assert.notEqual(prepared[0]?.validate, undefined);
   await prepared[0]?.validate?.();
+});
+
+test("the swap transaction pins every utility and ignores workflow command injection", async () => {
+  assert.deepEqual(LINUX_SWAP_EXECUTABLES, {
+    chmod: "/usr/bin/chmod",
+    dd: "/usr/bin/dd",
+    df: "/usr/bin/df",
+    fallocate: "/usr/bin/fallocate",
+    grep: "/usr/bin/grep",
+    mktemp: "/usr/bin/mktemp",
+    mkswap: "/usr/sbin/mkswap",
+    mv: "/usr/bin/mv",
+    rm: "/usr/bin/rm",
+    sed: "/usr/bin/sed",
+    swapoff: "/usr/sbin/swapoff",
+    swapon: "/usr/sbin/swapon",
+    tee: "/usr/bin/tee",
+    test: "/usr/bin/test",
+    truncate: "/usr/bin/truncate",
+  });
+  assert.deepEqual(linuxSwapCommandEnvironment(), {
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+  });
+
+  const { context, root } = await createSwapFixture();
+  const calls: LinuxSwapCommandInvocation[] = [];
+  const poisonedNames = ["PATH", "BASH_ENV", "ENV", "LD_PRELOAD"] as const;
+  const original = new Map(
+    poisonedNames.map((name) => [name, process.env[name]]),
+  );
+  process.env.PATH = "/workflow/untrusted-bin";
+  process.env.BASH_ENV = "/workflow/bash-env";
+  process.env.ENV = "/workflow/shell-env";
+  process.env.LD_PRELOAD = "/workflow/preload.so";
+
+  try {
+    const operation = createSwapOperation(context, 1024n ** 2n, root, {
+      commandRunner: async (invocation) => {
+        calls.push({
+          ...invocation,
+          args: [...invocation.args],
+          options: {
+            ...invocation.options,
+            env: { ...invocation.options.env },
+          },
+        });
+        const success = { exitCode: 0, stdout: "", stderr: "" };
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.test) {
+          return { ...success, exitCode: 1 };
+        }
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.grep) {
+          return { ...success, exitCode: 1 };
+        }
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.df) {
+          return { ...success, stdout: "Avail\n1073741824\n" };
+        }
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.mktemp) {
+          const template = invocation.args[0];
+          assert.ok(template !== undefined);
+          assert.ok(template.endsWith("XXXXXX"));
+          return {
+            ...success,
+            stdout: `${template.slice(0, -6)}ABC123\n`,
+          };
+        }
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.fallocate) {
+          return { ...success, exitCode: 1, stderr: "unsupported filesystem" };
+        }
+        if (invocation.executable === LINUX_SWAP_EXECUTABLES.tee) {
+          return { ...success, exitCode: 1, stderr: "simulated tee failure" };
+        }
+        return success;
+      },
+    });
+    assert.ok(operation.validate);
+    await operation.validate();
+    const result = await operation.run();
+    assert.equal(result.status, "failed");
+    assert.match(result.detail ?? "", /simulated tee failure/);
+  } finally {
+    for (const [name, value] of original) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+
+  assert.deepEqual(
+    calls.map(({ executable }) => executable),
+    [
+      LINUX_SWAP_EXECUTABLES.swapon,
+      LINUX_SWAP_EXECUTABLES.test,
+      LINUX_SWAP_EXECUTABLES.grep,
+      LINUX_SWAP_EXECUTABLES.df,
+      LINUX_SWAP_EXECUTABLES.mktemp,
+      LINUX_SWAP_EXECUTABLES.fallocate,
+      LINUX_SWAP_EXECUTABLES.dd,
+      LINUX_SWAP_EXECUTABLES.truncate,
+      LINUX_SWAP_EXECUTABLES.chmod,
+      LINUX_SWAP_EXECUTABLES.mkswap,
+      LINUX_SWAP_EXECUTABLES.mv,
+      LINUX_SWAP_EXECUTABLES.swapon,
+      LINUX_SWAP_EXECUTABLES.tee,
+      LINUX_SWAP_EXECUTABLES.swapoff,
+      LINUX_SWAP_EXECUTABLES.rm,
+      LINUX_SWAP_EXECUTABLES.sed,
+    ],
+  );
+  assert.deepEqual(
+    new Set(calls.map(({ executable }) => executable)),
+    new Set(Object.values(LINUX_SWAP_EXECUTABLES)),
+  );
+  assert.deepEqual(
+    calls.map(({ elevated }) => elevated),
+    [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+    ],
+  );
+  for (const invocation of calls) {
+    assert.equal(invocation.executable.startsWith("/"), true);
+    assert.deepEqual(invocation.options.env, linuxSwapCommandEnvironment());
+    assert.equal(invocation.options.env.BASH_ENV, undefined);
+    assert.equal(invocation.options.env.ENV, undefined);
+    assert.equal(invocation.options.env.LD_PRELOAD, undefined);
+  }
 });
 
 for (const redirectedTarget of ["swapfile", "fstab"] as const) {

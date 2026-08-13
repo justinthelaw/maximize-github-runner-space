@@ -61,21 +61,37 @@ jobs:
       # Keep the configured swap active across every compatibility assertion,
       # including historical no-input max. Remove it only after preservation is
       # proven so this one runner covers the full transactional lifecycle.
+      - name: Prepare untrusted swap utility shims
+        shell: bash
+        run: |
+          set -euo pipefail
+          shim_root="${RUNNER_TEMP}/untrusted-swap-bin"
+          /usr/bin/install -d "$shim_root"
+          for utility in swapon swapoff grep df mktemp fallocate dd truncate chmod mkswap mv rm sed tee test; do
+            /usr/bin/printf '%s\n' '#!/bin/sh' 'exit 97' >"${shim_root}/${utility}"
+            /usr/bin/chmod +x "${shim_root}/${utility}"
+          done
+
       - name: Resize swapfile with the historical fractional syntax
+        id: swap-resize
         uses: ./
         # Prove workflow-controlled image variables cannot select or reject the
         # image; runtime authorization comes from the fixed image-data record.
         env:
           ImageOS: rhel9
           ImageVersion: not-a-version
+          PATH: ${{ runner.temp }}/untrusted-swap-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         with:
           cleanup-profile: custom
           swapfile-size: 1.5GiB
 
       - name: Verify configured swapfile
         shell: bash
+        env:
+          FAILED_OPERATIONS: ${{ steps.swap-resize.outputs.failed-operations }}
         run: |
           set -euo pipefail
+          [[ "$FAILED_OPERATIONS" == 0 ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab

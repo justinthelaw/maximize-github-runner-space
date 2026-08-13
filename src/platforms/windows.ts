@@ -135,8 +135,42 @@ interface WindowsPathStats {
   readonly mtimeNs: bigint;
 }
 
-export interface WindowsManagedPathProbe {
+export interface WindowsPathProbe {
   lstat(path: string): Promise<WindowsPathStats>;
+}
+
+export type WindowsManagedPathProbe = WindowsPathProbe;
+
+interface WindowsPathIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+}
+
+const NODE_WINDOWS_PATH_PROBE: WindowsPathProbe = {
+  lstat: async (path: string) => await lstat(path, { bigint: true }),
+};
+
+function windowsPathIdentity(stats: WindowsPathStats): WindowsPathIdentity {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+  };
+}
+
+function sameWindowsPathIdentity(
+  left: WindowsPathIdentity | undefined,
+  right: WindowsPathIdentity | undefined,
+): boolean {
+  return (
+    left?.dev === right?.dev &&
+    left?.ino === right?.ino &&
+    left?.size === right?.size &&
+    left?.mtimeNs === right?.mtimeNs
+  );
 }
 
 interface WindowsServiceSnapshot extends WindowsServiceTarget {
@@ -752,38 +786,217 @@ function msiOperation(
   });
 }
 
-function executableUninstallOperation(options: {
+export interface WindowsExecutableUninstallCandidate {
+  readonly installationRoot: string;
+  readonly executable: string;
+}
+
+type WindowsExecutableUninstallSnapshot =
+  | {
+      readonly candidate: WindowsExecutableUninstallCandidate;
+      readonly status: "root-absent";
+    }
+  | {
+      readonly candidate: WindowsExecutableUninstallCandidate;
+      readonly status: "executable-absent";
+      readonly root: WindowsPathIdentity;
+    }
+  | {
+      readonly candidate: WindowsExecutableUninstallCandidate;
+      readonly status: "present";
+      readonly root: WindowsPathIdentity;
+      readonly executable: WindowsPathIdentity;
+    };
+
+function sameExecutableUninstallSnapshot(
+  left: WindowsExecutableUninstallSnapshot,
+  right: WindowsExecutableUninstallSnapshot,
+): boolean {
+  return (
+    win32.normalize(left.candidate.installationRoot).toLowerCase() ===
+      win32.normalize(right.candidate.installationRoot).toLowerCase() &&
+    win32.normalize(left.candidate.executable).toLowerCase() ===
+      win32.normalize(right.candidate.executable).toLowerCase() &&
+    left.status === right.status &&
+    (left.status === "root-absent" ||
+      (right.status !== "root-absent" &&
+        sameWindowsPathIdentity(left.root, right.root) &&
+        (left.status === "executable-absent" ||
+          (right.status === "present" &&
+            sameWindowsPathIdentity(left.executable, right.executable)))))
+  );
+}
+
+function sameExecutableUninstallSnapshots(
+  left: readonly WindowsExecutableUninstallSnapshot[],
+  right: readonly WindowsExecutableUninstallSnapshot[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((snapshot, index) => {
+      const other = right[index];
+      return (
+        other !== undefined && sameExecutableUninstallSnapshot(snapshot, other)
+      );
+    })
+  );
+}
+
+async function inspectExecutableUninstallCandidate(
+  context: RuntimeContext,
+  candidate: WindowsExecutableUninstallCandidate,
+  probe: WindowsPathProbe,
+): Promise<WindowsExecutableUninstallSnapshot> {
+  await validateExactTarget(context, candidate.installationRoot);
+  await validateRemovePathTarget(
+    candidate.executable,
+    [candidate.installationRoot],
+    context,
+  );
+
+  let root: WindowsPathStats;
+  try {
+    root = await probe.lstat(candidate.installationRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { candidate, status: "root-absent" };
+    }
+    throw error;
+  }
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new Error(
+      `Refusing executable uninstaller with an unexpected installation root type: '${candidate.installationRoot}'.`,
+    );
+  }
+
+  let executable: WindowsPathStats;
+  try {
+    executable = await probe.lstat(candidate.executable);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return {
+        candidate,
+        status: "executable-absent",
+        root: windowsPathIdentity(root),
+      };
+    }
+    throw error;
+  }
+  if (executable.isSymbolicLink() || !executable.isFile()) {
+    throw new Error(
+      `Refusing executable uninstaller with an unexpected executable type: '${candidate.executable}'.`,
+    );
+  }
+  return {
+    candidate,
+    status: "present",
+    root: windowsPathIdentity(root),
+    executable: windowsPathIdentity(executable),
+  };
+}
+
+export function executableUninstallOperation(options: {
+  readonly context: RuntimeContext;
   readonly component: ComponentId;
   readonly id: string;
   readonly description: string;
-  readonly candidates: readonly string[];
+  readonly candidates: readonly WindowsExecutableUninstallCandidate[];
   readonly args: readonly string[];
   readonly timeoutMs?: number;
+  readonly probe?: WindowsPathProbe;
+  readonly execute?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
 }): Operation {
+  const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const execute =
+    options.execute ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: true,
+        timeoutMs: options.timeoutMs ?? 20 * 60_000,
+      }));
+  const candidates = [
+    ...new Map(
+      options.candidates.map((candidate) => [
+        `${win32.normalize(candidate.installationRoot).toLowerCase()}\0${win32
+          .normalize(candidate.executable)
+          .toLowerCase()}`,
+        candidate,
+      ]),
+    ).values(),
+  ];
+  const inspectAll = async (): Promise<
+    readonly WindowsExecutableUninstallSnapshot[]
+  > =>
+    await Promise.all(
+      candidates.map(
+        async (candidate) =>
+          await inspectExecutableUninstallCandidate(
+            options.context,
+            candidate,
+            probe,
+          ),
+      ),
+    );
+  let validated: readonly WindowsExecutableUninstallSnapshot[] | undefined;
   return createFunctionOperation({
     id: `windows:uninstall:${options.component}:${options.id}`,
     component: options.component,
     description: options.description,
     phase: "package",
     dedupeKey: `windows:uninstall:${options.id}`,
+    validate: async () => {
+      validated = await inspectAll();
+    },
     run: async (): Promise<OperationResult> => {
-      const candidates = [...new Set(options.candidates)];
-      let removed = false;
-      for (const executable of candidates) {
-        if (!(await pathExists(executable))) continue;
-        const result = await runCommand(executable, options.args, {
-          silent: true,
-          timeoutMs: options.timeoutMs ?? 20 * 60_000,
-        });
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+      try {
+        validated ??= await inspectAll();
+        const immediate = await inspectAll();
+        if (!sameExecutableUninstallSnapshots(validated, immediate)) {
           return {
             status: "failed",
-            detail: failureDetail(result.stderr, executable, result.exitCode),
+            detail: "executable uninstaller changed after plan validation",
           };
         }
-        removed = true;
+        let removed = false;
+        for (const snapshot of validated) {
+          if (snapshot.status !== "present") continue;
+          const beforeSpawn = await inspectExecutableUninstallCandidate(
+            options.context,
+            snapshot.candidate,
+            probe,
+          );
+          if (!sameExecutableUninstallSnapshot(snapshot, beforeSpawn)) {
+            return {
+              status: "failed",
+              detail: "executable uninstaller changed immediately before spawn",
+            };
+          }
+          const result = await execute(
+            snapshot.candidate.executable,
+            options.args,
+          );
+          if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+            return {
+              status: "failed",
+              detail: failureDetail(
+                result.stderr,
+                snapshot.candidate.executable,
+                result.exitCode,
+              ),
+            };
+          }
+          removed = true;
+        }
+        return removed ? { status: "removed" } : { status: "not-found" };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
       }
-      return removed ? { status: "removed" } : { status: "not-found" };
     },
   });
 }
@@ -1050,15 +1263,13 @@ export function managedDirectoryUninstallOperation(options: {
   readonly target: string;
   readonly uninstaller: string;
   readonly args: readonly string[];
-  readonly probe?: WindowsManagedPathProbe;
+  readonly probe?: WindowsPathProbe;
   readonly execute?: (
     executable: string,
     args: readonly string[],
   ) => Promise<CommandResult>;
 }): Operation {
-  const probe = options.probe ?? {
-    lstat: async (path: string) => await lstat(path, { bigint: true }),
-  };
+  const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
   const execute =
     options.execute ??
     (async (path: string, args: readonly string[]) =>
@@ -1067,18 +1278,12 @@ export function managedDirectoryUninstallOperation(options: {
         timeoutMs: 30 * 60_000,
       }));
   const executable = win32.join(options.target, options.uninstaller);
-  const identity = (stats: WindowsPathStats) => ({
-    dev: stats.dev,
-    ino: stats.ino,
-    size: stats.size,
-    mtimeNs: stats.mtimeNs,
-  });
   type ManagedTargets =
     | { readonly status: "root-absent" }
     | {
         readonly status: "root-present";
-        readonly root: ReturnType<typeof identity>;
-        readonly uninstaller?: ReturnType<typeof identity>;
+        readonly root: WindowsPathIdentity;
+        readonly uninstaller?: WindowsPathIdentity;
       };
   const inspectManagedTargets = async (): Promise<ManagedTargets> => {
     await validateExactTarget(options.context, options.target);
@@ -1105,31 +1310,23 @@ export function managedDirectoryUninstallOperation(options: {
       }
       return {
         status: "root-present",
-        root: identity(root),
-        uninstaller: identity(uninstaller),
+        root: windowsPathIdentity(root),
+        uninstaller: windowsPathIdentity(uninstaller),
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return { status: "root-present", root: identity(root) };
+        return { status: "root-present", root: windowsPathIdentity(root) };
       }
       throw error;
     }
   };
   let validatedState: ManagedTargets | undefined;
-  const sameIdentity = (
-    left: ReturnType<typeof identity> | undefined,
-    right: ReturnType<typeof identity> | undefined,
-  ): boolean =>
-    left?.dev === right?.dev &&
-    left?.ino === right?.ino &&
-    left?.size === right?.size &&
-    left?.mtimeNs === right?.mtimeNs;
   const sameTargets = (left: ManagedTargets, right: ManagedTargets): boolean =>
     left.status === right.status &&
     (left.status === "root-absent" ||
       (right.status === "root-present" &&
-        sameIdentity(left.root, right.root) &&
-        sameIdentity(left.uninstaller, right.uninstaller)));
+        sameWindowsPathIdentity(left.root, right.root) &&
+        sameWindowsPathIdentity(left.uninstaller, right.uninstaller)));
   return createFunctionOperation({
     id: `windows:managed-directory:${options.component}:${options.id}`,
     component: options.component,
@@ -1509,23 +1706,26 @@ export async function createWindowsAdapter(
       const addFirefox = (component: "browsers" | "firefox"): void => {
         operations.push(
           executableUninstallOperation({
+            context,
             component,
             id: "firefox",
             description: "Uninstall Mozilla Firefox",
-            candidates: [
-              win32.join(
-                paths.programFiles,
-                "Mozilla Firefox",
-                "uninstall",
-                "helper.exe",
-              ),
-              win32.join(
-                paths.programFilesX86,
-                "Mozilla Firefox",
-                "uninstall",
-                "helper.exe",
-              ),
-            ],
+            candidates: [paths.programFiles, paths.programFilesX86].map(
+              (programFiles) => {
+                const installationRoot = win32.join(
+                  programFiles,
+                  "Mozilla Firefox",
+                );
+                return {
+                  installationRoot,
+                  executable: win32.join(
+                    installationRoot,
+                    "uninstall",
+                    "helper.exe",
+                  ),
+                };
+              },
+            ),
             args: ["/S"],
           }),
         );
@@ -1716,10 +1916,19 @@ export async function createWindowsAdapter(
         for (const versionPath of programVersions) {
           operations.push(
             executableUninstallOperation({
+              context,
               component: "postgresql",
               id: `postgresql-${win32.basename(versionPath)}`,
               description: `Uninstall PostgreSQL ${win32.basename(versionPath)}`,
-              candidates: [win32.join(versionPath, "uninstall-postgresql.exe")],
+              candidates: [
+                {
+                  installationRoot: versionPath,
+                  executable: win32.join(
+                    versionPath,
+                    "uninstall-postgresql.exe",
+                  ),
+                },
+              ],
               args: ["--mode", "unattended"],
               timeoutMs: 30 * 60_000,
             }),

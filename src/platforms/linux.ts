@@ -15,6 +15,7 @@ import {
   runCommand,
   runElevated,
   TRUSTED_UNIX_PATH,
+  type CommandOptions,
 } from "../command.js";
 import { COMPONENTS } from "../components.js";
 import {
@@ -1004,6 +1005,49 @@ function aptFinalizeOperation(
   });
 }
 
+export const LINUX_SWAP_EXECUTABLES = Object.freeze({
+  chmod: "/usr/bin/chmod",
+  dd: "/usr/bin/dd",
+  df: "/usr/bin/df",
+  fallocate: "/usr/bin/fallocate",
+  grep: "/usr/bin/grep",
+  mktemp: "/usr/bin/mktemp",
+  mkswap: "/usr/sbin/mkswap",
+  mv: "/usr/bin/mv",
+  rm: "/usr/bin/rm",
+  sed: "/usr/bin/sed",
+  swapoff: "/usr/sbin/swapoff",
+  swapon: "/usr/sbin/swapon",
+  tee: "/usr/bin/tee",
+  test: "/usr/bin/test",
+  truncate: "/usr/bin/truncate",
+} as const);
+
+type LinuxSwapUtility = keyof typeof LINUX_SWAP_EXECUTABLES;
+
+export interface LinuxSwapCommandInvocation {
+  readonly elevated: boolean;
+  readonly executable: string;
+  readonly args: readonly string[];
+  readonly options: CommandOptions & { readonly env: NodeJS.ProcessEnv };
+}
+
+export type LinuxSwapCommandRunner = (
+  invocation: LinuxSwapCommandInvocation,
+) => Promise<CommandResult>;
+
+export interface LinuxSwapDependencies {
+  readonly commandRunner?: LinuxSwapCommandRunner;
+}
+
+export function linuxSwapCommandEnvironment(): NodeJS.ProcessEnv {
+  return {
+    PATH: TRUSTED_UNIX_PATH,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+  };
+}
+
 interface SwapDefinitionPaths {
   readonly root: string;
   readonly mountDirectory: string;
@@ -1070,8 +1114,28 @@ export function createSwapOperation(
   context: RuntimeContext,
   requested: bigint,
   definitionRoot = "/",
+  dependencies: LinuxSwapDependencies = {},
 ): Operation {
   const paths = swapDefinitionPaths(definitionRoot);
+  const environment = linuxSwapCommandEnvironment();
+  const commandRunner: LinuxSwapCommandRunner =
+    dependencies.commandRunner ??
+    (async ({ elevated, executable, args, options }) =>
+      elevated
+        ? await runElevated(context, executable, args, options)
+        : await runCommand(executable, args, options));
+  const runSwapUtility = async (
+    elevated: boolean,
+    utility: LinuxSwapUtility,
+    args: readonly string[],
+    options: Omit<CommandOptions, "env"> = {},
+  ): Promise<CommandResult> =>
+    await commandRunner({
+      elevated,
+      executable: LINUX_SWAP_EXECUTABLES[utility],
+      args,
+      options: { ...options, env: environment },
+    });
   const validate = async (): Promise<void> =>
     await validateSwapTargets(context, definitionRoot);
   const fstabEntryPattern = `^${escapeExtendedRegularExpression(paths.swapfile)}[[:space:]]+none[[:space:]]+swap[[:space:]]`;
@@ -1103,8 +1167,8 @@ export function createSwapOperation(
         | { readonly path: string; readonly detail?: never }
         | { readonly path?: never; readonly detail: string }
       > => {
-        const created = await runElevated(
-          context,
+        const created = await runSwapUtility(
+          true,
           "mktemp",
           [`${prefix}XXXXXX`],
           { silent: true },
@@ -1125,7 +1189,7 @@ export function createSwapOperation(
       };
 
       const removeTemporaryFile = async (path: string): Promise<void> => {
-        await runElevated(context, "/bin/rm", ["-f", "--", path], {
+        await runSwapUtility(true, "rm", ["-f", "--", path], {
           silent: true,
         });
       };
@@ -1134,7 +1198,8 @@ export function createSwapOperation(
         | { readonly status: "present" | "absent" }
         | { readonly status: "failed"; readonly detail: string }
       > => {
-        const result = await runCommand(
+        const result = await runSwapUtility(
+          false,
           "grep",
           ["-Eq", fstabEntryPattern, paths.fstab],
           { silent: true },
@@ -1148,14 +1213,15 @@ export function createSwapOperation(
       };
 
       const removeFstabEntry = async () =>
-        await runElevated(
-          context,
+        await runSwapUtility(
+          true,
           "sed",
           ["-E", "-i", `\\|${fstabEntryPattern}|d`, paths.fstab],
           { silent: true },
         );
 
-      const active = await runCommand(
+      const active = await runSwapUtility(
+        false,
         "swapon",
         ["--show=NAME", "--noheadings"],
         {
@@ -1169,8 +1235,9 @@ export function createSwapOperation(
         };
       }
       const isActive = active.stdout.split(/\s+/).includes(paths.swapfile);
-      const existing = await runCommand(
-        "/usr/bin/test",
+      const existing = await runSwapUtility(
+        false,
+        "test",
         ["-e", paths.swapfile],
         {
           silent: true,
@@ -1202,7 +1269,7 @@ export function createSwapOperation(
           backup = temporary.path;
         }
         if (isActive) {
-          const off = await runElevated(context, "swapoff", [paths.swapfile], {
+          const off = await runSwapUtility(true, "swapoff", [paths.swapfile], {
             silent: true,
           });
           if (off.exitCode !== 0) {
@@ -1211,8 +1278,8 @@ export function createSwapOperation(
           }
         }
         if (backup !== undefined) {
-          const backedUp = await runElevated(
-            context,
+          const backedUp = await runSwapUtility(
+            true,
             "mv",
             [paths.swapfile, backup],
             { silent: true },
@@ -1220,7 +1287,7 @@ export function createSwapOperation(
           if (backedUp.exitCode !== 0) {
             await removeTemporaryFile(backup);
             if (isActive) {
-              await runElevated(context, "swapon", [paths.swapfile], {
+              await runSwapUtility(true, "swapon", [paths.swapfile], {
                 silent: true,
               });
             }
@@ -1236,8 +1303,8 @@ export function createSwapOperation(
         if (fstabRemoved.exitCode !== 0) {
           const rollback: string[] = [];
           if (backup !== undefined) {
-            const restored = await runElevated(
-              context,
+            const restored = await runSwapUtility(
+              true,
               "mv",
               [backup, paths.swapfile],
               { silent: true },
@@ -1245,8 +1312,8 @@ export function createSwapOperation(
             if (restored.exitCode !== 0) {
               rollback.push(`restore failed: ${restored.stderr.trim()}`);
             } else if (isActive) {
-              const enabled = await runElevated(
-                context,
+              const enabled = await runSwapUtility(
+                true,
                 "swapon",
                 [paths.swapfile],
                 { silent: true },
@@ -1266,9 +1333,9 @@ export function createSwapOperation(
         }
 
         if (backup !== undefined) {
-          const removed = await runElevated(
-            context,
-            "/bin/rm",
+          const removed = await runSwapUtility(
+            true,
+            "rm",
             ["-f", "--", backup],
             { silent: true },
           );
@@ -1279,7 +1346,8 @@ export function createSwapOperation(
         return { status: "removed" };
       }
 
-      const stat = await runCommand(
+      const stat = await runSwapUtility(
+        false,
         "df",
         ["--output=avail", "-B1", paths.mountDirectory],
         { silent: true },
@@ -1305,16 +1373,16 @@ export function createSwapOperation(
         return { status: "failed", detail: temporary.detail };
       }
       const replacement = temporary.path;
-      const allocate = await runElevated(
-        context,
+      const allocate = await runSwapUtility(
+        true,
         "fallocate",
         ["-l", requested.toString(), replacement],
         { silent: true },
       );
       if (allocate.exitCode !== 0) {
         const mebibytes = (requested + 1024n ** 2n - 1n) / 1024n ** 2n;
-        const fallback = await runElevated(
-          context,
+        const fallback = await runSwapUtility(
+          true,
           "dd",
           [
             "if=/dev/zero",
@@ -1326,7 +1394,7 @@ export function createSwapOperation(
           { silent: true, timeoutMs: 15 * 60_000 },
         );
         if (fallback.exitCode !== 0) {
-          await runElevated(context, "/bin/rm", ["-f", replacement], {
+          await runSwapUtility(true, "rm", ["-f", replacement], {
             silent: true,
           });
           return {
@@ -1334,33 +1402,33 @@ export function createSwapOperation(
             detail: fallback.stderr.trim() || allocate.stderr.trim(),
           };
         }
-        const truncated = await runElevated(
-          context,
+        const truncated = await runSwapUtility(
+          true,
           "truncate",
           ["-s", requested.toString(), replacement],
           { silent: true },
         );
         if (truncated.exitCode !== 0) {
-          await runElevated(context, "/bin/rm", ["-f", replacement], {
+          await runSwapUtility(true, "rm", ["-f", replacement], {
             silent: true,
           });
           return { status: "failed", detail: truncated.stderr.trim() };
         }
       }
-      const mode = await runElevated(context, "chmod", ["600", replacement], {
+      const mode = await runSwapUtility(true, "chmod", ["600", replacement], {
         silent: true,
       });
       if (mode.exitCode !== 0) {
-        await runElevated(context, "/bin/rm", ["-f", replacement], {
+        await runSwapUtility(true, "rm", ["-f", replacement], {
           silent: true,
         });
         return { status: "failed", detail: mode.stderr.trim() };
       }
-      const formatted = await runElevated(context, "mkswap", [replacement], {
+      const formatted = await runSwapUtility(true, "mkswap", [replacement], {
         silent: true,
       });
       if (formatted.exitCode !== 0) {
-        await runElevated(context, "/bin/rm", ["-f", replacement], {
+        await runSwapUtility(true, "rm", ["-f", replacement], {
           silent: true,
         });
         return { status: "failed", detail: formatted.stderr.trim() };
@@ -1382,8 +1450,8 @@ export function createSwapOperation(
       ): Promise<string> => {
         const details: string[] = [];
         if (replacementIsActive) {
-          const disabled = await runElevated(
-            context,
+          const disabled = await runSwapUtility(
+            true,
             "swapoff",
             [paths.swapfile],
             { silent: true },
@@ -1393,9 +1461,9 @@ export function createSwapOperation(
           }
         }
 
-        const removed = await runElevated(
-          context,
-          "/bin/rm",
+        const removed = await runSwapUtility(
+          true,
+          "rm",
           ["-f", "--", paths.swapfile, replacement],
           { silent: true },
         );
@@ -1404,8 +1472,8 @@ export function createSwapOperation(
         }
 
         if (backup !== undefined) {
-          const restored = await runElevated(
-            context,
+          const restored = await runSwapUtility(
+            true,
             "mv",
             [backup, paths.swapfile],
             { silent: true },
@@ -1413,8 +1481,8 @@ export function createSwapOperation(
           if (restored.exitCode !== 0) {
             details.push(`rollback move failed: ${restored.stderr.trim()}`);
           } else if (isActive) {
-            const reenabled = await runElevated(
-              context,
+            const reenabled = await runSwapUtility(
+              true,
               "swapon",
               [paths.swapfile],
               { silent: true },
@@ -1439,7 +1507,7 @@ export function createSwapOperation(
       };
 
       if (isActive) {
-        const off = await runElevated(context, "swapoff", [paths.swapfile], {
+        const off = await runSwapUtility(true, "swapoff", [paths.swapfile], {
           silent: true,
         });
         if (off.exitCode !== 0) {
@@ -1452,15 +1520,15 @@ export function createSwapOperation(
         }
       }
       if (backup !== undefined) {
-        const backedUp = await runElevated(
-          context,
+        const backedUp = await runSwapUtility(
+          true,
           "mv",
           [paths.swapfile, backup],
           { silent: true },
         );
         if (backedUp.exitCode !== 0) {
           if (isActive) {
-            await runElevated(context, "swapon", [paths.swapfile], {
+            await runSwapUtility(true, "swapon", [paths.swapfile], {
               silent: true,
             });
           }
@@ -1472,15 +1540,15 @@ export function createSwapOperation(
           };
         }
       }
-      const moved = await runElevated(
-        context,
+      const moved = await runSwapUtility(
+        true,
         "mv",
         [replacement, paths.swapfile],
         { silent: true },
       );
       const enabled =
         moved.exitCode === 0
-          ? await runElevated(context, "swapon", [paths.swapfile], {
+          ? await runSwapUtility(true, "swapon", [paths.swapfile], {
               silent: true,
             })
           : moved;
@@ -1498,9 +1566,9 @@ export function createSwapOperation(
       }
 
       if (fstabBefore.status === "absent") {
-        const appended = await runElevated(
-          context,
-          "/usr/bin/tee",
+        const appended = await runSwapUtility(
+          true,
+          "tee",
           ["-a", paths.fstab],
           {
             silent: true,
@@ -1522,12 +1590,9 @@ export function createSwapOperation(
       }
 
       if (backup !== undefined) {
-        const removed = await runElevated(
-          context,
-          "/bin/rm",
-          ["-f", "--", backup],
-          { silent: true },
-        );
+        const removed = await runSwapUtility(true, "rm", ["-f", "--", backup], {
+          silent: true,
+        });
         if (removed.exitCode !== 0) {
           return {
             status: "failed",
