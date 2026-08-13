@@ -11,7 +11,7 @@ import {
   createFunctionOperation,
   createRemovePathOperation,
 } from "../operations.js";
-import { assertSafeDirectoryTarget } from "../safety.js";
+import { assertSafeDirectoryTarget, assertSafeExactTarget } from "../safety.js";
 import type {
   Adapter,
   CleanupPlan,
@@ -499,16 +499,92 @@ function aptFinalizeOperation(
   });
 }
 
-function swapOperation(context: RuntimeContext, requested: bigint): Operation {
+interface SwapDefinitionPaths {
+  readonly root: string;
+  readonly mountDirectory: string;
+  readonly swapfile: string;
+  readonly etcDirectory: string;
+  readonly fstab: string;
+}
+
+function swapDefinitionPaths(definitionRoot: string): SwapDefinitionPaths {
+  if (!posix.isAbsolute(definitionRoot)) {
+    throw new Error(
+      `Refusing non-absolute swap definition root: '${definitionRoot}'.`,
+    );
+  }
+  const root = posix.normalize(posix.resolve(definitionRoot));
+  const mountDirectory = posix.join(root, "mnt");
+  const etcDirectory = posix.join(root, "etc");
+  return {
+    root,
+    mountDirectory,
+    swapfile: posix.join(mountDirectory, "swapfile"),
+    etcDirectory,
+    fstab: posix.join(etcDirectory, "fstab"),
+  };
+}
+
+export async function validateSwapTargets(
+  context: RuntimeContext,
+  definitionRoot = "/",
+): Promise<void> {
+  const paths = swapDefinitionPaths(definitionRoot);
+  await assertSafeExactTarget(
+    paths.mountDirectory,
+    [paths.root],
+    context,
+    "directory",
+  );
+  await assertSafeExactTarget(
+    paths.swapfile,
+    [paths.mountDirectory],
+    context,
+    "absent-or-regular-file",
+  );
+  await assertSafeExactTarget(
+    paths.etcDirectory,
+    [paths.root],
+    context,
+    "directory",
+  );
+  await assertSafeExactTarget(
+    paths.fstab,
+    [paths.etcDirectory],
+    context,
+    "regular-file",
+  );
+}
+
+function escapeExtendedRegularExpression(value: string): string {
+  return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+}
+
+/** The root override keeps exact-path safety tests isolated from the host. */
+export function createSwapOperation(
+  context: RuntimeContext,
+  requested: bigint,
+  definitionRoot = "/",
+): Operation {
+  const paths = swapDefinitionPaths(definitionRoot);
+  const validate = async (): Promise<void> =>
+    await validateSwapTargets(context, definitionRoot);
+  const fstabEntryPattern = `^${escapeExtendedRegularExpression(paths.swapfile)}[[:space:]]+none[[:space:]]+swap[[:space:]]`;
   return createFunctionOperation({
     id: "swapfile",
     component: "large-packages",
     description:
-      requested === 0n ? "Remove /mnt/swapfile" : "Configure /mnt/swapfile",
+      requested === 0n
+        ? `Remove ${paths.swapfile}`
+        : `Configure ${paths.swapfile}`,
     phase: "system",
     always: true,
     fatal: true,
+    validate,
     run: async () => {
+      // Package cleanup may run for several minutes after plan validation.
+      // Recheck the exact follow-through targets before the first swap command.
+      await validate();
       if (context.isContainer || !context.hasPasswordlessSudo) {
         return {
           status: "unsupported",
@@ -517,7 +593,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
       }
 
       const makeTemporaryFile = async (
-        prefix: "/mnt/swapfile.new." | "/mnt/swapfile.previous.",
+        prefix: string,
       ): Promise<
         | { readonly path: string; readonly detail?: never }
         | { readonly path?: never; readonly detail: string }
@@ -555,18 +631,14 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
       > => {
         const result = await runCommand(
           "grep",
-          [
-            "-Eq",
-            "^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]",
-            "/etc/fstab",
-          ],
+          ["-Eq", fstabEntryPattern, paths.fstab],
           { silent: true },
         );
         if (result.exitCode === 0) return { status: "present" };
         if (result.exitCode === 1) return { status: "absent" };
         return {
           status: "failed",
-          detail: result.stderr.trim() || "unable to inspect /etc/fstab",
+          detail: result.stderr.trim() || `unable to inspect ${paths.fstab}`,
         };
       };
 
@@ -574,11 +646,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
         await runElevated(
           context,
           "sed",
-          [
-            "-i",
-            "\\|^/mnt/swapfile[[:space:]]\\+none[[:space:]]\\+swap[[:space:]]|d",
-            "/etc/fstab",
-          ],
+          ["-E", "-i", `\\|${fstabEntryPattern}|d`, paths.fstab],
           { silent: true },
         );
 
@@ -595,11 +663,13 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           detail: active.stderr.trim() || "unable to inspect active swap",
         };
       }
-      const isActive = active.stdout.split(/\s+/).includes("/mnt/swapfile");
+      const isActive = active.stdout.split(/\s+/).includes(paths.swapfile);
       const existing = await runCommand(
         "/usr/bin/test",
-        ["-e", "/mnt/swapfile"],
-        { silent: true },
+        ["-e", paths.swapfile],
+        {
+          silent: true,
+        },
       );
       const fileState = existingFileState(existing.exitCode);
       if (fileState === "failed") {
@@ -618,14 +688,16 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
       if (requested === 0n) {
         let backup: string | undefined;
         if (hadExistingFile) {
-          const temporary = await makeTemporaryFile("/mnt/swapfile.previous.");
+          const temporary = await makeTemporaryFile(
+            `${paths.swapfile}.previous.`,
+          );
           if (temporary.path === undefined) {
             return { status: "failed", detail: temporary.detail };
           }
           backup = temporary.path;
         }
         if (isActive) {
-          const off = await runElevated(context, "swapoff", ["/mnt/swapfile"], {
+          const off = await runElevated(context, "swapoff", [paths.swapfile], {
             silent: true,
           });
           if (off.exitCode !== 0) {
@@ -637,13 +709,13 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           const backedUp = await runElevated(
             context,
             "mv",
-            ["/mnt/swapfile", backup],
+            [paths.swapfile, backup],
             { silent: true },
           );
           if (backedUp.exitCode !== 0) {
             await removeTemporaryFile(backup);
             if (isActive) {
-              await runElevated(context, "swapon", ["/mnt/swapfile"], {
+              await runElevated(context, "swapon", [paths.swapfile], {
                 silent: true,
               });
             }
@@ -662,7 +734,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
             const restored = await runElevated(
               context,
               "mv",
-              [backup, "/mnt/swapfile"],
+              [backup, paths.swapfile],
               { silent: true },
             );
             if (restored.exitCode !== 0) {
@@ -671,7 +743,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
               const enabled = await runElevated(
                 context,
                 "swapon",
-                ["/mnt/swapfile"],
+                [paths.swapfile],
                 { silent: true },
               );
               if (enabled.exitCode !== 0) {
@@ -682,7 +754,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           return {
             status: "failed",
             detail: [
-              fstabRemoved.stderr.trim() || "unable to update /etc/fstab",
+              fstabRemoved.stderr.trim() || `unable to update ${paths.fstab}`,
               ...rollback,
             ].join("; "),
           };
@@ -702,25 +774,28 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
         return { status: "removed" };
       }
 
-      const stat = await runCommand("df", ["--output=avail", "-B1", "/mnt"], {
-        silent: true,
-      });
+      const stat = await runCommand(
+        "df",
+        ["--output=avail", "-B1", paths.mountDirectory],
+        { silent: true },
+      );
       const rawAvailable = stat.stdout.trim().split(/\s+/).at(-1) ?? "";
       if (stat.exitCode !== 0 || !/^[0-9]+$/.test(rawAvailable)) {
         return {
           status: "failed",
-          detail: stat.stderr.trim() || "unable to inspect /mnt free space",
+          detail:
+            stat.stderr.trim() ||
+            `unable to inspect ${paths.mountDirectory} free space`,
         };
       }
       const available = BigInt(rawAvailable);
       if (requested > available - 512n * 1024n * 1024n) {
         return {
           status: "failed",
-          detail:
-            "requested swap exceeds safe /mnt free space; existing swap left unchanged",
+          detail: `requested swap exceeds safe ${paths.mountDirectory} free space; existing swap left unchanged`,
         };
       }
-      const temporary = await makeTemporaryFile("/mnt/swapfile.new.");
+      const temporary = await makeTemporaryFile(`${paths.swapfile}.new.`);
       if (temporary.path === undefined) {
         return { status: "failed", detail: temporary.detail };
       }
@@ -788,7 +863,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
 
       let backup: string | undefined;
       if (hadExistingFile) {
-        const previous = await makeTemporaryFile("/mnt/swapfile.previous.");
+        const previous = await makeTemporaryFile(`${paths.swapfile}.previous.`);
         if (previous.path === undefined) {
           await removeTemporaryFile(replacement);
           return { status: "failed", detail: previous.detail };
@@ -805,7 +880,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           const disabled = await runElevated(
             context,
             "swapoff",
-            ["/mnt/swapfile"],
+            [paths.swapfile],
             { silent: true },
           );
           if (disabled.exitCode !== 0) {
@@ -816,7 +891,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
         const removed = await runElevated(
           context,
           "/bin/rm",
-          ["-f", "--", "/mnt/swapfile", replacement],
+          ["-f", "--", paths.swapfile, replacement],
           { silent: true },
         );
         if (removed.exitCode !== 0) {
@@ -827,7 +902,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           const restored = await runElevated(
             context,
             "mv",
-            [backup, "/mnt/swapfile"],
+            [backup, paths.swapfile],
             { silent: true },
           );
           if (restored.exitCode !== 0) {
@@ -836,7 +911,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
             const reenabled = await runElevated(
               context,
               "swapon",
-              ["/mnt/swapfile"],
+              [paths.swapfile],
               { silent: true },
             );
             if (reenabled.exitCode !== 0) {
@@ -859,7 +934,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
       };
 
       if (isActive) {
-        const off = await runElevated(context, "swapoff", ["/mnt/swapfile"], {
+        const off = await runElevated(context, "swapoff", [paths.swapfile], {
           silent: true,
         });
         if (off.exitCode !== 0) {
@@ -875,12 +950,12 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
         const backedUp = await runElevated(
           context,
           "mv",
-          ["/mnt/swapfile", backup],
+          [paths.swapfile, backup],
           { silent: true },
         );
         if (backedUp.exitCode !== 0) {
           if (isActive) {
-            await runElevated(context, "swapon", ["/mnt/swapfile"], {
+            await runElevated(context, "swapon", [paths.swapfile], {
               silent: true,
             });
           }
@@ -895,12 +970,12 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
       const moved = await runElevated(
         context,
         "mv",
-        [replacement, "/mnt/swapfile"],
+        [replacement, paths.swapfile],
         { silent: true },
       );
       const enabled =
         moved.exitCode === 0
-          ? await runElevated(context, "swapon", ["/mnt/swapfile"], {
+          ? await runElevated(context, "swapon", [paths.swapfile], {
               silent: true,
             })
           : moved;
@@ -921,10 +996,10 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
         const appended = await runElevated(
           context,
           "/usr/bin/tee",
-          ["-a", "/etc/fstab"],
+          ["-a", paths.fstab],
           {
             silent: true,
-            input: "/mnt/swapfile none swap sw 0 0\n",
+            input: `${paths.swapfile} none swap sw 0 0\n`,
           },
         );
         if (appended.exitCode !== 0) {
@@ -932,7 +1007,7 @@ function swapOperation(context: RuntimeContext, requested: bigint): Operation {
           return {
             status: "failed",
             detail: [
-              appended.stderr.trim() || "unable to update /etc/fstab",
+              appended.stderr.trim() || `unable to update ${paths.fstab}`,
               rollbackDetail,
             ]
               .filter(Boolean)
@@ -1691,7 +1766,7 @@ export async function createLinuxAdapter(
       operations.push(dockerPruneOperation(context));
       add(recreateToolCacheOperation(context, cache));
       if (plan.swapfileBytes !== undefined) {
-        operations.push(swapOperation(context, plan.swapfileBytes));
+        operations.push(createSwapOperation(context, plan.swapfileBytes));
       }
       return operations;
     },

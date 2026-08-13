@@ -41,8 +41,8 @@ This action provides:
 - Automatic Linux, macOS, and Windows dispatch, including x64 and arm64 images.
 - A backward-compatible aggressive `max` profile and a precise `custom` profile.
 - Component-level protection through `skip-components`.
-- Definition-derived paths and package-aware removal instead of runner-username
-  assumptions.
+- Definition-derived paths and package-aware removal with exact, validated
+  hosted-runner home identities.
 - Before/after disk reporting and machine-readable outputs.
 - Best-effort cleanup for image variation, while keeping configuration and
   swapfile safety errors fatal.
@@ -63,6 +63,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Free runner space
         uses: justinthelaw/maximize-github-runner-space@v0.12.0
       - run: ./build.sh
@@ -78,6 +80,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Free runner space
         uses: justinthelaw/maximize-github-runner-space@v0.12.0
         with:
@@ -103,6 +107,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Free runner space
         id: cleanup
         uses: justinthelaw/maximize-github-runner-space@v0.12.0
@@ -155,8 +161,9 @@ remaining shell for later steps.
 - The Linux legacy `large-packages` purge is suppressed when it overlaps a
   protected component.
 - On Windows, protecting `visual-studio` also preserves its definition-owned
-  Android, .NET, vcpkg, and Windows SDK payloads so the retained installation is
-  not left unusable.
+  Android, .NET, vcpkg, and Windows SDK payloads. Protecting any one of those
+  payloads blocks the broad Visual Studio uninstall while allowing unrelated
+  cleanup, so neither direction leaves the retained toolchain unusable.
 
 Values in `skip-components` are comma-separated, case-insensitive, and have
 whitespace removed. Unknown names fail before cleanup begins.
@@ -305,8 +312,12 @@ are also written to the job log.
 - All inputs are parsed and validated before cleanup begins.
 - Paths come from runner contexts, documented environment variables, image
   package metadata, or tightly bounded runner-image definitions. Filesystem
-  roots, the home/workspace/action/runtime directories, and unsafe link targets
-  are protected.
+  roots, the home directory itself, workspace/action/runtime trees, and unsafe
+  link targets are protected. Definition-owned cache and tool directories below
+  the fixed hosted-runner home may still be selected explicitly.
+- Every planned deletion target is validated before the first mutation. An
+  unsafe target is fatal, so no package, filesystem, or system cleanup in that
+  plan is attempted.
 - Package-manager and system operations are serialized. Independent filesystem
   work uses bounded concurrency.
 - A missing component is expected image variation and produces `not-found` or

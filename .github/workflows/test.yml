@@ -9,6 +9,7 @@ on:
     branches:
       - main
   merge_group:
+    types: [checks_requested]
   push:
     branches:
       - main
@@ -25,6 +26,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use the minimum supported Node.js version
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
 
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
@@ -38,87 +47,52 @@ jobs:
       - name: Verify committed action bundle
         run: npm run check-dist
 
-  default-max:
-    name: Ubuntu x64 legacy default
+  ubuntu-x64:
+    name: Ubuntu x64 compatibility
     needs: static-validation
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Capture swap state
+      # Keep the configured swap active across every compatibility assertion,
+      # including historical no-input max. Remove it only after preservation is
+      # proven so this one runner covers the full transactional lifecycle.
+      - name: Resize swapfile with the historical fractional syntax
+        uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: 1.5GiB
+
+      - name: Verify configured swapfile
         shell: bash
         run: |
           set -euo pipefail
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq /mnt/swapfile; then
-            echo "SWAP_ACTIVE=1" >> "$GITHUB_ENV"
-          else
-            echo "SWAP_ACTIVE=0" >> "$GITHUB_ENV"
-          fi
-          if grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
-            echo "SWAP_FSTAB=1" >> "$GITHUB_ENV"
-          else
-            echo "SWAP_FSTAB=0" >> "$GITHUB_ENV"
-          fi
-          if [[ -e /mnt/swapfile ]]; then
-            echo "SWAP_PRESENT=1" >> "$GITHUB_ENV"
-            echo "SWAP_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
-          else
-            echo "SWAP_PRESENT=0" >> "$GITHUB_ENV"
-            echo "SWAP_BYTES=0" >> "$GITHUB_ENV"
-          fi
+          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
+          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
+          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
-      - name: Run historical no-input max profile
-        id: cleanup
+      - name: Reject an unsafe oversized replacement
+        id: oversized
+        continue-on-error: true
         uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: 100TiB
 
-      - name: Verify compatibility contract
+      - name: Verify oversized request rolled back
         shell: bash
         env:
-          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
-          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
-          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
-          PLATFORM: ${{ steps.cleanup.outputs.platform }}
-          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+          OUTCOME: ${{ steps.oversized.outcome }}
         run: |
           set -euo pipefail
-          [[ "$BEFORE" =~ ^[0-9]+$ ]]
-          [[ "$AFTER" =~ ^[0-9]+$ ]]
-          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
-          [[ "$PLATFORM" == linux ]]
-          [[ "$ARCHITECTURE" == x64 ]]
-          if [[ -e /mnt/swapfile ]]; then
-            current_present=1
-            current_bytes=$(stat -c %s /mnt/swapfile)
-          else
-            current_present=0
-            current_bytes=0
-          fi
-          [[ "$current_present" == "$SWAP_PRESENT" ]]
-          [[ "$current_bytes" == "$SWAP_BYTES" ]]
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq /mnt/swapfile; then
-            current_active=1
-          else
-            current_active=0
-          fi
-          if grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
-            current_fstab=1
-          else
-            current_fstab=0
-          fi
-          [[ "$current_active" == "$SWAP_ACTIVE" ]]
-          [[ "$current_fstab" == "$SWAP_FSTAB" ]]
-          test ! -e /usr/share/dotnet
-
-  ubuntu-regressions:
-    name: Ubuntu x64 batched regressions
-    needs: static-validation
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          [[ "$OUTCOME" == failure ]]
+          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
+          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
+          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Assert protected and removable fixtures exist
         shell: bash
@@ -171,6 +145,9 @@ jobs:
           test -d "${RUNNER_TOOL_CACHE}/Python"
           command -v firefox >/dev/null
           command -v google-chrome >/dev/null
+          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
+          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
+          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Exercise normalized max skips and toolcache precedence
         id: max-skip
@@ -193,48 +170,33 @@ jobs:
           test ! -e "${RUNNER_TOOL_CACHE}/Python"
           command -v firefox >/dev/null
           ! command -v google-chrome >/dev/null 2>&1
-
-  swapfile-transaction:
-    name: Ubuntu x64 swap transaction
-    needs: static-validation
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Resize swapfile with the historical fractional syntax
-        uses: ./
-        with:
-          cleanup-profile: custom
-          swapfile-size: 1.5GiB
-
-      - name: Verify configured swapfile
-        shell: bash
-        run: |
-          set -euo pipefail
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
-      - name: Reject an unsafe oversized replacement
-        id: oversized
-        continue-on-error: true
+      - name: Run historical no-input max profile
+        id: cleanup
         uses: ./
-        with:
-          cleanup-profile: custom
-          swapfile-size: 100TiB
 
-      - name: Verify oversized request rolled back
+      - name: Verify compatibility contract
         shell: bash
         env:
-          OUTCOME: ${{ steps.oversized.outcome }}
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
         run: |
           set -euo pipefail
-          [[ "$OUTCOME" == failure ]]
+          [[ "$BEFORE" =~ ^[0-9]+$ ]]
+          [[ "$AFTER" =~ ^[0-9]+$ ]]
+          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          [[ "$PLATFORM" == linux ]]
+          [[ "$ARCHITECTURE" == x64 ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          test ! -e /usr/share/dotnet
 
       - name: Remove the managed swapfile
         uses: ./
@@ -293,66 +255,63 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Assert AzCopy fixture exists on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: command -v azcopy >/dev/null
-
-      - name: Assert AzCopy fixture exists on Windows
-        if: runner.os == 'Windows'
+      - name: Assert Windows PostgreSQL fixture and service exist
+        if: matrix.platform == 'windows' && matrix.architecture == 'x64'
         shell: pwsh
         run: |
-          if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
-            throw 'Expected the runner image to contain AzCopy.'
+          $services = @(Get-Service -Name 'postgresql-*' -ErrorAction SilentlyContinue)
+          if ($services.Count -eq 0) {
+            throw 'Expected the Windows x64 runner image to contain a PostgreSQL service.'
           }
+          if ($services.Name | Where-Object { $_ -notmatch '^postgresql-x64-\d+(?:\.\d+)*$' }) {
+            throw 'PostgreSQL service name is outside the adapter allowlist.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:PGROOT) -or -not (Test-Path -LiteralPath $env:PGROOT)) {
+            throw 'Expected the Windows x64 runner image to contain PGROOT.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:PGDATA) -or -not (Test-Path -LiteralPath $env:PGDATA)) {
+            throw 'Expected the Windows x64 runner image to contain PGDATA.'
+          }
+          $dataRoot = Split-Path -Parent $env:PGDATA
+          if ($dataRoot -notmatch '^C:\\PostgreSQL\\\d+(?:\.\d+)*$') {
+            throw "Unexpected PostgreSQL data root: $dataRoot"
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "POSTGRES_DATA_ROOT=$dataRoot" -Encoding utf8
 
-      - name: Run a bounded native cleanup
-        id: cleanup
+      - name: Exercise Windows PostgreSQL cleanup
+        if: matrix.platform == 'windows' && matrix.architecture == 'x64'
         uses: ./
         with:
           cleanup-profile: custom
-          remove-azcopy: "true"
+          remove-postgresql: "true"
 
-      - name: Verify runtime and outputs on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
-          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
-          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
-          PLATFORM: ${{ steps.cleanup.outputs.platform }}
-          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
-          EXPECTED_PLATFORM: ${{ matrix.platform }}
-          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          set -euo pipefail
-          [[ "$BEFORE" =~ ^[0-9]+$ ]]
-          [[ "$AFTER" =~ ^[0-9]+$ ]]
-          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
-          [[ "$PLATFORM" == "$EXPECTED_PLATFORM" ]]
-          [[ "$ARCHITECTURE" == "$EXPECTED_ARCHITECTURE" ]]
-          if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
-            echo "AzCopy was not removed" >&2
-            exit 1
-          fi
-
-      - name: Verify runtime and outputs on Windows
-        if: runner.os == 'Windows'
+      - name: Verify Windows PostgreSQL cleanup
+        if: matrix.platform == 'windows' && matrix.architecture == 'x64'
         shell: pwsh
-        env:
-          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
-          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
-          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
-          PLATFORM: ${{ steps.cleanup.outputs.platform }}
-          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
-          EXPECTED_PLATFORM: ${{ matrix.platform }}
-          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
-          if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
-          if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
-          if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
-          if ($env:PLATFORM -ne $env:EXPECTED_PLATFORM) { throw 'Platform mismatch.' }
-          if ($env:ARCHITECTURE -ne $env:EXPECTED_ARCHITECTURE) { throw 'Architecture mismatch.' }
-          if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
-          if (Get-Command azcopy10 -ErrorAction SilentlyContinue) { throw 'AzCopy 10 alias was not removed.' }
+          $running = @(
+            Get-Service -Name 'postgresql-*' -ErrorAction SilentlyContinue |
+              Where-Object Status -ne 'Stopped'
+          )
+          if ($running.Count -ne 0) {
+            throw "PostgreSQL service is still running: $($running.Name -join ', ')"
+          }
+          if (Test-Path -LiteralPath $env:POSTGRES_DATA_ROOT) {
+            throw "PostgreSQL data root still exists: $env:POSTGRES_DATA_ROOT"
+          }
+          $remainingDataRoots = @(
+            Get-ChildItem -LiteralPath 'C:\PostgreSQL' -Directory -ErrorAction SilentlyContinue |
+              Where-Object Name -Match '^\d+(?:\.\d+)*$'
+          )
+          if ($remainingDataRoots.Count -ne 0) {
+            throw "Versioned PostgreSQL data roots remain: $($remainingDataRoots.FullName -join ', ')"
+          }
+
+      - name: Exercise the native adapter
+        uses: ./.github/actions/platform-smoke
+        with:
+          expected-platform: ${{ matrix.platform }}
+          expected-architecture: ${{ matrix.architecture }}

@@ -31,14 +31,9 @@ function protectedPathSets(
   readonly recursive: readonly string[];
 } {
   const root = canonicalLexical(api.parse(context.home).root, api);
-  const runtimeExecutable =
-    context.platform === "windows"
-      ? win32.isAbsolute(process.execPath)
-        ? process.execPath
-        : undefined
-      : posix.isAbsolute(process.execPath)
-        ? process.execPath
-        : undefined;
+  const runtimeExecutable = api.isAbsolute(context.runtimeExecutable)
+    ? context.runtimeExecutable
+    : undefined;
   const exact = [root, context.home, runtimeExecutable]
     .filter((value): value is string => value !== undefined && value !== "")
     .map((value) => canonicalLexical(value, api));
@@ -182,6 +177,52 @@ export async function assertSafeDirectoryTarget(
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+}
+
+export type ExactTargetExpectation =
+  "directory" | "regular-file" | "absent-or-regular-file";
+
+/**
+ * Validate a path that a later command will follow rather than unlink.
+ *
+ * Unlike cleanup targets, a final link is unsafe here because tools such as
+ * `mv`, `sed`, and `tee` follow it. The expectation also prevents a device,
+ * socket, or directory from being treated as an ordinary file.
+ */
+export async function assertSafeExactTarget(
+  target: string,
+  allowedParents: readonly string[],
+  context: RuntimeContext,
+  expectation: ExactTargetExpectation,
+): Promise<void> {
+  await assertSafeExistingTarget(target, allowedParents, context);
+
+  try {
+    const stat = await lstat(target);
+    if (stat.isSymbolicLink()) {
+      throw new Error(
+        `Refusing follow-through mutation of a symbolic link: '${target}'.`,
+      );
+    }
+
+    const expectsDirectory = expectation === "directory";
+    if (
+      (expectsDirectory && !stat.isDirectory()) ||
+      (!expectsDirectory && !stat.isFile())
+    ) {
+      throw new Error(
+        `Refusing follow-through mutation of an unexpected target type: '${target}'.`,
+      );
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (expectation === "absent-or-regular-file") return;
+      throw new Error(
+        `Required definition target does not exist: '${target}'.`,
+      );
+    }
     throw error;
   }
 }

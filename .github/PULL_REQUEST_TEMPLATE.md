@@ -4,8 +4,8 @@ Describe what changed and why.
 
 ## Validation
 
+- [ ] `npm ci --ignore-scripts && npm test && npm run format:check && npm run check-dist`
 - [ ] `pre-commit run --all-files --hook-stage pre-push`
-- [ ] `npm ci && npm test && npm run check-dist`
 - [ ] Representative runner smoke tests remain accurate
 - [ ] README and docs updated for behavior changes
 

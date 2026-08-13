@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  definitionActionPath,
   isDefinitionCompatibleRunnerImage,
   isOfficialUbuntuSlimContainer,
 } from "../src/runtime.js";
@@ -20,58 +21,36 @@ const officialSlimImageData = JSON.stringify([
   },
 ]);
 
-test("the official Ubuntu slim image requires every positive identity marker", () => {
-  assert.equal(isOfficialUbuntuSlimContainer(officialSlimIdentity, true), true);
-  assert.equal(
-    isOfficialUbuntuSlimContainer(officialSlimIdentity, false),
-    false,
+test("workflow environment cannot authorize an Ubuntu slim container", () => {
+  const original = new Map(
+    Object.keys(officialSlimIdentity).map((name) => [name, process.env[name]]),
   );
-
-  for (const marker of [
-    "ImageOS",
-    "IMAGE_TARGET_PLATFORM",
-    "IMAGEDATA_NAME",
-    "ImageVersion",
-  ] as const) {
-    const incompleteIdentity = { ...officialSlimIdentity };
-    delete incompleteIdentity[marker];
-    assert.equal(
-      isOfficialUbuntuSlimContainer(incompleteIdentity, true),
-      false,
-      marker,
-    );
+  try {
+    Object.assign(process.env, officialSlimIdentity);
+    assert.equal(isOfficialUbuntuSlimContainer(true), false);
+  } finally {
+    for (const [name, value] of original) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
 test("an arbitrary GitHub Actions job container is not Ubuntu slim", () => {
+  assert.equal(isOfficialUbuntuSlimContainer(true), false);
   assert.equal(
-    isOfficialUbuntuSlimContainer(
-      {
-        GITHUB_ACTIONS: "true",
-        RUNNER_ENVIRONMENT: "github-hosted",
-        ImageOS: "ubuntu24",
-        ImageVersion: "20260805.1",
-      },
-      true,
-    ),
-    false,
-  );
-  assert.equal(
-    isOfficialUbuntuSlimContainer(
-      { ...officialSlimIdentity, IMAGEDATA_NAME: "ubuntu:24.04-custom" },
-      true,
-    ),
+    isOfficialUbuntuSlimContainer(true, JSON.stringify(officialSlimIdentity)),
     false,
   );
 });
 
 test("the definition-owned image record identifies ubuntu-slim", () => {
   assert.equal(
-    isOfficialUbuntuSlimContainer({}, true, officialSlimImageData),
+    isOfficialUbuntuSlimContainer(true, officialSlimImageData),
     true,
   );
   assert.equal(
-    isOfficialUbuntuSlimContainer({}, false, officialSlimImageData),
+    isOfficialUbuntuSlimContainer(false, officialSlimImageData),
     false,
   );
   for (const changed of [
@@ -80,8 +59,25 @@ test("the definition-owned image record identifies ubuntu-slim", () => {
     officialSlimImageData.replace("20260728.2.1", "latest"),
     "not JSON",
   ]) {
-    assert.equal(isOfficialUbuntuSlimContainer({}, true, changed), false);
+    assert.equal(isOfficialUbuntuSlimContainer(true, changed), false);
   }
+});
+
+test("the action path comes from its module and accepts only a containing runner value", () => {
+  const moduleUrl = "file:///opt/action/dist/runtime.js";
+  assert.equal(definitionActionPath("linux", moduleUrl), "/opt/action/dist");
+  assert.equal(
+    definitionActionPath("linux", moduleUrl, "/opt/action"),
+    "/opt/action",
+  );
+  assert.equal(
+    definitionActionPath("linux", moduleUrl, "/tmp/workflow-controlled"),
+    "/opt/action/dist",
+  );
+  assert.equal(
+    definitionActionPath("linux", moduleUrl, "/opt"),
+    "/opt/action/dist",
+  );
 });
 
 test("only definition-compatible standard image families pass discovery", () => {
@@ -96,6 +92,7 @@ test("only definition-compatible standard image families pass discovery", () => 
     assert.equal(
       isDefinitionCompatibleRunnerImage(
         platform,
+        ImageOS.endsWith("arm64") || platform === "macos" ? "arm64" : "x64",
         { ImageOS, ImageVersion: "20260805.1" },
         false,
       ),
@@ -106,6 +103,7 @@ test("only definition-compatible standard image families pass discovery", () => 
   assert.equal(
     isDefinitionCompatibleRunnerImage(
       "linux",
+      "x64",
       { ImageOS: "rhel9", ImageVersion: "20260805.1" },
       false,
     ),
@@ -114,6 +112,7 @@ test("only definition-compatible standard image families pass discovery", () => 
   assert.equal(
     isDefinitionCompatibleRunnerImage(
       "windows",
+      "x64",
       { ImageOS: "custom-windows", ImageVersion: "20260805.1" },
       false,
     ),
@@ -122,9 +121,38 @@ test("only definition-compatible standard image families pass discovery", () => 
   assert.equal(
     isDefinitionCompatibleRunnerImage(
       "windows",
+      "x64",
       { ImageOS: "win22-vs2026", ImageVersion: "20260805.1" },
       false,
     ),
+    false,
+  );
+  for (const [platform, architecture, ImageOS] of [
+    ["linux", "x64", "ubuntu24-arm64"],
+    ["linux", "arm64", "ubuntu24"],
+    ["windows", "x64", "win11-arm64"],
+    ["windows", "arm64", "win25"],
+  ] as const) {
+    assert.equal(
+      isDefinitionCompatibleRunnerImage(
+        platform,
+        architecture,
+        { ImageOS, ImageVersion: "20260805.1" },
+        false,
+      ),
+      false,
+      `${platform}/${architecture} must reject ${ImageOS}`,
+    );
+  }
+});
+
+test("ubuntu-slim metadata is compatible only with its x64 architecture", () => {
+  assert.equal(
+    isDefinitionCompatibleRunnerImage("linux", "x64", {}, true),
+    true,
+  );
+  assert.equal(
+    isDefinitionCompatibleRunnerImage("linux", "arm64", {}, true),
     false,
   );
 });

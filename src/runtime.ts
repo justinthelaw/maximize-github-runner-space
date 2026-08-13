@@ -1,8 +1,13 @@
-import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { constants, existsSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
+import { posix, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Architecture, Platform, RuntimeContext } from "./types.js";
 import { runCommand } from "./command.js";
+
+const UBUNTU_SLIM_IMAGE_DATA = "/imagegeneration/imagedata.json";
+const MAX_IMAGE_DATA_BYTES = 256 * 1024;
 
 function detectPlatform(): Platform {
   const runnerOs = (process.env.RUNNER_OS ?? "").toLowerCase();
@@ -27,18 +32,10 @@ function detectArchitecture(): Architecture {
 }
 
 export function isOfficialUbuntuSlimContainer(
-  environment: NodeJS.ProcessEnv,
   isContainer: boolean,
   imageData?: string,
 ): boolean {
   if (!isContainer) return false;
-  const environmentIdentity =
-    environment.ImageOS === "Linux" &&
-    environment.IMAGE_TARGET_PLATFORM === "GitHub" &&
-    environment.IMAGEDATA_NAME === "ubuntu:24.04" &&
-    /^\d+(?:\.\d+)+$/.test(environment.ImageVersion ?? "");
-  if (environmentIdentity) return true;
-
   if (imageData === undefined) return false;
   try {
     const parsed = JSON.parse(imageData) as unknown;
@@ -62,23 +59,51 @@ export function isOfficialUbuntuSlimContainer(
   }
 }
 
+export function definitionActionPath(
+  platform: Platform,
+  moduleUrl: string,
+  configuredPath?: string,
+): string {
+  const api = platform === "windows" ? win32 : posix;
+  const canonical = (value: string): string => {
+    const normalized = api.normalize(api.resolve(value));
+    return platform === "windows" ? normalized.toLowerCase() : normalized;
+  };
+  const moduleDirectory = api.normalize(
+    api.resolve(api.dirname(fileURLToPath(moduleUrl))),
+  );
+  if (configuredPath !== undefined && api.isAbsolute(configuredPath)) {
+    const configured = api.normalize(api.resolve(configuredPath));
+    if (
+      canonical(configured) === canonical(moduleDirectory) ||
+      canonical(configured) === canonical(api.dirname(moduleDirectory))
+    ) {
+      return configured;
+    }
+  }
+  return moduleDirectory;
+}
+
 export function isDefinitionCompatibleRunnerImage(
   platform: Platform,
+  architecture: Architecture,
   environment: NodeJS.ProcessEnv,
   isUbuntuSlim: boolean,
 ): boolean {
-  if (isUbuntuSlim) return true;
+  if (isUbuntuSlim) return platform === "linux" && architecture === "x64";
   const imageVersion = environment.ImageVersion ?? "";
   if (!/^\d+(?:\.\d+)+$/.test(imageVersion)) return false;
 
   const imageOS = environment.ImageOS ?? "";
   switch (platform) {
     case "linux":
-      return /^ubuntu(?:22|24|26)(?:-arm64)?$/.test(imageOS);
+      return architecture === "arm64"
+        ? /^ubuntu(?:22|24|26)-arm64$/.test(imageOS)
+        : /^ubuntu(?:22|24|26)$/.test(imageOS);
     case "windows":
-      return /^(?:win22|win25|win25-vs2026|win11-arm64|win11-vs2026-arm64)$/.test(
-        imageOS,
-      );
+      return architecture === "arm64"
+        ? /^(?:win11-arm64|win11-vs2026-arm64)$/.test(imageOS)
+        : /^(?:win22|win25|win25-vs2026)$/.test(imageOS);
     case "macos":
       return /^macos(?:14|15|26)$/.test(imageOS);
   }
@@ -86,22 +111,30 @@ export function isDefinitionCompatibleRunnerImage(
 
 export async function createRuntimeContext(): Promise<RuntimeContext> {
   const platform = detectPlatform();
+  const architecture = detectArchitecture();
   const isContainer =
     platform === "linux" &&
     (existsSync("/run/.containerenv") || existsSync("/.dockerenv"));
   let imageData: string | undefined;
   if (isContainer) {
     try {
-      imageData = await readFile("/imagegeneration/imagedata.json", "utf8");
+      const file = await open(
+        UBUNTU_SLIM_IMAGE_DATA,
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      try {
+        const metadata = await file.stat();
+        if (metadata.isFile() && metadata.size <= MAX_IMAGE_DATA_BYTES) {
+          imageData = await file.readFile("utf8");
+        }
+      } finally {
+        await file.close();
+      }
     } catch {
       imageData = undefined;
     }
   }
-  const isUbuntuSlim = isOfficialUbuntuSlimContainer(
-    process.env,
-    isContainer,
-    imageData,
-  );
+  const isUbuntuSlim = isOfficialUbuntuSlimContainer(isContainer, imageData);
   let hasPasswordlessSudo = false;
   if (platform !== "windows" && typeof process.getuid === "function") {
     if (process.getuid() === 0) {
@@ -121,7 +154,7 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
 
   return {
     platform,
-    architecture: detectArchitecture(),
+    architecture,
     home:
       platform === "windows"
         ? (process.env.USERPROFILE ?? process.env.HOME ?? homedir())
@@ -130,13 +163,19 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
     toolCache:
       process.env.RUNNER_TOOL_CACHE ?? process.env.AGENT_TOOLSDIRECTORY,
     workspace: process.env.GITHUB_WORKSPACE,
-    actionPath: process.env.GITHUB_ACTION_PATH,
+    runtimeExecutable: process.execPath,
+    actionPath: definitionActionPath(
+      platform,
+      import.meta.url,
+      process.env.GITHUB_ACTION_PATH,
+    ),
     isContainer,
     isGitHubHosted:
       process.env.GITHUB_ACTIONS === "true" &&
       process.env.RUNNER_ENVIRONMENT === "github-hosted",
     isDefinitionCompatibleImage: isDefinitionCompatibleRunnerImage(
       platform,
+      architecture,
       process.env,
       isUbuntuSlim,
     ),

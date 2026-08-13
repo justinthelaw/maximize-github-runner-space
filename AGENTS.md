@@ -23,7 +23,7 @@
 ## Required validation
 
 ```bash
-npm ci
+npm ci --ignore-scripts
 npm test
 npm run format:check
 npm run check-dist

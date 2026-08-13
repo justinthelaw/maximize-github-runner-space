@@ -1,9 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { createRemovePathOperation } from "../src/operations.js";
+import {
+  createFunctionOperation,
+  createRemovePathOperation,
+  executeOperations,
+  prepareOperations,
+} from "../src/operations.js";
+import { createSwapOperation } from "../src/platforms/linux.js";
 import {
   assertSafeDirectoryTarget,
   assertSafeRemovalTarget,
@@ -83,10 +96,14 @@ test("a target containing a protected workspace is rejected", () => {
 
 test("the Node executable is protected without blocking sibling tools", () => {
   const context = contextFor("linux");
-  const runtimeDirectory = dirname(process.execPath);
+  const runtimeDirectory = dirname(context.runtimeExecutable);
   assert.throws(
     () =>
-      assertSafeRemovalTarget(process.execPath, [runtimeDirectory], context),
+      assertSafeRemovalTarget(
+        context.runtimeExecutable,
+        [runtimeDirectory],
+        context,
+      ),
     /protected/,
   );
   assert.throws(
@@ -119,7 +136,6 @@ test("realpath validation blocks intermediate symlink escapes", async () => {
     home: "/home/runner",
     temp: join(root, "runner-temp"),
     workspace: undefined,
-    actionPath: undefined,
   };
   const operation = createRemovePathOperation({
     id: "escape",
@@ -137,6 +153,110 @@ test("realpath validation blocks intermediate symlink escapes", async () => {
     "preserve me",
   );
 });
+
+test("complete-plan path validation aborts before an earlier package mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-plan-"));
+  const allowed = join(root, "allowed");
+  const outside = join(root, "outside");
+  await mkdir(allowed);
+  await mkdir(outside);
+  await writeFile(join(outside, "sentinel"), "preserve me");
+  await symlink(outside, join(allowed, "redirect"));
+
+  let packageRan = false;
+  const packageOperation = createFunctionOperation({
+    id: "package-before-path",
+    component: "vcpkg",
+    description: "package mutation fixture",
+    phase: "package",
+    run: async () => {
+      packageRan = true;
+      return { status: "removed" };
+    },
+  });
+  const unsafePathOperation = createRemovePathOperation({
+    id: "later-unsafe-path",
+    component: "vcpkg",
+    description: "redirected path fixture",
+    target: join(allowed, "redirect", "sentinel"),
+    allowedParents: [allowed],
+    context: { ...contextFor("linux"), temp: join(root, "runner-temp") },
+  });
+
+  await assert.rejects(
+    async () =>
+      await executeOperations([packageOperation, unsafePathOperation]),
+    /validation failed before mutation.*redirected ancestor/s,
+  );
+  assert.equal(packageRan, false);
+  assert.equal(
+    await readFile(join(outside, "sentinel"), "utf8"),
+    "preserve me",
+  );
+});
+
+async function createSwapFixture(): Promise<{
+  readonly root: string;
+  readonly context: ReturnType<typeof contextFor>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-swap-"));
+  await mkdir(join(root, "mnt"));
+  await mkdir(join(root, "etc"));
+  await writeFile(join(root, "etc", "fstab"), "# test fixture\n");
+  return {
+    root,
+    context: contextFor("linux"),
+  };
+}
+
+test("the prepared swap operation validates its exact definition targets", async () => {
+  const { context, root } = await createSwapFixture();
+  const operation = createSwapOperation(context, 0n, root);
+  const prepared = prepareOperations([operation], {
+    profile: "custom",
+    enabled: new Set(),
+    skipped: new Set(),
+    swapfileBytes: 0n,
+  });
+
+  assert.deepEqual(
+    prepared.map(({ id }) => id),
+    ["swapfile"],
+  );
+  assert.notEqual(prepared[0]?.validate, undefined);
+  await prepared[0]?.validate?.();
+});
+
+for (const redirectedTarget of ["swapfile", "fstab"] as const) {
+  test(`a final ${redirectedTarget} symlink aborts before package mutation`, async () => {
+    const { context, root } = await createSwapFixture();
+    const target =
+      redirectedTarget === "swapfile"
+        ? join(root, "mnt", "swapfile")
+        : join(root, "etc", "fstab");
+    if (redirectedTarget === "fstab") await unlink(target);
+    await symlink(join(root, "outside"), target);
+
+    let packageRan = false;
+    const packageOperation = createFunctionOperation({
+      id: `package-before-${redirectedTarget}`,
+      component: "large-packages",
+      description: "package mutation fixture",
+      phase: "package",
+      run: async () => {
+        packageRan = true;
+        return { status: "removed" };
+      },
+    });
+    const swap = createSwapOperation(context, 0n, root);
+
+    await assert.rejects(
+      async () => await executeOperations([packageOperation, swap]),
+      /validation failed before mutation.*symbolic link/s,
+    );
+    assert.equal(packageRan, false);
+  });
+}
 
 test("a symlinked allowlist parent cannot redirect deletion", async () => {
   const root = await mkdtemp(join(tmpdir(), "maximize-space-parent-link-"));

@@ -16,8 +16,11 @@ This document is for action maintainers and contributors. If you only need to us
 - `src/`: TypeScript planning, safety, reporting, and native Linux, macOS, and Windows adapters.
 - `test/`: Deterministic unit and contract tests for metadata, planning, platform behavior, and path safety.
 - `dist/`: Committed JavaScript action bundle generated from `src/`.
-- `.github/workflows/test.yml`: Pull-request quality, Ubuntu compatibility, interaction, swap, and representative platform tests.
+- `scripts/check-dist.mjs`: Cross-platform verification that the generated
+  bundle exactly matches committed `dist/` files.
+- `.github/workflows/test.yml`: Pull-request quality, one ordered Ubuntu compatibility job, and representative platform tests.
 - `.github/workflows/compatibility.yml`: Weekly/manual exact-label runner compatibility sweep.
+- `.github/actions/platform-smoke/action.yml`: Shared bounded cleanup and output assertions used by both runner workflows.
 - `.github/workflows/lint.yml`: Pre-commit checks in CI.
 - `README.md`: End-user usage and input documentation.
 - `docs/RUNNER-SUPPORT.md`: Runner-image research, supported labels, deletion-target evidence, and CI policy.
@@ -25,9 +28,13 @@ This document is for action maintainers and contributors. If you only need to us
 
 ## Local setup
 
+Development requires Node.js 22 or newer and npm. CI deliberately runs the
+quality gate on Node.js 22, the minimum version declared by `package.json`.
+
 1. Create a branch from `main`.
-2. Install pre-commit.
-3. Install hooks.
+2. Install locked dependencies with `npm ci --ignore-scripts`.
+3. Install pre-commit.
+4. Install hooks.
 
 ```bash
 pre-commit install --hook-type pre-commit --hook-type pre-push
@@ -49,7 +56,7 @@ Important safety notes:
 
 - This project intentionally runs destructive commands (`rm -rf`, apt purges, swap removal).
 - Keep operations idempotent and capability-aware where possible.
-- Derive targets from runner contexts, package metadata, or a cited runner-image definition; do not add broad or username-dependent deletion paths.
+- Derive targets from runner contexts, package metadata, or a cited runner-image definition; do not add broad paths or infer home identities that are absent from the cited definition.
 - Preserve home, workspace, action, runtime, filesystem-root, and unsafe link boundaries.
 - Keep package managers and service operations serialized, and stop services before deleting live data.
 

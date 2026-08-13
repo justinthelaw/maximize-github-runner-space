@@ -28,7 +28,7 @@ The new `remove-xcode`, `remove-visual-studio`, and `remove-windows-sdk` inputs 
 
 For a new macOS or Windows workflow, start with `cleanup-profile: custom` and enable only measured, disposable components. The default `max` profile is intentionally destructive: it includes unselected Xcodes on macOS and eligible Visual Studio and Windows SDK payloads on Windows. Windows `max` also removes PowerShell 7, the default shell for later Windows `run` steps. Use `skip-components` to protect every toolchain and shell the rest of the job requires.
 
-The action now rejects self-hosted runners, arbitrary job containers, and hosted images that do not match a supported standard runner-image definition before cleanup. Larger runners remain unsupported and outside the tested contract. See [Runner support](/docs/RUNNER-SUPPORT.md) for exact labels and limitations.
+The action now rejects self-hosted runners, arbitrary job containers, and hosted image identities outside the supported Ubuntu, macOS, and Windows runner-image definitions before cleanup. This identity gate does not prove a runner's billing or size class, so larger runners remain unsupported and outside the tested contract rather than being guaranteed rejection cases. These checks apply to both `max` and `custom`; selecting `custom` does not extend the support boundary. See [Runner support](/docs/RUNNER-SUPPORT.md) for exact labels and limitations.
 
 ## 0.8.x -> 0.9.0
 

@@ -32,14 +32,20 @@ GitHub Free users. It does not support:
 - GitHub-hosted larger runners, including larger-runner RHEL images.
 - Arbitrary job containers layered on a full hosted VM.
 
+GitHub does not expose a reliable standard-versus-larger size-class marker to
+an action. The runtime rejects unrecognized image-family metadata, but a larger
+runner using the same runner-image family may be indistinguishable and remains
+untested and unsupported rather than a guaranteed rejection case.
+
 There is no OS input. The action detects `runner.os`, `runner.arch`, hosted
 toolcache, home, temporary directory, privilege availability, and container
 state. It then builds an operation plan for that environment.
 
 Container cleanup additionally requires the exact runner-images
 `/imagegeneration/imagedata.json` identity (Linux x64, Docker source,
-`ubuntu:24.04`, and a numeric image version), or the equivalent complete image
-environment markers. Ordinary workflow job containers fail before mutation.
+`ubuntu:24.04`, and a numeric image version). Ordinary workflow job containers
+fail before mutation; workflow-controlled environment markers cannot authorize
+container cleanup.
 
 | Environment class | Support level | Important behavior |
 | --- | --- | --- |
@@ -139,9 +145,9 @@ Important sources include:
 | --- | --- |
 | OS and architecture | `runner.os` / `RUNNER_OS`, `runner.arch` / `RUNNER_ARCH` |
 | Hosted toolcache | `runner.tool_cache`, `RUNNER_TOOL_CACHE`, or `AGENT_TOOLSDIRECTORY` |
-| Home | `HOME` or `USERPROFILE`, accepted only when it matches the detected runner-image definition |
+| Home | `HOME` or `USERPROFILE`, accepted only when it is the exact definition-owned home: `/home/runner` on Ubuntu VMs, `/Users/runner` on macOS, `C:\Users\runneradmin` on Windows, or `/root`/`/github/home` on `ubuntu-slim` |
 | Temporary directory | `runner.temp` or `RUNNER_TEMP` |
-| Workspace/action paths | `GITHUB_WORKSPACE` and `GITHUB_ACTION_PATH`, which are protected from deletion |
+| Workspace/action paths | `GITHUB_WORKSPACE` plus the bundled module directory; `GITHUB_ACTION_PATH` is accepted only when it equals that directory or its immediate parent. These paths are protected from deletion. |
 | Installed roots | `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `CONDA`, `VCPKG_INSTALLATION_ROOT`, driver variables, database variables, and native package metadata |
 
 The [runner context
@@ -230,7 +236,7 @@ Pinned manifests:
 | vcpkg | `/usr/local/share/vcpkg` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-vcpkg.sh)) | Same definition on both architectures |
 | Rust | Homebrew-managed Rustup plus `$HOME/.cargo` and `$HOME/.rustup` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-rust.sh)) | Package-aware uninstall first |
 | Drivers | Chrome `/usr/local/share/chromedriver-mac-{x64,arm64}`; Edge `/usr/local/share/edge_driver`; Gecko through `brew --prefix geckodriver` | Never guess the Gecko Homebrew prefix |
-| Xcode | Dynamically enumerate `/Applications/Xcode_*.app`; resolve the selected developer directory with `xcode-select -p`; versions come from the pinned [15](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-15.json) and [26](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-26.json) toolsets | Preserve the selected Xcode and `/Applications/Xcode.app` relationship |
+| Xcode | Dynamically enumerate `/Applications/Xcode_*.app`; resolve the selected developer directory with `xcode-select -p`; versions come from the pinned [14](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-14.json), [15](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-15.json), [26](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-26.json), and [Xcode 27](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-xcode-27.json) toolsets | Preserve the selected Xcode and `/Applications/Xcode.app` relationship |
 
 Many macOS project tools and CLIs are Homebrew formulae or casks. They are
 removed by exact package identity followed by `brew cleanup`, not by deleting
@@ -301,7 +307,9 @@ Additional rules:
 - `remove-visual-studio` and `remove-windows-sdk` use guarded adapter
   definitions. Protect them under Windows `max` whenever later build steps
   depend on Visual Studio or an SDK. Protecting `visual-studio` also retains its
-  definition-owned Android, .NET, vcpkg, and Windows SDK payloads.
+  definition-owned Android, .NET, vcpkg, and Windows SDK payloads. Conversely,
+  protecting any one of those payloads blocks the broad Visual Studio uninstall
+  while unrelated cleanup remains eligible.
 - On `ubuntu-slim`, logical Linux applicability yields `unsupported` for
   operations requiring privileges or a daemon.
 
@@ -310,8 +318,9 @@ Additional rules:
 ### Cross-platform rules
 
 - Validate every input and build the complete plan before mutation.
-- Refuse empty, relative, filesystem-root, home, workspace, action, runtime, and
-  other protected deletion targets.
+- Refuse empty, relative, filesystem-root, home-directory root, workspace,
+  action, runtime, and other protected deletion targets. Explicitly allowlisted
+  runner-image caches and tools below the fixed home remain removable.
 - Resolve environment-defined paths only within component-specific allowlists.
 - Treat symlinks and Windows junction/reparse boundaries conservatively.
 - Invoke executables with argument arrays, never interpolated user input.
@@ -406,6 +415,8 @@ This behavior lets the same `custom` configuration run across a matrix and lets
 
 - Invalid `cleanup-profile`, unknown `skip-components`, and invalid
   `swapfile-size` fail before cleanup.
+- Complete-plan deletion-target validation is read-only and fatal. If any
+  target is unsafe, the action aborts before the first mutation.
 - A swap request on a non-privileged-Linux-VM environment fails before cleanup.
 - Swap allocation/activation failure is fatal and rolls back because leaving
   swap in an unknown state is unsafe.
@@ -452,32 +463,40 @@ strategy separates deterministic behavior from destructive image tests.
 
 ### Pull requests
 
-1. Run one inexpensive quality job first: formatting, type checking, unit and
-   contract tests, action metadata validation, security/path tests, and a check
-   that generated distribution files are current.
-2. Run the full no-input Ubuntu compatibility test on `ubuntu-latest`. This is
-   the sentinel that protects historical default `max` behavior.
-3. Batch Ubuntu component, skip/overlap, invalid-input, and swap lifecycle cases
-   instead of allocating one VM for every toggle.
-4. Smoke one representative from each remaining environment class:
+1. The Test workflow runs one inexpensive Quality job first: a locked install
+   on the minimum supported Node.js 22 runtime, TypeScript compilation, unit and
+   contract tests, formatting, metadata/security/path tests, and verification
+   that the committed distribution matches a clean build.
+2. One ordered `ubuntu-latest` job batches swap lifecycle, invalid-input,
+   skip/overlap, and historical no-input `max` assertions. It keeps the
+   configured swap active through `max`, verifies preservation, and removes the
+   swapfile only afterward.
+3. Smoke one representative from each remaining environment class with the
+   shared platform-smoke composite:
    `ubuntu-24.04-arm`, `ubuntu-slim`, `windows-latest`, `windows-11-arm`,
    `macos-latest`, and `macos-15-intel`.
 Runtime jobs depend on the quality job, have explicit timeouts, and use bounded
 matrix parallelism. Superseded pull-request and branch runs are cancelled.
-Static failures therefore do not launch destructive matrices, and force-pushes
-do not leave obsolete macOS/Windows jobs running.
+Failures in Test's Quality job therefore do not launch destructive matrices,
+and force-pushes do not leave obsolete macOS/Windows jobs running.
+
+The separate Lint workflow runs pre-commit checks for pull requests and merge
+queues. It is an independent required check rather than a dependency of Test's
+destructive jobs.
 
 ### Scheduled and release validation
 
 A separate weekly/manual sweep covers distinct exact image labels without
 making every preview image a required pull-request check:
 
+<!-- compatibility-labels:start -->
 - Linux: `ubuntu-slim`, `ubuntu-22.04`, `ubuntu-24.04`, `ubuntu-26.04`,
   `ubuntu-22.04-arm`, `ubuntu-24.04-arm`, `ubuntu-26.04-arm`.
 - Windows: `windows-2022`, `windows-2025`, `windows-2025-vs2026`,
   `windows-11-arm`, `windows-11-vs2026-arm`.
 - macOS: `macos-14`, `macos-15`, `macos-26`, `xcode-27`,
   `macos-15-intel`, `macos-26-intel`.
+<!-- compatibility-labels:end -->
 
 Preview rows may report experimental failures during normal development. A
 release candidate should receive a deliberate manual sweep, and all stable

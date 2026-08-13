@@ -10,6 +10,8 @@ export interface CommandOptions {
   readonly silent?: boolean;
 }
 
+const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
+
 export async function runCommand(
   executable: string,
   args: readonly string[],
@@ -109,35 +111,33 @@ export async function runCommand(
         return false;
       }
     };
-    if (options.timeoutMs !== undefined) {
-      timeout = setTimeout(() => {
-        timedOut = true;
-        killTree(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
-        forceKill = setTimeout(() => {
-          // Kill the group even if the direct child has already exited: a
-          // descendant may still hold stdout/stderr and keep `close` pending.
-          killTree("SIGKILL");
-          const pending = pendingTimedOutResult;
-          if (pending !== undefined) {
-            // Give pipe close notifications one event-loop turn after SIGKILL.
-            setTimeout(() => settle(pending), 50);
-          }
-        }, 2_000);
-        // A process tree that ignores both signals must not consume an
-        // unbounded runner allocation. Resolve with the timeout status even if
-        // an OS-level pipe close notification never arrives.
-        hardBound = setTimeout(() => {
-          // Do not keep the action process alive on inherited pipe handles
-          // if the OS cannot terminate a detached descendant tree.
-          childStdout.destroy();
-          childStderr.destroy();
-          child.stdin?.destroy();
-          child.unref();
-          settle({ exitCode: 124, stdout, stderr });
-        }, 2_500);
-      }, options.timeoutMs);
-      timeout.unref();
-    }
+    timeout = setTimeout(() => {
+      timedOut = true;
+      killTree(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
+      forceKill = setTimeout(() => {
+        // Kill the group even if the direct child has already exited: a
+        // descendant may still hold stdout/stderr and keep `close` pending.
+        killTree("SIGKILL");
+        const pending = pendingTimedOutResult;
+        if (pending !== undefined) {
+          // Give pipe close notifications one event-loop turn after SIGKILL.
+          setTimeout(() => settle(pending), 50);
+        }
+      }, 2_000);
+      // A process tree that ignores both signals must not consume an
+      // unbounded runner allocation. Resolve with the timeout status even if
+      // an OS-level pipe close notification never arrives.
+      hardBound = setTimeout(() => {
+        // Do not keep the action process alive on inherited pipe handles
+        // if the OS cannot terminate a detached descendant tree.
+        childStdout.destroy();
+        childStderr.destroy();
+        child.stdin?.destroy();
+        child.unref();
+        settle({ exitCode: 124, stdout, stderr });
+      }, 2_500);
+    }, options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
+    timeout.unref();
 
     child.on("error", (error) => {
       settle({

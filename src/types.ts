@@ -11,7 +11,10 @@ export interface RuntimeContext {
   readonly temp: string;
   readonly toolCache: string | undefined;
   readonly workspace: string | undefined;
-  readonly actionPath: string | undefined;
+  /** Node executable that is running this action, not the workflow PATH entry. */
+  readonly runtimeExecutable: string;
+  /** Definition-derived action directory containing the executing module. */
+  readonly actionPath: string;
   readonly isContainer: boolean;
   readonly isGitHubHosted: boolean;
   readonly isDefinitionCompatibleImage: boolean;
@@ -51,6 +54,8 @@ export interface Operation {
   readonly always?: boolean;
   /** Abort the action when the operation cannot preserve its state contract. */
   readonly fatal?: boolean;
+  /** Read-only complete-plan validation, run before any operation mutates state. */
+  readonly validate?: () => Promise<void>;
   run(): Promise<OperationResult>;
 }
 

@@ -27,7 +27,15 @@ export interface RemovePathOptions {
   readonly coveredBy?: readonly ComponentId[];
 }
 
-async function removePath(
+export async function validateRemovePathTarget(
+  target: string,
+  allowedParents: readonly string[],
+  context: RuntimeContext,
+): Promise<void> {
+  await assertSafeExistingTarget(target, allowedParents, context);
+}
+
+export async function removePathTarget(
   target: string,
   allowedParents: readonly string[],
   context: RuntimeContext,
@@ -100,8 +108,14 @@ export function createRemovePathOperation(
     ...(options.coveredBy === undefined
       ? {}
       : { coveredBy: options.coveredBy }),
+    validate: async () =>
+      await validateRemovePathTarget(
+        target,
+        options.allowedParents,
+        options.context,
+      ),
     run: async () =>
-      await removePath(target, options.allowedParents, options.context),
+      await removePathTarget(target, options.allowedParents, options.context),
   };
 }
 
@@ -128,6 +142,7 @@ export function createFunctionOperation(options: {
   readonly coveredBy?: readonly ComponentId[];
   readonly always?: boolean;
   readonly fatal?: boolean;
+  readonly validate?: () => Promise<void>;
   readonly run: () => Promise<OperationResult>;
 }): Operation {
   return {
@@ -146,6 +161,7 @@ export function createFunctionOperation(options: {
       : { coveredBy: options.coveredBy }),
     ...(options.always === undefined ? {} : { always: options.always }),
     ...(options.fatal === undefined ? {} : { fatal: options.fatal }),
+    ...(options.validate === undefined ? {} : { validate: options.validate }),
     run: options.run,
   };
 }
@@ -224,6 +240,22 @@ async function runBounded(
 export async function executeOperations(
   operations: readonly Operation[],
 ): Promise<readonly OperationResult[]> {
+  const validationFailures: string[] = [];
+  for (const operation of operations) {
+    if (operation.validate === undefined) continue;
+    try {
+      await operation.validate();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      validationFailures.push(`${operation.description}: ${detail}`);
+    }
+  }
+  if (validationFailures.length > 0) {
+    throw new Error(
+      `Cleanup plan validation failed before mutation:\n${validationFailures.join("\n")}`,
+    );
+  }
+
   const results: OperationResult[] = [];
   for (const phase of [
     "preflight",

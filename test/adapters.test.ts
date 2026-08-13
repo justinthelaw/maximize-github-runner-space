@@ -8,8 +8,13 @@ import {
 } from "../src/platforms/linux.js";
 import { createMacOSAdapter } from "../src/platforms/macos.js";
 import {
+  classifyPostgreSqlServiceInventory,
   createWindowsAdapter,
   isMissingWindowsService,
+  isStoppedWindowsService,
+  isStrictWindowsDescendant,
+  PINNED_WINDOWS_WEB_SERVICE_NAMES,
+  POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
 } from "../src/platforms/windows.js";
 import { prepareOperations } from "../src/operations.js";
 import { createPlan } from "../src/planner.js";
@@ -228,6 +233,39 @@ test("skipping Visual Studio preserves every overlapping Windows toolchain", asy
   );
 });
 
+for (const protectedPayload of [
+  "android",
+  "dotnet",
+  "vcpkg",
+  "windows-sdk",
+] as const satisfies readonly ComponentId[]) {
+  test(`skipping Windows ${protectedPayload} blocks the broad Visual Studio uninstall`, async () => {
+    const adapter = await createWindowsAdapter(contextFor("windows"));
+    const plan = maxPlan(protectedPayload);
+    const operations = await adapter.operations(plan);
+
+    assert.equal(
+      operations.some(({ id }) => id === "windows:visual-studio:uninstall"),
+      true,
+      "adapter must offer the broad uninstall before overlap filtering",
+    );
+
+    const prepared = prepareOperations(operations, plan);
+    assert.equal(
+      prepared.some(({ component }) => component === "visual-studio"),
+      false,
+    );
+    assert.equal(
+      prepared.some(({ component }) => component === protectedPayload),
+      false,
+    );
+    assert.equal(
+      prepared.some(({ component }) => component === "azcopy"),
+      true,
+    );
+  });
+}
+
 test("Windows Docker engine cleanup owns its image data without a redundant prune", async () => {
   const adapter = await createWindowsAdapter(contextFor("windows"));
   const plan = createPlan((name) =>
@@ -289,11 +327,172 @@ test("Windows service discovery distinguishes absence from unsafe query failure"
     true,
   );
   for (const result of [
+    {
+      exitCode: 1,
+      stdout: "[SC] OpenService FAILED 1060: service does not exist",
+      stderr: "",
+    },
     { exitCode: 124, stdout: "", stderr: "" },
     { exitCode: 5, stdout: "", stderr: "Access is denied" },
   ]) {
     assert.equal(isMissingWindowsService(result), false);
   }
+});
+
+test("Windows PostgreSQL service discovery requests and accepts a complete bounded inventory", () => {
+  assert.deepEqual(POSTGRESQL_SERVICE_QUERY_ARGUMENTS, [
+    "query",
+    "type=",
+    "service",
+    "state=",
+    "all",
+    "bufsize=",
+    "262144",
+  ]);
+  const inventory = [
+    "SERVICE_NAME: postgresql-x64-17",
+    "SERVICE_NAME: PostgreSQL-x64-14.2",
+    "SERVICE_NAME: postgresql-x64-17",
+    "SERVICE_NAME: docker",
+  ].join("\r\n");
+  assert.deepEqual(classifyPostgreSqlServiceInventory(inventory), {
+    status: "complete",
+    serviceNames: ["PostgreSQL-x64-14.2", "postgresql-x64-17"],
+  });
+});
+
+test("Windows PostgreSQL service discovery fails closed on incomplete or unrecognized inventory", () => {
+  const unsafeInventories = [
+    "",
+    "Enum: more data, need 1048576 bytes start resume at index 42",
+    "SERVICE_NAME: docker\r\nEnumQueryServicesStatus: more data",
+    "SERVICE_NAME: postgresql-x64-17\r\nresume at index 42",
+    "SERVICE_NAME: docker\r\nRESUME_INDEX=42",
+    "SERVICE_NAME: postgresql-evil",
+    "SERVICE_NAME: postgresql-x64-17 & whoami",
+    "SERVICE_NAME: PostgreSQL Backup",
+  ];
+  for (const inventory of unsafeInventories) {
+    assert.equal(
+      classifyPostgreSqlServiceInventory(inventory).status,
+      "unsafe",
+      inventory,
+    );
+  }
+});
+
+test("Visual Studio discovery accepts only strict definition-root descendants", () => {
+  const root = "C:\\Program Files\\Microsoft Visual Studio";
+  assert.equal(
+    isStrictWindowsDescendant(
+      "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise",
+      root,
+    ),
+    true,
+  );
+  assert.equal(isStrictWindowsDescendant(root, root), false);
+  assert.equal(
+    isStrictWindowsDescendant(
+      "C:\\Program Files\\Microsoft Visual Studio Evil\\2022",
+      root,
+    ),
+    false,
+  );
+});
+
+test("Windows service state parsing requires a successful STOPPED response", () => {
+  assert.equal(
+    isStoppedWindowsService({
+      exitCode: 0,
+      stdout: "        STATE              : 1  STOPPED\r\n",
+      stderr: "",
+    }),
+    true,
+  );
+  for (const result of [
+    { exitCode: 1, stdout: "STATE : 1 STOPPED", stderr: "" },
+    { exitCode: 0, stdout: "STATE : 4 RUNNING", stderr: "" },
+    { exitCode: 0, stdout: "", stderr: "" },
+  ]) {
+    assert.equal(isStoppedWindowsService(result), false);
+  }
+});
+
+test("Windows PostgreSQL cleanup has a fatal service-stop precondition", async () => {
+  const adapter = await createWindowsAdapter(contextFor("windows"));
+  const prepared = prepareOperations(
+    await adapter.operations(planFor("postgresql")),
+    planFor("postgresql"),
+  );
+  const stop = prepared.find(({ id }) => id === "windows:postgresql:services");
+  assert.equal(stop?.phase, "preflight");
+  assert.equal(stop?.fatal, true);
+});
+
+test("Windows Apache and Nginx cleanup have exact fatal service-stop preconditions", async () => {
+  assert.deepEqual(PINNED_WINDOWS_WEB_SERVICE_NAMES, {
+    apache: "Apache",
+    nginx: "nginx",
+  });
+  for (const expected of [
+    {
+      component: "apache" as const,
+      serviceId: "windows:apache:service",
+      packageId: "windows:choco:apache:apache-httpd",
+      residualId: "windows:residual:apache:C:\\tools\\Apache24",
+    },
+    {
+      component: "nginx" as const,
+      serviceId: "windows:nginx:service",
+      packageId: "windows:choco:nginx:nginx",
+    },
+  ]) {
+    const adapter = await createWindowsAdapter(contextFor("windows"));
+    const plan = planFor(expected.component);
+    const prepared = prepareOperations(await adapter.operations(plan), plan);
+    const serviceIndex = prepared.findIndex(
+      ({ id }) => id === expected.serviceId,
+    );
+    const packageIndex = prepared.findIndex(
+      ({ id }) => id === expected.packageId,
+    );
+    const service = prepared[serviceIndex];
+
+    assert.notEqual(serviceIndex, -1);
+    assert.notEqual(packageIndex, -1);
+    assert.equal(service?.component, expected.component);
+    assert.equal(service?.phase, "preflight");
+    assert.equal(service?.fatal, true);
+    assert.equal(prepared[packageIndex]?.phase, "package");
+    assert.ok(serviceIndex < packageIndex);
+
+    if (expected.residualId !== undefined) {
+      const residualIndex = prepared.findIndex(
+        ({ id }) => id === expected.residualId,
+      );
+      assert.notEqual(residualIndex, -1);
+      assert.equal(prepared[residualIndex]?.phase, "system");
+      assert.ok(serviceIndex < residualIndex);
+    }
+  }
+});
+
+test("Windows manual path removers participate in complete-plan validation", async () => {
+  const adapter = await createWindowsAdapter(contextFor("windows"));
+  const plan = planFor("miniconda", "php", "docker-engine");
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+  const manualPathOperations = prepared.filter(({ id }) =>
+    [
+      "windows:managed-directory:miniconda:miniconda",
+      "windows:residual:php:C:\\tools\\php",
+      "windows:docker:engine",
+    ].includes(id),
+  );
+  assert.equal(manualPathOperations.length, 3);
+  assert.equal(
+    manualPathOperations.every(({ validate }) => validate !== undefined),
+    true,
+  );
 });
 
 test("swapfile discovery distinguishes absence from command failure", () => {

@@ -147,26 +147,3 @@ export const LARGE_PACKAGE_OVERLAPS = [
   "firefox",
   "powershell",
 ] as const satisfies readonly ComponentId[];
-
-// Homebrew owns a large portion of each macOS image. If a user protects any
-// Homebrew-managed component, broad Homebrew removal must yield to that skip.
-export const HOMEBREW_MANAGED = [
-  "chrome",
-  "edge",
-  "firefox",
-  "webdrivers",
-  "selenium",
-  "aws-cli",
-  "aws-sam-cli",
-  "kubectl",
-  "helm",
-  "kind",
-  "maven",
-  "gradle",
-  "ant",
-  "rust",
-  "php",
-  "nginx",
-  "gh-cli",
-  "azure-cli",
-] as const satisfies readonly ComponentId[];
