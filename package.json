@@ -5,7 +5,7 @@
   "description": "Cross-platform GitHub Action for reclaiming hosted-runner disk space",
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=22"
   },
   "scripts": {
     "build": "npm run clean:dist && ncc build src/index.ts --out dist --minify --no-source-map-register",
