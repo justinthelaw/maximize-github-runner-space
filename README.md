@@ -204,6 +204,15 @@ support contract. Their images, persistent state, and disk layouts are not the
 ephemeral standard-runner definitions against which deletion targets are
 validated.
 
+Before cleanup, the action reads the fixed image-data record produced by the
+runner-images build at `/imagegeneration/imagedata.json`,
+`/Users/runner/imagedata.json`, or `C:\imagedata.json`. It validates the image
+label, version, source branch, manifest path, operating system, and architecture;
+workflow-overridable `ImageOS` and `ImageVersion` values never authorize
+cleanup. This is strict compatibility evidence, not cryptographic attestation:
+a prior privileged step can alter local state, and a larger runner using the
+identical GitHub image remains indistinguishable and unsupported.
+
 ## Inputs
 
 The three global inputs and all historical `remove-*` inputs retain their names
@@ -310,6 +319,9 @@ are also written to the job log.
 ## Safety and failure behavior
 
 - All inputs are parsed and validated before cleanup begins.
+- A missing, malformed, linked, oversized, duplicated, or platform-mismatched
+  runner-image record is fatal before an adapter or package manager is
+  initialized.
 - Paths come from runner contexts, documented environment variables, image
   package metadata, or tightly bounded runner-image definitions. Filesystem
   roots, the home directory itself, workspace/action/runtime trees, and unsafe

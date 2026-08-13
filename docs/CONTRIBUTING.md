@@ -48,6 +48,7 @@ When you change cleanup behavior:
 2. Add deterministic coverage in `test/` and update the representative hosted-runner checks in `.github/workflows/test.yml` when runtime behavior changes.
    - Include targeted interaction coverage whenever you change grouped logic (`browsers` vs subcomponents, `cached-tools` vs per-language caches, or `max` + `skip-components` precedence).
 3. Update `.github/workflows/compatibility.yml` and `docs/RUNNER-SUPPORT.md` when supported labels, runner-image definitions, architecture differences, or bounded deletion targets change.
+   - Keep the runtime image-data registry aligned with the definition's exact image label, source branch, manifest path, and architecture. Never use workflow-overridable `ImageOS` or `ImageVersion` values to authorize cleanup.
 4. Update `action.yml` and the root `README.md` together for public input, output, or behavior changes.
 5. Rebuild `dist/` and verify that the committed bundle exactly matches `src/`.
 6. Update `docs/MIGRATIONS.md` if the change is breaking or materially alters defaults.

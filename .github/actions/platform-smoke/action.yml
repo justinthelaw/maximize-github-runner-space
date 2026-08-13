@@ -28,6 +28,12 @@ runs:
     - name: Run a bounded native cleanup
       id: cleanup
       uses: ./
+      # These ordinary image variables are workflow-overridable and must never
+      # authorize cleanup. Every platform must instead use its fixed image-data
+      # record created during runner-image generation.
+      env:
+        ImageOS: workflow-spoof
+        ImageVersion: not-a-version
       with:
         cleanup-profile: custom
         remove-azcopy: "true"

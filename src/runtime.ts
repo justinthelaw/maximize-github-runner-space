@@ -1,13 +1,131 @@
 import { constants, existsSync } from "node:fs";
-import { open } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Architecture, Platform, RuntimeContext } from "./types.js";
 import { runCommand } from "./command.js";
 
-const UBUNTU_SLIM_IMAGE_DATA = "/imagegeneration/imagedata.json";
 const MAX_IMAGE_DATA_BYTES = 256 * 1024;
+
+const DEFINITION_IMAGE_DATA_PATHS: Readonly<Record<Platform, string>> = {
+  linux: "/imagegeneration/imagedata.json",
+  macos: "/Users/runner/imagedata.json",
+  windows: "C:\\imagedata.json",
+};
+
+interface SupportedVmImage {
+  readonly platform: Platform;
+  readonly architecture: Architecture;
+  readonly sourceRef: string;
+  readonly readme: string;
+}
+
+const SUPPORTED_VM_IMAGES: Readonly<Record<string, SupportedVmImage>> = {
+  "ubuntu-22.04": {
+    platform: "linux",
+    architecture: "x64",
+    sourceRef: "ubuntu22",
+    readme: "images/ubuntu/Ubuntu2204-Readme.md",
+  },
+  "ubuntu-24.04": {
+    platform: "linux",
+    architecture: "x64",
+    sourceRef: "ubuntu24",
+    readme: "images/ubuntu/Ubuntu2404-Readme.md",
+  },
+  "ubuntu-26.04": {
+    platform: "linux",
+    architecture: "x64",
+    sourceRef: "ubuntu26",
+    readme: "images/ubuntu/Ubuntu2604-Readme.md",
+  },
+  "ubuntu-22.04-arm": {
+    platform: "linux",
+    architecture: "arm64",
+    sourceRef: "ubuntu22-arm64",
+    readme: "images/ubuntu/Ubuntu2204-Arm64-Readme.md",
+  },
+  "ubuntu-24.04-arm": {
+    platform: "linux",
+    architecture: "arm64",
+    sourceRef: "ubuntu24-arm64",
+    readme: "images/ubuntu/Ubuntu2404-Arm64-Readme.md",
+  },
+  "ubuntu-26.04-arm": {
+    platform: "linux",
+    architecture: "arm64",
+    sourceRef: "ubuntu26-arm64",
+    readme: "images/ubuntu/Ubuntu2604-Arm64-Readme.md",
+  },
+  "windows-2022": {
+    platform: "windows",
+    architecture: "x64",
+    sourceRef: "win22",
+    readme: "images/windows/Windows2022-Readme.md",
+  },
+  "windows-2025": {
+    platform: "windows",
+    architecture: "x64",
+    sourceRef: "win25",
+    readme: "images/windows/Windows2025-Readme.md",
+  },
+  "windows-2025-vs2026": {
+    platform: "windows",
+    architecture: "x64",
+    sourceRef: "win25-vs2026",
+    readme: "images/windows/Windows2025-VS2026-Readme.md",
+  },
+  "windows-11-arm64": {
+    platform: "windows",
+    architecture: "arm64",
+    sourceRef: "win11-arm64",
+    readme: "images/windows/Windows11-Arm64-Readme.md",
+  },
+  "windows-11-vs2026-arm64": {
+    platform: "windows",
+    architecture: "arm64",
+    sourceRef: "win11-vs2026-arm64",
+    readme: "images/windows/Windows11-VS2026-Arm64-Readme.md",
+  },
+  "macos-15": {
+    platform: "macos",
+    architecture: "x64",
+    sourceRef: "macos-15",
+    readme: "images/macos/macos-15-Readme.md",
+  },
+  "macos-26": {
+    platform: "macos",
+    architecture: "x64",
+    sourceRef: "macos-26",
+    readme: "images/macos/macos-26-Readme.md",
+  },
+  "macos-14-arm64": {
+    platform: "macos",
+    architecture: "arm64",
+    sourceRef: "macos-14-arm64",
+    readme: "images/macos/macos-14-arm64-Readme.md",
+  },
+  "macos-15-arm64": {
+    platform: "macos",
+    architecture: "arm64",
+    sourceRef: "macos-15-arm64",
+    readme: "images/macos/macos-15-arm64-Readme.md",
+  },
+  "macos-26-arm64": {
+    platform: "macos",
+    architecture: "arm64",
+    sourceRef: "macos-26-arm64",
+    readme: "images/macos/macos-26-arm64-Readme.md",
+  },
+  "xcode-27-arm64": {
+    platform: "macos",
+    architecture: "arm64",
+    sourceRef: "xcode-27-arm64",
+    readme: "images/macos/xcode-27-arm64-Readme.md",
+  },
+};
 
 function detectPlatform(): Platform {
   const runnerOs = (process.env.RUNNER_OS ?? "").toLowerCase();
@@ -31,31 +149,160 @@ function detectArchitecture(): Architecture {
   throw new Error(`Unsupported runner architecture: ${process.arch}`);
 }
 
+function parseImageData(
+  imageData?: string,
+): readonly Record<string, unknown>[] {
+  if (imageData === undefined) return [];
+  try {
+    const parsed = JSON.parse(imageData) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (entry): entry is Record<string, unknown> =>
+        typeof entry === "object" && entry !== null,
+    );
+  } catch {
+    return [];
+  }
+}
+
 export function isOfficialUbuntuSlimContainer(
   isContainer: boolean,
   imageData?: string,
 ): boolean {
   if (!isContainer) return false;
-  if (imageData === undefined) return false;
-  try {
-    const parsed = JSON.parse(imageData) as unknown;
-    if (!Array.isArray(parsed)) return false;
-    return parsed.some((entry) => {
-      if (typeof entry !== "object" || entry === null) return false;
-      const record = entry as Record<string, unknown>;
-      if (record.group !== "VM Image" || typeof record.detail !== "string") {
-        return false;
-      }
-      const detail = record.detail;
-      return (
-        /^- OS: Linux \(x64\)$/m.test(detail) &&
-        /^- Source: Docker$/m.test(detail) &&
-        /^- Name: ubuntu:24\.04$/m.test(detail) &&
-        /^- Version: \d+(?:\.\d+)+$/m.test(detail)
-      );
-    });
-  } catch {
+  const records = parseImageData(imageData);
+  const record = records[0];
+  if (
+    records.length !== 1 ||
+    record?.group !== "VM Image" ||
+    typeof record.detail !== "string"
+  ) {
     return false;
+  }
+  return /^- OS: Linux \(x64\)\n- Source: Docker\n- Name: ubuntu:24\.04\n- Version: \d+(?:\.\d+)+\n(?:[\s\S]*)$/.test(
+    record.detail,
+  );
+}
+
+interface RunnerImageIdentity {
+  readonly label: string;
+  readonly version: string;
+  readonly sourceRef: string;
+  readonly readme: string;
+}
+
+function runnerImageIdentity(
+  imageData?: string,
+): RunnerImageIdentity | undefined {
+  const records = parseImageData(imageData).filter(
+    (record) => record.group === "Runner Image",
+  );
+  const record = records[0];
+  if (records.length !== 1 || typeof record?.detail !== "string") {
+    return undefined;
+  }
+  const match = record.detail.match(
+    /^Image: ([a-z0-9.-]+)\nVersion: (\d+(?:\.\d+)+)\nIncluded Software: https:\/\/github\.com\/actions\/runner-images\/blob\/([a-z0-9.-]+)\/(\d+\.\d+)\/(images\/(?:ubuntu|windows|macos)\/[A-Za-z0-9.-]+-Readme\.md)\nImage Release: https:\/\/github\.com\/actions\/runner-images\/releases\/tag\/([a-z0-9.-]+)%2F(\d+\.\d+)$/,
+  );
+  const label = match?.[1];
+  const version = match?.[2];
+  const sourceRef = match?.[3];
+  const sourceVersion = match?.[4];
+  const readme = match?.[5];
+  const releaseTag = match?.[6];
+  const releaseVersion = match?.[7];
+  const versionPrefix = version?.split(".", 2).join(".");
+  if (
+    label === undefined ||
+    version === undefined ||
+    sourceRef === undefined ||
+    readme === undefined ||
+    releaseTag === undefined ||
+    sourceRef !== releaseTag ||
+    sourceVersion !== versionPrefix ||
+    releaseVersion !== versionPrefix
+  ) {
+    return undefined;
+  }
+  return { label, version, sourceRef, readme };
+}
+
+export function definitionImageDataPath(platform: Platform): string {
+  return DEFINITION_IMAGE_DATA_PATHS[platform];
+}
+
+function isSameFile(left: Stats, right: Stats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function isSameFileSnapshot(left: Stats, right: Stats): boolean {
+  return (
+    isSameFile(left, right) &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs
+  );
+}
+
+export async function readDefinitionImageData(
+  platform: Platform,
+  path = definitionImageDataPath(platform),
+): Promise<string | undefined> {
+  try {
+    const before = await lstat(path);
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.size > MAX_IMAGE_DATA_BYTES
+    ) {
+      return undefined;
+    }
+    const flags =
+      platform === "windows"
+        ? constants.O_RDONLY
+        : constants.O_RDONLY | constants.O_NOFOLLOW;
+    const file = await open(path, flags);
+    try {
+      const opened = await file.stat();
+      if (
+        !opened.isFile() ||
+        opened.size > MAX_IMAGE_DATA_BYTES ||
+        !isSameFileSnapshot(before, opened)
+      ) {
+        return undefined;
+      }
+
+      const buffer = Buffer.alloc(MAX_IMAGE_DATA_BYTES + 1);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const result = await file.read(
+          buffer,
+          bytesRead,
+          buffer.length - bytesRead,
+          bytesRead,
+        );
+        if (result.bytesRead === 0) break;
+        bytesRead += result.bytesRead;
+      }
+      if (bytesRead > MAX_IMAGE_DATA_BYTES) return undefined;
+
+      const [afterPath, afterHandle] = await Promise.all([
+        lstat(path),
+        file.stat(),
+      ]);
+      if (
+        !afterPath.isFile() ||
+        !isSameFileSnapshot(opened, afterPath) ||
+        !isSameFileSnapshot(opened, afterHandle)
+      ) {
+        return undefined;
+      }
+      return buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await file.close();
+    }
+  } catch {
+    return undefined;
   }
 }
 
@@ -87,26 +334,26 @@ export function definitionActionPath(
 export function isDefinitionCompatibleRunnerImage(
   platform: Platform,
   architecture: Architecture,
-  environment: NodeJS.ProcessEnv,
-  isUbuntuSlim: boolean,
+  isContainer: boolean,
+  imageData: string | undefined,
 ): boolean {
-  if (isUbuntuSlim) return platform === "linux" && architecture === "x64";
-  const imageVersion = environment.ImageVersion ?? "";
-  if (!/^\d+(?:\.\d+)+$/.test(imageVersion)) return false;
-
-  const imageOS = environment.ImageOS ?? "";
-  switch (platform) {
-    case "linux":
-      return architecture === "arm64"
-        ? /^ubuntu(?:22|24|26)-arm64$/.test(imageOS)
-        : /^ubuntu(?:22|24|26)$/.test(imageOS);
-    case "windows":
-      return architecture === "arm64"
-        ? /^(?:win11-arm64|win11-vs2026-arm64)$/.test(imageOS)
-        : /^(?:win22|win25|win25-vs2026)$/.test(imageOS);
-    case "macos":
-      return /^macos(?:14|15|26)$/.test(imageOS);
+  if (isContainer) {
+    return (
+      platform === "linux" &&
+      architecture === "x64" &&
+      isOfficialUbuntuSlimContainer(true, imageData)
+    );
   }
+  const identity = runnerImageIdentity(imageData);
+  if (identity === undefined) return false;
+  const expected = SUPPORTED_VM_IMAGES[identity.label];
+  return (
+    expected !== undefined &&
+    platform === expected.platform &&
+    architecture === expected.architecture &&
+    identity.sourceRef === expected.sourceRef &&
+    identity.readme === expected.readme
+  );
 }
 
 export async function createRuntimeContext(): Promise<RuntimeContext> {
@@ -115,25 +362,7 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
   const isContainer =
     platform === "linux" &&
     (existsSync("/run/.containerenv") || existsSync("/.dockerenv"));
-  let imageData: string | undefined;
-  if (isContainer) {
-    try {
-      const file = await open(
-        UBUNTU_SLIM_IMAGE_DATA,
-        constants.O_RDONLY | constants.O_NOFOLLOW,
-      );
-      try {
-        const metadata = await file.stat();
-        if (metadata.isFile() && metadata.size <= MAX_IMAGE_DATA_BYTES) {
-          imageData = await file.readFile("utf8");
-        }
-      } finally {
-        await file.close();
-      }
-    } catch {
-      imageData = undefined;
-    }
-  }
+  const imageData = await readDefinitionImageData(platform);
   const isUbuntuSlim = isOfficialUbuntuSlimContainer(isContainer, imageData);
   let hasPasswordlessSudo = false;
   if (platform !== "windows" && typeof process.getuid === "function") {
@@ -176,8 +405,8 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
     isDefinitionCompatibleImage: isDefinitionCompatibleRunnerImage(
       platform,
       architecture,
-      process.env,
-      isUbuntuSlim,
+      isContainer,
+      imageData,
     ),
     isUbuntuSlim,
     hasPasswordlessSudo,

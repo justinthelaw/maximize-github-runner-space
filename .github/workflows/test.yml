@@ -63,6 +63,11 @@ jobs:
       # proven so this one runner covers the full transactional lifecycle.
       - name: Resize swapfile with the historical fractional syntax
         uses: ./
+        # Prove workflow-controlled image variables cannot select or reject the
+        # image; runtime authorization comes from the fixed image-data record.
+        env:
+          ImageOS: rhel9
+          ImageVersion: not-a-version
         with:
           cleanup-profile: custom
           swapfile-size: 1.5GiB
