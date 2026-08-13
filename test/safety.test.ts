@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { createRemovePathOperation } from "../src/operations.js";
 import {
@@ -78,6 +78,30 @@ test("a target containing a protected workspace is rejected", () => {
     () =>
       assertSafeRemovalTarget("/home/runner/work", ["/home/runner"], context),
     /protected/,
+  );
+});
+
+test("the Node executable is protected without blocking sibling tools", () => {
+  const context = contextFor("linux");
+  const runtimeDirectory = dirname(process.execPath);
+  assert.throws(
+    () =>
+      assertSafeRemovalTarget(process.execPath, [runtimeDirectory], context),
+    /protected/,
+  );
+  assert.throws(
+    () =>
+      assertSafeRemovalTarget(
+        runtimeDirectory,
+        [dirname(runtimeDirectory)],
+        context,
+      ),
+    /protected/,
+  );
+  const sibling = join(runtimeDirectory, "unrelated-runner-tool");
+  assert.equal(
+    assertSafeRemovalTarget(sibling, [runtimeDirectory], context),
+    sibling,
   );
 });
 

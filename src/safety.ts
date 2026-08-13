@@ -31,21 +31,18 @@ function protectedPathSets(
   readonly recursive: readonly string[];
 } {
   const root = canonicalLexical(api.parse(context.home).root, api);
-  const exact = [root, context.home]
-    .filter((value): value is string => value !== undefined && value !== "")
-    .map((value) => canonicalLexical(value, api));
-  const recursive = [
-    context.temp,
-    context.workspace,
-    context.actionPath,
+  const runtimeExecutable =
     context.platform === "windows"
       ? win32.isAbsolute(process.execPath)
-        ? win32.dirname(process.execPath)
+        ? process.execPath
         : undefined
       : posix.isAbsolute(process.execPath)
-        ? posix.dirname(process.execPath)
-        : undefined,
-  ]
+        ? process.execPath
+        : undefined;
+  const exact = [root, context.home, runtimeExecutable]
+    .filter((value): value is string => value !== undefined && value !== "")
+    .map((value) => canonicalLexical(value, api));
+  const recursive = [context.temp, context.workspace, context.actionPath]
     .filter((value): value is string => value !== undefined && value !== "")
     .map((value) => canonicalLexical(value, api));
   return { exact, recursive };
@@ -58,7 +55,10 @@ function overlapsProtected(
 ): boolean {
   const protectedPaths = protectedPathSets(context, api);
   return (
-    protectedPaths.exact.includes(candidate) ||
+    protectedPaths.exact.some(
+      (protectedPath) =>
+        candidate === protectedPath || isWithin(protectedPath, candidate, api),
+    ) ||
     protectedPaths.recursive.some(
       (protectedPath) =>
         candidate === protectedPath ||
