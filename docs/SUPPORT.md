@@ -10,5 +10,7 @@
 
 - Search open and closed issues first.
 - If you recently upgraded, review [Migration guide](/docs/MIGRATIONS.md) for breaking changes.
-- Include runner image and workflow snippet.
-- Include disk usage before and after running the action.
+- Include the exact workflow runner label, detected architecture, and the `ImageOS` and `ImageVersion` values shown in the runner's **Set up job** log.
+- Include the action tag or full commit SHA, the cleanup step's workflow snippet, and every supplied input.
+- Include the action's `available-bytes-before`, `available-bytes-after`, `reclaimed-bytes`, `platform`, and `architecture` outputs.
+- Include the action's per-operation summary and relevant failure logs with credentials and other secrets removed.

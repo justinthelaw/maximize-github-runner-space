@@ -4,9 +4,31 @@ This document captures breaking changes and notable behavior shifts between rele
 
 ## Table of Contents
 
+- [0.11.x -> 0.12.0](#011x---0120)
 - [0.6.x -> 0.7.0](#06x---070)
 - [0.7.x -> 0.8.0](#07x---080)
 - [0.8.x -> 0.9.0](#08x---090)
+
+## 0.11.x -> 0.12.0
+
+> [!NOTE]
+> `v0.12.0` is planned but not yet published. Until release, test the pull request by pinning its full commit SHA.
+
+This release changes the implementation from an Ubuntu-only composite action to a bundled Node action with native Linux, macOS, and Windows adapters.
+
+Existing Ubuntu workflows remain compatible:
+
+- Every historical input retains its name, default, and optional status.
+- Calling the action without a `with:` block still selects the aggressive `max` profile.
+- `custom` still enables only inputs whose value is exactly `"true"`.
+- Omitting `swapfile-size` still leaves swap unchanged.
+- Existing component names and skip behavior remain supported; broader operations now yield when necessary to honor protected components.
+
+The new `remove-xcode`, `remove-visual-studio`, and `remove-windows-sdk` inputs are additive. They apply only to their named operating systems and do not change Ubuntu cleanup.
+
+For a new macOS or Windows workflow, start with `cleanup-profile: custom` and enable only measured, disposable components. The default `max` profile is intentionally destructive: it includes unselected Xcodes on macOS and eligible Visual Studio and Windows SDK payloads on Windows. Windows `max` also removes PowerShell 7, the default shell for later Windows `run` steps. Use `skip-components` to protect every toolchain and shell the rest of the job requires.
+
+The action now rejects self-hosted runners, arbitrary job containers, and hosted images that do not match a supported standard runner-image definition before cleanup. Larger runners remain unsupported and outside the tested contract. See [Runner support](/docs/RUNNER-SUPPORT.md) for exact labels and limitations.
 
 ## 0.8.x -> 0.9.0
 
