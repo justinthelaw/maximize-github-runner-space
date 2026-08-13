@@ -12,6 +12,14 @@ const officialSlimIdentity: NodeJS.ProcessEnv = {
   ImageVersion: "20260805.1",
 };
 
+const officialSlimImageData = JSON.stringify([
+  {
+    group: "VM Image",
+    detail:
+      "- OS: Linux (x64)\n- Source: Docker\n- Name: ubuntu:24.04\n- Version: 20260728.2.1\n",
+  },
+]);
+
 test("the official Ubuntu slim image requires every positive identity marker", () => {
   assert.equal(isOfficialUbuntuSlimContainer(officialSlimIdentity, true), true);
   assert.equal(
@@ -55,6 +63,25 @@ test("an arbitrary GitHub Actions job container is not Ubuntu slim", () => {
     ),
     false,
   );
+});
+
+test("the definition-owned image record identifies ubuntu-slim", () => {
+  assert.equal(
+    isOfficialUbuntuSlimContainer({}, true, officialSlimImageData),
+    true,
+  );
+  assert.equal(
+    isOfficialUbuntuSlimContainer({}, false, officialSlimImageData),
+    false,
+  );
+  for (const changed of [
+    officialSlimImageData.replace("Docker", "Podman"),
+    officialSlimImageData.replace("ubuntu:24.04", "ubuntu:24.04-custom"),
+    officialSlimImageData.replace("20260728.2.1", "latest"),
+    "not JSON",
+  ]) {
+    assert.equal(isOfficialUbuntuSlimContainer({}, true, changed), false);
+  }
 });
 
 test("only definition-compatible standard image families pass discovery", () => {

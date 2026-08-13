@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import type { Architecture, Platform, RuntimeContext } from "./types.js";
 import { runCommand } from "./command.js";
@@ -28,14 +29,37 @@ function detectArchitecture(): Architecture {
 export function isOfficialUbuntuSlimContainer(
   environment: NodeJS.ProcessEnv,
   isContainer: boolean,
+  imageData?: string,
 ): boolean {
-  return (
-    isContainer &&
+  if (!isContainer) return false;
+  const environmentIdentity =
     environment.ImageOS === "Linux" &&
     environment.IMAGE_TARGET_PLATFORM === "GitHub" &&
     environment.IMAGEDATA_NAME === "ubuntu:24.04" &&
-    /^\d+(?:\.\d+)+$/.test(environment.ImageVersion ?? "")
-  );
+    /^\d+(?:\.\d+)+$/.test(environment.ImageVersion ?? "");
+  if (environmentIdentity) return true;
+
+  if (imageData === undefined) return false;
+  try {
+    const parsed = JSON.parse(imageData) as unknown;
+    if (!Array.isArray(parsed)) return false;
+    return parsed.some((entry) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      const record = entry as Record<string, unknown>;
+      if (record.group !== "VM Image" || typeof record.detail !== "string") {
+        return false;
+      }
+      const detail = record.detail;
+      return (
+        /^- OS: Linux \(x64\)$/m.test(detail) &&
+        /^- Source: Docker$/m.test(detail) &&
+        /^- Name: ubuntu:24\.04$/m.test(detail) &&
+        /^- Version: \d+(?:\.\d+)+$/m.test(detail)
+      );
+    });
+  } catch {
+    return false;
+  }
 }
 
 export function isDefinitionCompatibleRunnerImage(
@@ -43,9 +67,9 @@ export function isDefinitionCompatibleRunnerImage(
   environment: NodeJS.ProcessEnv,
   isUbuntuSlim: boolean,
 ): boolean {
+  if (isUbuntuSlim) return true;
   const imageVersion = environment.ImageVersion ?? "";
   if (!/^\d+(?:\.\d+)+$/.test(imageVersion)) return false;
-  if (isUbuntuSlim) return true;
 
   const imageOS = environment.ImageOS ?? "";
   switch (platform) {
@@ -65,7 +89,19 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
   const isContainer =
     platform === "linux" &&
     (existsSync("/run/.containerenv") || existsSync("/.dockerenv"));
-  const isUbuntuSlim = isOfficialUbuntuSlimContainer(process.env, isContainer);
+  let imageData: string | undefined;
+  if (isContainer) {
+    try {
+      imageData = await readFile("/imagegeneration/imagedata.json", "utf8");
+    } catch {
+      imageData = undefined;
+    }
+  }
+  const isUbuntuSlim = isOfficialUbuntuSlimContainer(
+    process.env,
+    isContainer,
+    imageData,
+  );
   let hasPasswordlessSudo = false;
   if (platform !== "windows" && typeof process.getuid === "function") {
     if (process.getuid() === 0) {

@@ -36,6 +36,11 @@ There is no OS input. The action detects `runner.os`, `runner.arch`, hosted
 toolcache, home, temporary directory, privilege availability, and container
 state. It then builds an operation plan for that environment.
 
+Container cleanup additionally requires the exact runner-images
+`/imagegeneration/imagedata.json` identity (Linux x64, Docker source,
+`ubuntu:24.04`, and a numeric image version), or the equivalent complete image
+environment markers. Ordinary workflow job containers fail before mutation.
+
 | Environment class | Support level | Important behavior |
 | --- | --- | --- |
 | Ubuntu x64 full VM | Full and backward-compatible | Existing no-input `max`, component names, skips, and optional swap behavior remain supported. |
