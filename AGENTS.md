@@ -2,34 +2,55 @@
 
 ## Purpose
 
-- Composite GitHub Action that frees disk space on `ubuntu-latest` runners by removing optional preinstalled software and caches.
-- Main implementation lives in `action.yml` and is intended to run early in a workflow.
-- Supports `cleanup-profile` modes (`custom` and `max`), `skip-components` to keep specific toolchains, and an opt-in `swapfile-size` input to manage `/mnt/swapfile` without changing it by default.
+- JavaScript GitHub Action that reclaims disk space on ephemeral standard
+  GitHub-hosted Linux, macOS, and Windows runners.
+- `cleanup-profile: max` remains the no-input default; `custom` enables only
+  exact `"true"` component inputs. `skip-components` protects tools under max.
+- `swapfile-size` is opt-in and supported only on privileged Linux VMs.
 
-## Repository Map
+## Repository map
 
-- `action.yml`: Action metadata, inputs, and all cleanup logic.
-- `.github/workflows/test.yml`: CI matrix tests plus focused interaction jobs for grouped/subgroup precedence and `skip-components` normalization.
-- `README.md`: User-facing usage and caveats.
+- `action.yml`: stable public metadata and Node 24 entrypoint.
+- `src/components.ts`: canonical component/platform registry.
+- `src/planner.ts`: all profile, group, skip, and overlap precedence.
+- `src/platforms/`: native Linux, macOS, and Windows adapters.
+- `src/safety.ts`: mandatory deletion-target validation.
+- `test/`: fast, data-driven planner, safety, metadata, and adapter tests.
+- `.github/workflows/test.yml`: representative destructive runner smoke tests.
+- `docs/RUNNER-SUPPORT.md`: pinned runner-image evidence and support policy.
+- `dist/`: committed `ncc` bundle consumed by Actions.
 
-## Scripts / Execution Surfaces
+## Required validation
 
-- There are no standalone repo scripts (`scripts/`, `package.json`, Makefile, etc.).
-- Effective execution surfaces are:
-  - GitHub Action runtime in `action.yml` (bash blocks under `runs.steps[*].run`).
-  - CI workflow steps in `.github/workflows/test.yml`.
+```bash
+npm ci
+npm test
+npm run format:check
+npm run check-dist
+pre-commit run --all-files --hook-stage pre-push
+```
 
-## Development Notes
+## Destructive-change rules
 
-- Environment assumptions: GitHub-hosted Ubuntu runner, `bash`, `sudo`, `apt-get`, `docker` available.
-- Operations are destructive (`rm -rf`, package purges, swap resize/removal/recreation when explicitly requested). Keep changes tightly scoped and idempotent.
-- The action uses parallel cleanup jobs and a per-run state directory under `${RUNNER_TEMP:-/tmp}` for progress files (`total_ops`, `completed_ops`, `component_flags.env`).
-- Boolean removal inputs default to `'false'`; CI validates behavior one input at a time via matrix, includes dedicated grouped/subgroup precedence and `max` + `skip-components` interaction coverage, and includes swapfile resize/remove/oversize-failure coverage plus no-input coverage for leaving swap untouched. Swap checks must tolerate runners that start with or without `/mnt/swapfile`.
-- When changing removal targets or swapfile behavior, update both:
-  - `action.yml` removal logic
-  - `.github/workflows/test.yml` verification checks
+- Never guess a home directory, toolcache, version, or package path.
+- Use runner context, exact installer environment values, native package
+  metadata, or a path supported by the pinned runner-image definition.
+- Treat workflow environment variables as untrusted. Bound and normalize them
+  before constructing an operation.
+- Never remove a filesystem root, home, temp/workspace/action/runtime tree,
+  Homebrew prefix, `WinSxS`, or unchecked `Program Files` subtree.
+- Preserve grouped-component skip promises. If a broad operation owns a
+  protected child, it must yield and narrower sibling operations must run.
+- Validate the complete plan before the first mutation. Swap replacement must
+  be atomic and failure-fatal; ordinary absent/image-drift cleanup is
+  best-effort for backward compatibility.
+- Update the registry, action metadata, unit coverage, live smoke assertions,
+  README, and runner support document together when adding a component.
 
-## Important Caveats
+## CI cost policy
 
-- Intended only for runners with disk pressure; can break builds if required toolchains are removed.
-- Use as an early workflow step so reclaimed space is available before expensive steps.
+- Put planner, path, and adapter-shape coverage in the single Linux quality job.
+- Test each of the seven standard runner environment classes once on PRs;
+  avoid a component-by-OS Cartesian product.
+- Keep every-label and preview coverage in the scheduled/manual workflow,
+  cap matrix parallelism, time out every job, and cancel superseded PR runs.

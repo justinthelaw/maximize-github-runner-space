@@ -8,1016 +8,343 @@ on:
   pull_request:
     branches:
       - main
+  merge_group:
+  push:
+    branches:
+      - main
 
 concurrency:
-  group: test-${{ github.ref }}
+  group: test-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   static-validation:
+    name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Validate Action Metadata and Shell
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
 
-          python3 <<'PY'
-          from pathlib import Path
-          import subprocess
+      - name: Typecheck and unit tests
+        run: npm test
 
-          expected_checkout = "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
-          workflows = sorted(Path(".github/workflows").glob("*.yml"))
-          workflows.extend(sorted(Path(".github/workflows").glob("*.yaml")))
-          for workflow in workflows:
-              workflow_text = workflow.read_text(encoding="utf-8")
-              for line_number, line in enumerate(workflow_text.splitlines(), start=1):
-                  stripped = line.strip()
-                  if stripped.startswith("uses: actions/checkout@") and expected_checkout not in stripped:
-                      raise SystemExit(f"Unpinned or stale checkout reference at {workflow}:{line_number}: {line.strip()}")
-                  if stripped.startswith("uses:"):
-                      action_ref = stripped.removeprefix("uses:").strip().split()[0]
-                      if not action_ref.startswith("./"):
-                          if "@" not in action_ref:
-                              raise SystemExit(f"Remote action has no revision at {workflow}:{line_number}: {line.strip()}")
-                          revision = action_ref.rsplit("@", 1)[-1]
-                          if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
-                              raise SystemExit(f"Remote action is not pinned to a full SHA at {workflow}:{line_number}: {line.strip()}")
+      - name: Formatting
+        run: npm run format:check
 
-          action_text = Path("action.yml").read_text(encoding="utf-8")
-          disallowed_temp_paths = (
-              "/tmp/component_flags.env",
-              "/tmp/progress.sh",
-              "/tmp/total_ops",
-              "/tmp/completed_ops",
-          )
-          for token in disallowed_temp_paths:
-              if token in action_text:
-                  raise SystemExit(f"Found fixed temp state path in action.yml: {token}")
-
-          def extract_run_blocks(path):
-              lines = path.read_text(encoding="utf-8").splitlines()
-              index = 0
-              while index < len(lines):
-                  line = lines[index]
-                  stripped = line.lstrip()
-                  indent = len(line) - len(stripped)
-                  if stripped == "run: |":
-                      index += 1
-                      content_indent = indent + 2
-                      block = []
-                      while index < len(lines):
-                          candidate = lines[index]
-                          if candidate.strip():
-                              candidate_indent = len(candidate) - len(candidate.lstrip())
-                              if candidate_indent <= indent:
-                                  break
-                              block.append(candidate[content_indent:])
-                          else:
-                              block.append("")
-                          index += 1
-                      yield "\n".join(block) + "\n"
-                      continue
-                  index += 1
-
-          checked = 0
-          for checked, script in enumerate(extract_run_blocks(Path("action.yml")), start=1):
-              result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True, check=False)
-              if result.returncode != 0:
-                  raise SystemExit(f"action.yml run block {checked} failed bash -n:\n{result.stderr}")
-
-          if checked == 0:
-              raise SystemExit("No action.yml run blocks were found")
-
-          print(f"Validated {checked} action.yml run blocks.")
-          PY
+      - name: Verify committed action bundle
+        run: npm run check-dist
 
   default-max:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Max Profile Test
-        uses: ./
-
-  no-op-custom:
+    name: Ubuntu x64 legacy default
+    needs: static-validation
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Capture Initial Swapfile State
+      - name: Capture swap state
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ -f "/mnt/swapfile" ]; then
-            echo "INITIAL_SWAPFILE_PRESENT=1" >> "$GITHUB_ENV"
-            echo "INITIAL_SWAPFILE_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq /mnt/swapfile; then
+            echo "SWAP_ACTIVE=1" >> "$GITHUB_ENV"
           else
-            echo "INITIAL_SWAPFILE_PRESENT=0" >> "$GITHUB_ENV"
-            echo "INITIAL_SWAPFILE_BYTES=0" >> "$GITHUB_ENV"
+            echo "SWAP_ACTIVE=0" >> "$GITHUB_ENV"
+          fi
+          if grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
+            echo "SWAP_FSTAB=1" >> "$GITHUB_ENV"
+          else
+            echo "SWAP_FSTAB=0" >> "$GITHUB_ENV"
+          fi
+          if [[ -e /mnt/swapfile ]]; then
+            echo "SWAP_PRESENT=1" >> "$GITHUB_ENV"
+            echo "SWAP_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
+          else
+            echo "SWAP_PRESENT=0" >> "$GITHUB_ENV"
+            echo "SWAP_BYTES=0" >> "$GITHUB_ENV"
           fi
 
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
-            echo "INITIAL_SWAPFILE_ACTIVE=1" >> "$GITHUB_ENV"
-          else
-            echo "INITIAL_SWAPFILE_ACTIVE=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Custom Profile Test, with No Toggles
+      - name: Run historical no-input max profile
+        id: cleanup
         uses: ./
-        with:
-          cleanup-profile: custom
 
-      - name: Verify Swapfile Left Untouched
+      - name: Verify compatibility contract
         shell: bash
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
         run: |
           set -euo pipefail
-
-          if [ -f "/mnt/swapfile" ]; then
+          [[ "$BEFORE" =~ ^[0-9]+$ ]]
+          [[ "$AFTER" =~ ^[0-9]+$ ]]
+          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          [[ "$PLATFORM" == linux ]]
+          [[ "$ARCHITECTURE" == x64 ]]
+          if [[ -e /mnt/swapfile ]]; then
             current_present=1
             current_bytes=$(stat -c %s /mnt/swapfile)
           else
             current_present=0
             current_bytes=0
           fi
-
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
+          [[ "$current_present" == "$SWAP_PRESENT" ]]
+          [[ "$current_bytes" == "$SWAP_BYTES" ]]
+          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq /mnt/swapfile; then
             current_active=1
           else
             current_active=0
           fi
-
-          if [ "$current_present" != "$INITIAL_SWAPFILE_PRESENT" ] || \
-             [ "$current_bytes" != "$INITIAL_SWAPFILE_BYTES" ] || \
-             [ "$current_active" != "$INITIAL_SWAPFILE_ACTIVE" ]; then
-            echo "Expected swapfile state to remain unchanged when swapfile-size is omitted. Initial: present=${INITIAL_SWAPFILE_PRESENT}, bytes=${INITIAL_SWAPFILE_BYTES}, active=${INITIAL_SWAPFILE_ACTIVE}. Current: present=${current_present}, bytes=${current_bytes}, active=${current_active}."
-            exit 1
+          if grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
+            current_fstab=1
+          else
+            current_fstab=0
           fi
+          [[ "$current_active" == "$SWAP_ACTIVE" ]]
+          [[ "$current_fstab" == "$SWAP_FSTAB" ]]
+          test ! -e /usr/share/dotnet
 
-  max-with-skip:
+  ubuntu-regressions:
+    name: Ubuntu x64 batched regressions
+    needs: static-validation
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Capture Pre-Action State
+      - name: Assert protected and removable fixtures exist
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d "/usr/share/dotnet" ]; then
-            echo "DOTNET_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "DOTNET_PRE=0" >> "$GITHUB_ENV"
-          fi
-          if [ -d "/usr/local/lib/android" ]; then
-            echo "ANDROID_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "ANDROID_PRE=0" >> "$GITHUB_ENV"
-          fi
+          : "${RUNNER_TOOL_CACHE:?RUNNER_TOOL_CACHE is not set}"
+          test -d /usr/share/dotnet
+          test -d "${RUNNER_TOOL_CACHE}/node"
+          test -d "${RUNNER_TOOL_CACHE}/Python"
+          command -v azcopy >/dev/null
+          command -v firefox >/dev/null
+          command -v google-chrome >/dev/null
 
-      - name: Max Profile Test, with Skips
-        uses: ./
-        with:
-          cleanup-profile: " MaX "
-          skip-components: " DotNet , Android "
-
-      - name: Verify Post-Action State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${DOTNET_PRE}" = "1" ] && [ ! -d "/usr/share/dotnet" ]; then
-            echo '.NET should have been skipped but is missing'
-            exit 1
-          fi
-
-          if [ "${ANDROID_PRE}" = "1" ] && [ ! -d "/usr/local/lib/android" ]; then
-            echo 'Android should have been skipped but is missing'
-            exit 1
-          fi
-
-  max-skip-cached-node-precedence:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Capture Pre-Action Toolcache State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-          echo "TOOLS_DIR=${tools_dir}" >> "$GITHUB_ENV"
-
-          if [ -d "${tools_dir}/node" ] || [ -d "${tools_dir}/Node" ]; then
-            echo "NODE_CACHE_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "NODE_CACHE_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-          if [ -d "${tools_dir}/Python" ] || [ -d "${tools_dir}/python" ]; then
-            echo "PYTHON_CACHE_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "PYTHON_CACHE_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Max Profile Skip Cached Node
-        uses: ./
-        with:
-          cleanup-profile: max
-          skip-components: "  CACHED-Node  "
-
-      - name: Verify Cached Node Is Kept But Cached Python Can Be Removed
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${NODE_CACHE_PRE}" = "1" ] && [ ! -d "${TOOLS_DIR}/node" ] && [ ! -d "${TOOLS_DIR}/Node" ]; then
-            echo 'Node toolcache should have been skipped but is missing'
-            exit 1
-          fi
-
-          if [ "${PYTHON_CACHE_PRE}" = "1" ] && { [ -d "${TOOLS_DIR}/Python" ] || [ -d "${TOOLS_DIR}/python" ]; }; then
-            echo 'Python toolcache should have been removed when only cached-node is skipped'
-            exit 1
-          fi
-
-  max-skip-firefox-precedence:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Capture Pre-Action Browser State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if command -v firefox >/dev/null 2>&1; then
-            echo "FIREFOX_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "FIREFOX_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-          if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then
-            echo "CHROME_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "CHROME_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Max Profile Skip Firefox
-        uses: ./
-        with:
-          cleanup-profile: max
-          skip-components: "  FireFox  "
-
-      - name: Verify Firefox Is Kept But Chrome Can Be Removed
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${FIREFOX_PRE}" = "1" ] && ! command -v firefox >/dev/null 2>&1; then
-            echo 'Firefox should have been skipped but is missing'
-            exit 1
-          fi
-
-          if [ "${CHROME_PRE}" = "1" ] && { command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; }; then
-            echo 'Chrome should have been removed when only firefox is skipped'
-            exit 1
-          fi
-
-  custom-grouped-subgroup-precedence:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Capture Pre-Action Browser State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if command -v firefox >/dev/null 2>&1; then
-            echo "FIREFOX_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "FIREFOX_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-          if command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; then
-            echo "CHROME_PRE=1" >> "$GITHUB_ENV"
-          else
-            echo "CHROME_PRE=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Custom Profile Grouped + Subgroup Browsers
+      - name: Preserve exact custom-toggle semantics
         uses: ./
         with:
           cleanup-profile: custom
-          remove-browsers: "true"
-          remove-firefox: "true"
+          remove-azcopy: "TRUE"
 
-      - name: Verify Grouped Browser Removal Takes Precedence
+      - name: Verify non-lowercase toggle stayed disabled
         shell: bash
-        run: |
-          set -euo pipefail
+        run: command -v azcopy >/dev/null
 
-          if [ "${FIREFOX_PRE}" = "1" ] && command -v firefox >/dev/null 2>&1; then
-            echo 'Firefox should be removed when grouped browser cleanup is enabled'
-            exit 1
-          fi
-
-          if [ "${CHROME_PRE}" = "1" ] && { command -v google-chrome >/dev/null 2>&1 || command -v google-chrome-stable >/dev/null 2>&1; }; then
-            echo 'Chrome should be removed when grouped browser cleanup is enabled'
-            exit 1
-          fi
-
-  invalid-input-validation:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      matrix:
-        scenario:
-          - name: invalid-cleanup-profile
-            cleanup_profile: invalid-profile
-            skip_components: ""
-            swapfile_size: ""
-          - name: invalid-skip-components
-            cleanup_profile: max
-            skip_components: not-a-real-component
-            swapfile_size: ""
-          - name: mixed-valid-invalid-skip-components
-            cleanup_profile: max
-            skip_components: dotnet,not-a-real-component
-            swapfile_size: ""
-          - name: undersized-swapfile
-            cleanup_profile: custom
-            skip_components: ""
-            swapfile_size: 1B
-          - name: overflowing-swapfile
-            cleanup_profile: custom
-            skip_components: ""
-            swapfile_size: 100000000000000000000TiB
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Run Action with Invalid Inputs
-        id: invalid_input_run
+      - name: Reject an invalid profile before mutation
+        id: invalid-profile
         continue-on-error: true
         uses: ./
         with:
-          cleanup-profile: ${{ matrix.scenario.cleanup_profile }}
-          skip-components: ${{ matrix.scenario.skip_components }}
-          swapfile-size: ${{ matrix.scenario.swapfile_size }}
+          cleanup-profile: invalid-profile
 
-      - name: Verify Invalid Inputs Fail Early
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${{ steps.invalid_input_run.outcome }}" != "failure" ]; then
-            echo "Expected scenario '${{ matrix.scenario.name }}' to fail validation."
-            exit 1
-          fi
-
-  conda-root-safety:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Create Traversal Fixture
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "TEST_SENTINEL=${RUNNER_TEMP}/conda-safety-sentinel" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/conda-safety-sentinel"
-          touch "${RUNNER_TEMP}/conda-safety-sentinel/keep"
-          relative_sentinel=$(realpath --relative-to="$RUNNER_TOOL_CACHE" "${RUNNER_TEMP}/conda-safety-sentinel")
-          echo "TEST_CONDA=${RUNNER_TOOL_CACHE}/${relative_sentinel}" >> "$GITHUB_ENV"
-
-      - name: Reject Traversing CONDA Root
+      - name: Reject an invalid skip before mutation
+        id: invalid-skip
+        continue-on-error: true
         uses: ./
-        env:
-          CONDA: ${{ env.TEST_CONDA }}
         with:
-          cleanup-profile: custom
-          remove-miniconda: "true"
+          cleanup-profile: max
+          skip-components: dotnet,not-a-component
 
-      - name: Verify Unrelated Directory Was Kept
+      - name: Verify validation failures and fixtures
         shell: bash
-        run: test -f "${TEST_SENTINEL}/keep"
+        env:
+          PROFILE_OUTCOME: ${{ steps.invalid-profile.outcome }}
+          SKIP_OUTCOME: ${{ steps.invalid-skip.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$PROFILE_OUTCOME" == failure ]]
+          [[ "$SKIP_OUTCOME" == failure ]]
+          test -d /usr/share/dotnet
+          test -d "${RUNNER_TOOL_CACHE}/node"
+          test -d "${RUNNER_TOOL_CACHE}/Python"
+          command -v firefox >/dev/null
+          command -v google-chrome >/dev/null
 
+      - name: Exercise normalized max skips and toolcache precedence
+        id: max-skip
+        uses: ./
+        with:
+          cleanup-profile: " MaX "
+          skip-components: " DotNet , Cached-Node , Firefox "
 
-  swapfile-resize:
+      - name: Verify skipped children survived and sibling cleanup ran
+        shell: bash
+        env:
+          PLATFORM: ${{ steps.max-skip.outputs.platform }}
+          ARCHITECTURE: ${{ steps.max-skip.outputs.architecture }}
+        run: |
+          set -euo pipefail
+          [[ "$PLATFORM" == linux ]]
+          [[ "$ARCHITECTURE" == x64 ]]
+          test -d /usr/share/dotnet
+          test -d "${RUNNER_TOOL_CACHE}/node"
+          test ! -e "${RUNNER_TOOL_CACHE}/Python"
+          command -v firefox >/dev/null
+          ! command -v google-chrome >/dev/null 2>&1
+
+  swapfile-transaction:
+    name: Ubuntu x64 swap transaction
+    needs: static-validation
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Resize Swapfile
+      - name: Resize swapfile with the historical fractional syntax
         uses: ./
         with:
           cleanup-profile: custom
           swapfile-size: 1.5GiB
 
-      - name: Verify Resized Swapfile
+      - name: Verify configured swapfile
         shell: bash
         run: |
           set -euo pipefail
+          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
+          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
+          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
-          if [ ! -f "/mnt/swapfile" ]; then
-            echo 'Expected /mnt/swapfile to be created'
-            exit 1
-          fi
-
-          swap_bytes=$(stat -c %s /mnt/swapfile)
-          if [ "$swap_bytes" -ne $((3 * 1024 * 1024 * 1024 / 2)) ]; then
-            echo "Expected /mnt/swapfile to be 1.5 GiB, got ${swap_bytes} bytes"
-            exit 1
-          fi
-
-          if ! swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
-            echo 'Expected /mnt/swapfile to be active swap'
-            exit 1
-          fi
-
-  swapfile-remove:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Remove Swapfile via Size Input
-        uses: ./
-        with:
-          cleanup-profile: custom
-          swapfile-size: 0
-
-      - name: Verify Swapfile Removal
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -f "/mnt/swapfile" ] || swapon --show | grep -q '/mnt/swapfile'; then
-            echo 'Swapfile was not removed by swapfile-size=0'
-            exit 1
-          fi
-
-  swapfile-oversize:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Capture Initial Swapfile State
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ -f "/mnt/swapfile" ]; then
-            echo "INITIAL_SWAPFILE_PRESENT=1" >> "$GITHUB_ENV"
-            echo "INITIAL_SWAPFILE_BYTES=$(stat -c %s /mnt/swapfile)" >> "$GITHUB_ENV"
-          else
-            echo "INITIAL_SWAPFILE_PRESENT=0" >> "$GITHUB_ENV"
-            echo "INITIAL_SWAPFILE_BYTES=0" >> "$GITHUB_ENV"
-          fi
-
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
-            echo "INITIAL_SWAPFILE_ACTIVE=1" >> "$GITHUB_ENV"
-          else
-            echo "INITIAL_SWAPFILE_ACTIVE=0" >> "$GITHUB_ENV"
-          fi
-
-      - name: Request Oversized Swapfile
-        id: oversized_swap
+      - name: Reject an unsafe oversized replacement
+        id: oversized
         continue-on-error: true
         uses: ./
         with:
           cleanup-profile: custom
-          swapfile-size: 1000TiB
+          swapfile-size: 100TiB
 
-      - name: Verify Oversized Request Fails And Keeps Existing Swapfile
+      - name: Verify oversized request rolled back
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.oversized.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$OUTCOME" == failure ]]
+          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
+          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
+          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+
+      - name: Remove the managed swapfile
+        uses: ./
+        with:
+          cleanup-profile: custom
+          swapfile-size: "0"
+
+      - name: Verify swapfile removal
         shell: bash
         run: |
           set -euo pipefail
+          test ! -e /mnt/swapfile
+          ! swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq /mnt/swapfile
+          ! grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
-          if [ "${{ steps.oversized_swap.outcome }}" != "failure" ]; then
-            echo 'Expected oversized swapfile request to fail'
-            exit 1
-          fi
-
-          if [ -f "/mnt/swapfile" ]; then
-            current_present=1
-            current_bytes=$(stat -c %s /mnt/swapfile)
-          else
-            current_present=0
-            current_bytes=0
-          fi
-
-          if swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fxq '/mnt/swapfile'; then
-            current_active=1
-          else
-            current_active=0
-          fi
-
-          if [ "$current_present" != "$INITIAL_SWAPFILE_PRESENT" ] || \
-             [ "$current_bytes" != "$INITIAL_SWAPFILE_BYTES" ] || \
-             [ "$current_active" != "$INITIAL_SWAPFILE_ACTIVE" ]; then
-            echo "Expected oversized swapfile request to keep the initial swap state. Initial: present=${INITIAL_SWAPFILE_PRESENT}, bytes=${INITIAL_SWAPFILE_BYTES}, active=${INITIAL_SWAPFILE_ACTIVE}. Current: present=${current_present}, bytes=${current_bytes}, active=${current_active}."
-            exit 1
-          fi
-
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  platform-smoke:
+    name: ${{ matrix.name }}
+    needs: static-validation
     strategy:
+      fail-fast: false
+      max-parallel: 4
       matrix:
-        option:
-          - remove-dotnet
-          - remove-android
-          - remove-haskell
-          - remove-codeql
-          - remove-docker-images
-          - remove-large-packages
-          - remove-cached-tools
-          - remove-cached-go
-          - remove-cached-node
-          - remove-cached-python
-          - remove-cached-pypy
-          - remove-cached-ruby
-          - remove-swift
-          - remove-julia
-          - remove-java
-          - remove-browsers
-          - remove-chrome
-          - remove-chromium
-          - remove-edge
-          - remove-firefox
-          - remove-webdrivers
-          - remove-selenium
-          - remove-powershell
-          - remove-miniconda
-          - remove-homebrew
-          - remove-vcpkg
-          - remove-aws-cli
-          - remove-aws-sam-cli
-          - remove-azure-cli
-          - remove-gh-cli
-          - remove-gcloud-cli
-          - remove-azcopy
-          - remove-kubectl
-          - remove-helm
-          - remove-kind
-          - remove-minikube
-          - remove-kustomize
-          - remove-docker-engine
-          - remove-buildah
-          - remove-podman
-          - remove-maven
-          - remove-gradle
-          - remove-ant
-          - remove-php
-          - remove-rust
-          - remove-postgresql
-          - remove-mysql
-          - remove-apache
-          - remove-nginx
-
+        include:
+          - name: Ubuntu arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            architecture: arm64
+          - name: Ubuntu slim
+            runner: ubuntu-slim
+            platform: linux
+            architecture: x64
+          - name: Windows x64
+            runner: windows-latest
+            platform: windows
+            architecture: x64
+          - name: Windows arm64
+            runner: windows-11-arm
+            platform: windows
+            architecture: arm64
+          - name: macOS arm64
+            runner: macos-latest
+            platform: macos
+            architecture: arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos
+            architecture: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Custom Profile Test, with Various Toggles
+      - name: Assert AzCopy fixture exists on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: command -v azcopy >/dev/null
+
+      - name: Assert AzCopy fixture exists on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+            throw 'Expected the runner image to contain AzCopy.'
+          }
+
+      - name: Run a bounded native cleanup
+        id: cleanup
         uses: ./
         with:
           cleanup-profile: custom
-          remove-dotnet: ${{ matrix.option == 'remove-dotnet' && 'true' || 'false' }}
-          remove-android: ${{ matrix.option == 'remove-android' && 'true' || 'false' }}
-          remove-haskell: ${{ matrix.option == 'remove-haskell' && 'true' || 'false' }}
-          remove-codeql: ${{ matrix.option == 'remove-codeql' && 'true' || 'false' }}
-          remove-docker-images: ${{ matrix.option == 'remove-docker-images' && 'true' || 'false' }}
-          remove-large-packages: ${{ matrix.option == 'remove-large-packages' && 'true' || 'false' }}
-          remove-cached-tools: ${{ matrix.option == 'remove-cached-tools' && 'true' || 'false' }}
-          remove-cached-go: ${{ matrix.option == 'remove-cached-go' && 'true' || 'false' }}
-          remove-cached-node: ${{ matrix.option == 'remove-cached-node' && 'true' || 'false' }}
-          remove-cached-python: ${{ matrix.option == 'remove-cached-python' && 'true' || 'false' }}
-          remove-cached-pypy: ${{ matrix.option == 'remove-cached-pypy' && 'true' || 'false' }}
-          remove-cached-ruby: ${{ matrix.option == 'remove-cached-ruby' && 'true' || 'false' }}
-          remove-swift: ${{ matrix.option == 'remove-swift' && 'true' || 'false' }}
-          remove-julia: ${{ matrix.option == 'remove-julia' && 'true' || 'false' }}
-          remove-java: ${{ matrix.option == 'remove-java' && 'true' || 'false' }}
-          remove-browsers: ${{ matrix.option == 'remove-browsers' && 'true' || 'false' }}
-          remove-chrome: ${{ matrix.option == 'remove-chrome' && 'true' || 'false' }}
-          remove-chromium: ${{ matrix.option == 'remove-chromium' && 'true' || 'false' }}
-          remove-edge: ${{ matrix.option == 'remove-edge' && 'true' || 'false' }}
-          remove-firefox: ${{ matrix.option == 'remove-firefox' && 'true' || 'false' }}
-          remove-webdrivers: ${{ matrix.option == 'remove-webdrivers' && 'true' || 'false' }}
-          remove-selenium: ${{ matrix.option == 'remove-selenium' && 'true' || 'false' }}
-          remove-powershell: ${{ matrix.option == 'remove-powershell' && 'true' || 'false' }}
-          remove-miniconda: ${{ matrix.option == 'remove-miniconda' && 'true' || 'false' }}
-          remove-homebrew: ${{ matrix.option == 'remove-homebrew' && 'true' || 'false' }}
-          remove-vcpkg: ${{ matrix.option == 'remove-vcpkg' && 'true' || 'false' }}
-          remove-aws-cli: ${{ matrix.option == 'remove-aws-cli' && 'true' || 'false' }}
-          remove-aws-sam-cli: ${{ matrix.option == 'remove-aws-sam-cli' && 'true' || 'false' }}
-          remove-azure-cli: ${{ matrix.option == 'remove-azure-cli' && 'true' || 'false' }}
-          remove-gh-cli: ${{ matrix.option == 'remove-gh-cli' && 'true' || 'false' }}
-          remove-gcloud-cli: ${{ matrix.option == 'remove-gcloud-cli' && 'true' || 'false' }}
-          remove-azcopy: ${{ matrix.option == 'remove-azcopy' && 'true' || 'false' }}
-          remove-kubectl: ${{ matrix.option == 'remove-kubectl' && 'true' || 'false' }}
-          remove-helm: ${{ matrix.option == 'remove-helm' && 'true' || 'false' }}
-          remove-kind: ${{ matrix.option == 'remove-kind' && 'true' || 'false' }}
-          remove-minikube: ${{ matrix.option == 'remove-minikube' && 'true' || 'false' }}
-          remove-kustomize: ${{ matrix.option == 'remove-kustomize' && 'true' || 'false' }}
-          remove-docker-engine: ${{ matrix.option == 'remove-docker-engine' && 'true' || 'false' }}
-          remove-buildah: ${{ matrix.option == 'remove-buildah' && 'true' || 'false' }}
-          remove-podman: ${{ matrix.option == 'remove-podman' && 'true' || 'false' }}
-          remove-maven: ${{ matrix.option == 'remove-maven' && 'true' || 'false' }}
-          remove-gradle: ${{ matrix.option == 'remove-gradle' && 'true' || 'false' }}
-          remove-ant: ${{ matrix.option == 'remove-ant' && 'true' || 'false' }}
-          remove-php: ${{ matrix.option == 'remove-php' && 'true' || 'false' }}
-          remove-rust: ${{ matrix.option == 'remove-rust' && 'true' || 'false' }}
-          remove-postgresql: ${{ matrix.option == 'remove-postgresql' && 'true' || 'false' }}
-          remove-mysql: ${{ matrix.option == 'remove-mysql' && 'true' || 'false' }}
-          remove-apache: ${{ matrix.option == 'remove-apache' && 'true' || 'false' }}
-          remove-nginx: ${{ matrix.option == 'remove-nginx' && 'true' || 'false' }}
+          remove-azcopy: "true"
 
-      - name: Verify Post-Action State
+      - name: Verify runtime and outputs on Unix
+        if: runner.os != 'Windows'
         shell: bash
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
         run: |
           set -euo pipefail
+          [[ "$BEFORE" =~ ^[0-9]+$ ]]
+          [[ "$AFTER" =~ ^[0-9]+$ ]]
+          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          [[ "$PLATFORM" == "$EXPECTED_PLATFORM" ]]
+          [[ "$ARCHITECTURE" == "$EXPECTED_ARCHITECTURE" ]]
+          ! command -v azcopy >/dev/null 2>&1
+          ! command -v azcopy10 >/dev/null 2>&1
 
-          case "${{ matrix.option }}" in
-            remove-dotnet)
-              if [ -d "/usr/share/dotnet" ]; then
-                echo '.NET was not removed'
-                exit 1
-              fi
-              ;;
-            remove-android)
-              if [ -d "/usr/local/lib/android" ]; then
-                echo 'Android SDKs were not removed'
-                exit 1
-              fi
-              ;;
-            remove-haskell)
-              if [ -d "/opt/ghc" ] || \
-                 [ -d "/usr/local/.ghcup" ] || \
-                 [ -d "/home/runner/.ghcup" ] || \
-                 [ -d "/home/runner/.cabal" ] || \
-                 [ -d "/home/runner/.stack" ] || \
-                 command -v ghc >/dev/null 2>&1 || \
-                 command -v ghcup >/dev/null 2>&1 || \
-                 command -v cabal >/dev/null 2>&1 || \
-                 command -v stack >/dev/null 2>&1; then
-                echo 'Haskell artifacts were not removed'
-                exit 1
-              fi
-              ;;
-            remove-codeql)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/CodeQL" ]; then
-                echo 'CodeQL bundles were not removed'
-                exit 1
-              fi
-              ;;
-            remove-docker-images)
-              if [ "$(docker image ls -q | wc -l)" -gt 0 ]; then
-                echo 'Docker images were not removed'
-                exit 1
-              fi
-              ;;
-            remove-large-packages)
-              if dpkg -l | grep -E 'azure-cli|google-cloud-sdk|google-cloud-cli|google-chrome-stable|microsoft-edge-stable|chromium|firefox|powershell'; then
-                echo 'Large packages were not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-tools)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir" ] && [ "$(ls -A "$tools_dir")" != "" ]; then
-                echo 'Cached tools were not removed'
-                exit 1
-              fi
-              ;;
-            remove-swift)
-              if [ -d "/usr/share/swift" ] || command -v swift >/dev/null 2>&1; then
-                echo 'Swift was not removed'
-                exit 1
-              fi
-              ;;
-            remove-julia)
-              if [ -e "/usr/local/bin/julia" ] || command -v julia >/dev/null 2>&1; then
-                echo 'Julia was not removed'
-                exit 1
-              fi
-              ;;
-            remove-java)
-              if command -v javac >/dev/null 2>&1; then
-                echo 'Java was not removed'
-                exit 1
-              fi
-              ;;
-            remove-browsers)
-              if command -v google-chrome >/dev/null 2>&1 || \
-                 command -v google-chrome-stable >/dev/null 2>&1 || \
-                 command -v chromium >/dev/null 2>&1 || \
-                 command -v chromium-browser >/dev/null 2>&1 || \
-                 command -v microsoft-edge >/dev/null 2>&1 || \
-                 command -v microsoft-edge-stable >/dev/null 2>&1 || \
-                 command -v firefox >/dev/null 2>&1 || \
-                 command -v chromedriver >/dev/null 2>&1 || \
-                 command -v geckodriver >/dev/null 2>&1 || \
-                 command -v msedgedriver >/dev/null 2>&1; then
-                echo 'Browsers were not removed'
-                exit 1
-              fi
-              ;;
-            remove-powershell)
-              if command -v pwsh >/dev/null 2>&1; then
-                echo 'PowerShell was not removed'
-                exit 1
-              fi
-              ;;
-            remove-miniconda)
-              conda_root="${CONDA:-/usr/share/miniconda}"
-              if [ -d "$conda_root" ]; then
-                echo 'Miniconda was not removed'
-                exit 1
-              fi
-              ;;
-            remove-homebrew)
-              if [ -d "/home/linuxbrew" ]; then
-                echo 'Homebrew was not removed'
-                exit 1
-              fi
-              ;;
-            remove-vcpkg)
-              if [ -d "/usr/local/share/vcpkg" ] || \
-                 [ -d "/home/runner/.cache/vcpkg" ] || \
-                 [ -d "/home/runner/.vcpkg" ] || \
-                 command -v vcpkg >/dev/null 2>&1; then
-                echo 'vcpkg was not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-go)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/Go" ] || [ -d "$tools_dir/go" ]; then
-                echo 'Go toolcache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-node)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/node" ] || [ -d "$tools_dir/Node" ]; then
-                echo 'Node.js toolcache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-python)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/Python" ] || [ -d "$tools_dir/python" ]; then
-                echo 'Python toolcache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-pypy)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/PyPy" ] || [ -d "$tools_dir/pypy" ]; then
-                echo 'PyPy toolcache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-cached-ruby)
-              tools_dir="${RUNNER_TOOL_CACHE:-${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}}"
-              if [ -d "$tools_dir/Ruby" ] || [ -d "$tools_dir/ruby" ]; then
-                echo 'Ruby toolcache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-chrome)
-              if command -v google-chrome >/dev/null 2>&1 || \
-                 command -v google-chrome-stable >/dev/null 2>&1; then
-                echo 'Chrome was not removed'
-                exit 1
-              fi
-              ;;
-            remove-chromium)
-              if command -v chromium >/dev/null 2>&1 || \
-                 command -v chromium-browser >/dev/null 2>&1 || \
-                 { dpkg-query -W -f='${Package} ${Status}\n' \
-                     chromium chromium-browser chromium-codecs-ffmpeg-extra 2>/dev/null || true; } | \
-                   grep -q 'install ok installed'; then
-                echo 'Chromium was not removed'
-                exit 1
-              fi
-              ;;
-            remove-edge)
-              if command -v microsoft-edge >/dev/null 2>&1 || \
-                 command -v microsoft-edge-stable >/dev/null 2>&1; then
-                echo 'Edge was not removed'
-                exit 1
-              fi
-              ;;
-            remove-firefox)
-              if command -v firefox >/dev/null 2>&1; then
-                echo 'Firefox was not removed'
-                exit 1
-              fi
-              ;;
-            remove-webdrivers)
-              if command -v chromedriver >/dev/null 2>&1 || \
-                 command -v geckodriver >/dev/null 2>&1 || \
-                 command -v msedgedriver >/dev/null 2>&1; then
-                echo 'Webdrivers were not removed'
-                exit 1
-              fi
-              ;;
-            remove-selenium)
-              if [ -e "/usr/share/java/selenium-server.jar" ]; then
-                echo 'Selenium server was not removed'
-                exit 1
-              fi
-              ;;
-            remove-aws-cli)
-              if command -v aws >/dev/null 2>&1 || \
-                 command -v session-manager-plugin >/dev/null 2>&1 || \
-                 [ -d "/usr/local/sessionmanagerplugin" ]; then
-                echo 'AWS CLI was not removed'
-                exit 1
-              fi
-              ;;
-            remove-aws-sam-cli)
-              if command -v sam >/dev/null 2>&1; then
-                echo 'AWS SAM CLI was not removed'
-                exit 1
-              fi
-              ;;
-            remove-azure-cli)
-              if command -v az >/dev/null 2>&1; then
-                echo 'Azure CLI was not removed'
-                exit 1
-              fi
-              ;;
-            remove-gh-cli)
-              if command -v gh >/dev/null 2>&1; then
-                echo 'GitHub CLI was not removed'
-                exit 1
-              fi
-              ;;
-            remove-gcloud-cli)
-              if command -v gcloud >/dev/null 2>&1 || \
-                 command -v gsutil >/dev/null 2>&1 || \
-                 command -v bq >/dev/null 2>&1; then
-                echo 'Google Cloud CLI was not removed'
-                exit 1
-              fi
-              ;;
-            remove-azcopy)
-              if command -v azcopy >/dev/null 2>&1 || command -v azcopy10 >/dev/null 2>&1; then
-                echo 'AzCopy was not removed'
-                exit 1
-              fi
-              ;;
-            remove-kubectl)
-              if command -v kubectl >/dev/null 2>&1; then
-                echo 'kubectl was not removed'
-                exit 1
-              fi
-              ;;
-            remove-helm)
-              if command -v helm >/dev/null 2>&1; then
-                echo 'Helm was not removed'
-                exit 1
-              fi
-              ;;
-            remove-kind)
-              if command -v kind >/dev/null 2>&1; then
-                echo 'kind was not removed'
-                exit 1
-              fi
-              ;;
-            remove-minikube)
-              if command -v minikube >/dev/null 2>&1; then
-                echo 'Minikube was not removed'
-                exit 1
-              fi
-              ;;
-            remove-kustomize)
-              if command -v kustomize >/dev/null 2>&1; then
-                echo 'Kustomize was not removed'
-                exit 1
-              fi
-              ;;
-            remove-docker-engine)
-              if command -v docker >/dev/null 2>&1 || \
-                 command -v docker-compose >/dev/null 2>&1 || \
-                 command -v docker-buildx >/dev/null 2>&1 || \
-                 command -v docker-credential-ecr-login >/dev/null 2>&1 || \
-                 [ -d "/var/lib/docker" ] || \
-                 [ -d "/var/lib/containerd" ] || \
-                 [ -d "/etc/docker" ]; then
-                echo 'Docker Engine was not removed'
-                exit 1
-              fi
-              ;;
-            remove-buildah)
-              if command -v buildah >/dev/null 2>&1; then
-                echo 'Buildah was not removed'
-                exit 1
-              fi
-              ;;
-            remove-podman)
-              if command -v podman >/dev/null 2>&1; then
-                echo 'Podman was not removed'
-                exit 1
-              fi
-              ;;
-            remove-maven)
-              if command -v mvn >/dev/null 2>&1; then
-                echo 'Maven was not removed'
-                exit 1
-              fi
-              ;;
-            remove-gradle)
-              if command -v gradle >/dev/null 2>&1; then
-                echo 'Gradle was not removed'
-                exit 1
-              fi
-              ;;
-            remove-ant)
-              if command -v ant >/dev/null 2>&1; then
-                echo 'Ant was not removed'
-                exit 1
-              fi
-              ;;
-            remove-php)
-              if command -v php >/dev/null 2>&1 || command -v composer >/dev/null 2>&1; then
-                echo 'PHP tooling was not removed'
-                exit 1
-              fi
-              ;;
-            remove-rust)
-              if command -v rustc >/dev/null 2>&1 || \
-                 command -v cargo >/dev/null 2>&1 || \
-                 command -v rustup >/dev/null 2>&1 || \
-                 command -v rustdoc >/dev/null 2>&1 || \
-                 command -v rustfmt >/dev/null 2>&1 || \
-                 command -v cargo-clippy >/dev/null 2>&1 || \
-                 command -v clippy-driver >/dev/null 2>&1; then
-                echo 'Rust toolchain was not removed'
-                exit 1
-              fi
-              ;;
-            remove-postgresql)
-              if command -v psql >/dev/null 2>&1 || \
-                 command -v pg_config >/dev/null 2>&1 || \
-                 [ -d "/var/lib/postgresql" ] || \
-                 [ -d "/etc/postgresql" ] || \
-                 [ -d "/usr/lib/postgresql" ]; then
-                echo 'PostgreSQL was not removed'
-                exit 1
-              fi
-              ;;
-            remove-mysql)
-              if command -v mysql >/dev/null 2>&1 || \
-                 command -v mysqld >/dev/null 2>&1 || \
-                 command -v mariadb >/dev/null 2>&1 || \
-                 [ -d "/var/lib/mysql" ] || \
-                 [ -d "/etc/mysql" ]; then
-                echo 'MySQL/MariaDB was not removed'
-                exit 1
-              fi
-              ;;
-            remove-apache)
-              if command -v apache2 >/dev/null 2>&1 || [ -d "/etc/apache2" ]; then
-                echo 'Apache was not removed'
-                exit 1
-              fi
-              ;;
-            remove-nginx)
-              if command -v nginx >/dev/null 2>&1 || [ -d "/etc/nginx" ]; then
-                echo 'Nginx was not removed'
-                exit 1
-              fi
-              ;;
-          esac
+      - name: Verify runtime and outputs on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
+          if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
+          if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
+          if ($env:PLATFORM -ne $env:EXPECTED_PLATFORM) { throw 'Platform mismatch.' }
+          if ($env:ARCHITECTURE -ne $env:EXPECTED_ARCHITECTURE) { throw 'Architecture mismatch.' }
+          if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
+          if (Get-Command azcopy10 -ErrorAction SilentlyContinue) { throw 'AzCopy 10 alias was not removed.' }

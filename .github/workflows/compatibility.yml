@@ -1,0 +1,97 @@
+name: Runner compatibility sweep
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * 1"
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-image-smoke:
+    name: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        runner:
+          # actionlint v1.7.12 has not yet learned these official preview
+          # labels; keep this list aligned with GitHub's runner reference.
+          # .github/actionlint.yaml narrowly ignores only these preview labels.
+          - ubuntu-slim
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+          - ubuntu-26.04-arm
+          - windows-2022
+          - windows-2025
+          - windows-2025-vs2026
+          - windows-11-arm
+          - windows-11-vs2026-arm
+          - macos-15-intel
+          - macos-26-intel
+          - macos-14
+          - macos-15
+          - macos-26
+          - xcode-27
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert AzCopy fixture exists on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: command -v azcopy >/dev/null
+
+      - name: Assert AzCopy fixture exists on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command azcopy -ErrorAction SilentlyContinue)) {
+            throw 'Expected the runner image to contain AzCopy.'
+          }
+
+      - name: Exercise adapter and capability discovery
+        id: cleanup
+        uses: ./
+        with:
+          cleanup-profile: custom
+          remove-azcopy: "true"
+
+      - name: Verify outputs on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        run: |
+          set -euo pipefail
+          [[ "$BEFORE" =~ ^[0-9]+$ ]]
+          [[ "$AFTER" =~ ^[0-9]+$ ]]
+          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          ! command -v azcopy >/dev/null 2>&1
+          ! command -v azcopy10 >/dev/null 2>&1
+
+      - name: Verify outputs on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+        run: |
+          if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
+          if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
+          if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
+          if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
+          if (Get-Command azcopy10 -ErrorAction SilentlyContinue) { throw 'AzCopy 10 alias was not removed.' }

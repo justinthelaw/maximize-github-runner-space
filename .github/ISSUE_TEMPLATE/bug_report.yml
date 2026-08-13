@@ -31,7 +31,7 @@ body:
     id: runner
     attributes:
       label: Runner Image
-      description: For example ubuntu-latest, ubuntu-24.04
+      description: Include the exact label and architecture, for example ubuntu-24.04-arm, windows-latest, or macos-15-intel
       placeholder: ubuntu-latest
     validations:
       required: true
@@ -52,7 +52,7 @@ body:
     id: disk
     attributes:
       label: Disk Usage Before and After
-      description: Include `df -h` output before and after action execution
+      description: Include the action's available-bytes-before, available-bytes-after, and reclaimed-bytes outputs
     validations:
       required: true
 

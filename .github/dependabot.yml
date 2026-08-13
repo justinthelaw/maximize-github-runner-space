@@ -17,3 +17,12 @@ updates:
       pre-commit-hooks:
         patterns:
           - "*"
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      javascript-action:
+        patterns:
+          - "*"
