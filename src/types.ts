@@ -50,6 +50,12 @@ export interface Operation {
   readonly dedupeKey?: string;
   readonly blockedBy?: readonly ComponentId[];
   readonly coveredBy?: readonly ComponentId[];
+  /**
+   * Skip this narrower fallback only after one of the named operations reports
+   * that it removed the payload. Missing, not-found, unsupported, and failed
+   * covering operations leave the fallback eligible to run.
+   */
+  readonly coveredBySuccessfulOperations?: readonly string[];
   /** Run independently of component selection (currently used for swap). */
   readonly always?: boolean;
   /** Abort the action when the operation cannot preserve its state contract. */

@@ -10,7 +10,14 @@ export interface CommandOptions {
   readonly silent?: boolean;
 }
 
+interface CommandInvocation {
+  readonly executable: string;
+  readonly args: readonly string[];
+}
+
 const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
+export const TRUSTED_UNIX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+export const UNIX_SUDO_EXECUTABLE = "/usr/bin/sudo";
 
 export async function runCommand(
   executable: string,
@@ -200,25 +207,40 @@ export async function runResolvedCommand(
   return await runCommand(executable, args, options);
 }
 
+export function createElevatedInvocation(
+  context: RuntimeContext,
+  executable: string,
+  args: readonly string[],
+  effectiveUid = typeof process.getuid === "function"
+    ? process.getuid()
+    : undefined,
+): CommandInvocation | undefined {
+  if (context.platform === "windows" || effectiveUid === 0) {
+    return { executable, args };
+  }
+  if (!context.hasPasswordlessSudo) return undefined;
+
+  // Supported Linux and macOS runner definitions install sudo here. Never
+  // resolve this privilege boundary through workflow-controlled PATH entries.
+  return {
+    executable: UNIX_SUDO_EXECUTABLE,
+    args: ["-n", "--", executable, ...args],
+  };
+}
+
 export async function runElevated(
   context: RuntimeContext,
   executable: string,
   args: readonly string[],
   options: CommandOptions = {},
 ): Promise<CommandResult> {
-  if (
-    context.platform !== "windows" &&
-    typeof process.getuid === "function" &&
-    process.getuid() !== 0
-  ) {
-    if (!context.hasPasswordlessSudo) {
-      return {
-        exitCode: 126,
-        stdout: "",
-        stderr: "passwordless sudo is unavailable",
-      };
-    }
-    return await runCommand("sudo", ["-n", executable, ...args], options);
+  const invocation = createElevatedInvocation(context, executable, args);
+  if (invocation === undefined) {
+    return {
+      exitCode: 126,
+      stdout: "",
+      stderr: "passwordless sudo is unavailable",
+    };
   }
-  return await runCommand(executable, args, options);
+  return await runCommand(invocation.executable, invocation.args, options);
 }

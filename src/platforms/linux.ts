@@ -1,10 +1,12 @@
-import { mkdir, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { dirname, join, posix } from "node:path";
 import {
   commandExists,
   findCommandPath,
   runCommand,
   runElevated,
+  TRUSTED_UNIX_PATH,
 } from "../command.js";
 import { COMPONENTS } from "../components.js";
 import {
@@ -39,6 +41,149 @@ export function isStoppedSystemdUnit(result: CommandResult): boolean {
   if (result.exitCode !== 0) return false;
   const state = result.stdout.trim();
   return state === "inactive" || state === "failed";
+}
+
+const SYSTEMCTL = "/usr/bin/systemctl";
+
+const SERVICE_UNITS: Readonly<Partial<Record<ComponentId, readonly string[]>>> =
+  {
+    "docker-engine": ["docker.socket", "docker.service", "containerd.service"],
+    postgresql: ["postgresql.service"],
+    mysql: ["mysql.service", "mariadb.service"],
+    apache: ["apache2.service"],
+    nginx: ["nginx.service"],
+  };
+
+interface SystemdUnitTarget {
+  readonly component: ComponentId;
+  readonly unit: string;
+}
+
+interface SystemdUnitSnapshot extends SystemdUnitTarget {
+  readonly loadState: string;
+  readonly activeState: string;
+}
+
+export interface LinuxSystemctl {
+  show(
+    unit: string,
+    property: "LoadState" | "ActiveState",
+  ): Promise<CommandResult>;
+  stop(unit: string): Promise<CommandResult>;
+}
+
+export function linuxSystemCommandEnvironment(
+  context: RuntimeContext,
+): NodeJS.ProcessEnv {
+  return {
+    HOME: context.home,
+    USER: "runner",
+    LOGNAME: "runner",
+    PATH: TRUSTED_UNIX_PATH,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    SYSTEMD_COLORS: "0",
+    SYSTEMD_PAGER: "",
+  };
+}
+
+function systemctlFor(context: RuntimeContext): LinuxSystemctl {
+  const environment = linuxSystemCommandEnvironment(context);
+  return {
+    show: async (unit, property) =>
+      await runCommand(
+        SYSTEMCTL,
+        ["show", unit, `--property=${property}`, "--value"],
+        { env: environment, silent: true, timeoutMs: 30_000 },
+      ),
+    stop: async (unit) =>
+      await runElevated(context, SYSTEMCTL, ["stop", unit], {
+        env: environment,
+        silent: true,
+        timeoutMs: 60_000,
+      }),
+  };
+}
+
+function selectedServiceUnits(plan: CleanupPlan): readonly SystemdUnitTarget[] {
+  return (
+    Object.entries(SERVICE_UNITS) as [ComponentId, readonly string[]][]
+  ).flatMap(([component, units]) =>
+    plan.enabled.has(component)
+      ? units.map((unit) => ({ component, unit }))
+      : [],
+  );
+}
+
+function systemdFailure(result: CommandResult, detail: string): Error {
+  return new Error(result.stderr.trim() || detail);
+}
+
+async function inspectSystemdUnits(
+  targets: readonly SystemdUnitTarget[],
+  systemctl: LinuxSystemctl,
+): Promise<readonly SystemdUnitSnapshot[]> {
+  const present: SystemdUnitSnapshot[] = [];
+  for (const target of targets) {
+    const result = await systemctl.show(target.unit, "LoadState");
+    if (result.exitCode !== 0) {
+      throw systemdFailure(
+        result,
+        `could not inspect systemd unit ${target.unit}`,
+      );
+    }
+    const loadState = result.stdout.trim();
+    if (loadState === "not-found") continue;
+    if (loadState !== "loaded" && loadState !== "masked") {
+      throw new Error(
+        loadState === ""
+          ? `systemd returned no LoadState for ${target.unit}`
+          : `systemd returned unsafe LoadState '${loadState}' for ${target.unit}`,
+      );
+    }
+    const active = await systemctl.show(target.unit, "ActiveState");
+    if (active.exitCode !== 0) {
+      throw systemdFailure(
+        active,
+        `could not inspect active state for systemd unit ${target.unit}`,
+      );
+    }
+    const activeState = active.stdout.trim();
+    if (
+      ![
+        "active",
+        "activating",
+        "deactivating",
+        "failed",
+        "inactive",
+        "reloading",
+      ].includes(activeState)
+    ) {
+      throw new Error(
+        activeState === ""
+          ? `systemd returned no ActiveState for ${target.unit}`
+          : `systemd returned unsafe ActiveState '${activeState}' for ${target.unit}`,
+      );
+    }
+    present.push({ ...target, loadState, activeState });
+  }
+  return present;
+}
+
+function sameSystemdSnapshot(
+  left: readonly SystemdUnitSnapshot[],
+  right: readonly SystemdUnitSnapshot[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (unit, index) =>
+        unit.unit === right[index]?.unit &&
+        unit.component === right[index]?.component &&
+        unit.loadState === right[index]?.loadState &&
+        unit.activeState === right[index]?.activeState,
+    )
+  );
 }
 
 const APT_PACKAGES: Readonly<Partial<Record<ComponentId, readonly string[]>>> =
@@ -315,79 +460,331 @@ function dockerPruneOperation(context: RuntimeContext): Operation {
   });
 }
 
-function serviceStopOperation(
+export function createLinuxServiceStopOperation(
   context: RuntimeContext,
-  component: ComponentId,
-  services: readonly string[],
-  options: { readonly id?: string; readonly description?: string } = {},
-): Operation {
+  plan: CleanupPlan,
+  systemctl: LinuxSystemctl = systemctlFor(context),
+): Operation | undefined {
+  const targets = selectedServiceUnits(plan);
+  const first = targets[0];
+  if (first === undefined) return undefined;
+
+  let validatedSnapshot: readonly SystemdUnitSnapshot[] | undefined;
+  const validate = async (): Promise<void> => {
+    if (context.isContainer) {
+      validatedSnapshot = [];
+      return;
+    }
+    validatedSnapshot = await inspectSystemdUnits(targets, systemctl);
+  };
+
   return createFunctionOperation({
-    id: options.id ?? `service:stop:${component}`,
-    component,
-    description:
-      options.description ?? `Stop ${component} services before cleanup`,
+    id: "linux:services:stop",
+    component: first.component,
+    description: "Stop selected Linux services before cleanup",
     phase: "preflight",
     fatal: true,
+    validate,
     run: async () => {
       if (context.isContainer) {
         return { status: "unsupported", detail: "systemd unavailable" };
       }
-      if (!(await commandExists("systemctl"))) {
-        return { status: "failed", detail: "systemd is unavailable" };
-      }
-      let stopped = false;
-      for (const service of services) {
-        const unit = `${service}.service`;
-        const discovered = await runElevated(
-          context,
-          "systemctl",
-          ["show", unit, "--property=LoadState", "--value"],
-          { silent: true, timeoutMs: 30_000 },
-        );
-        if (discovered.exitCode !== 0) {
+
+      try {
+        validatedSnapshot ??= await inspectSystemdUnits(targets, systemctl);
+        // Complete-plan validation can precede this phase by several seconds.
+        // Re-read every selected unit before the first stop, so a later unit
+        // cannot fail discovery after an earlier component was mutated.
+        const immediateSnapshot = await inspectSystemdUnits(targets, systemctl);
+        if (!sameSystemdSnapshot(validatedSnapshot, immediateSnapshot)) {
           return {
             status: "failed",
-            detail:
-              discovered.stderr.trim() ||
-              `could not inspect systemd unit ${unit}`,
-          };
-        }
-        const loadState = discovered.stdout.trim();
-        if (loadState === "not-found") continue;
-        if (loadState === "") {
-          return {
-            status: "failed",
-            detail: `systemd returned no LoadState for ${unit}`,
+            detail: "systemd unit inventory changed after plan validation",
           };
         }
 
-        const result = await runElevated(context, "systemctl", ["stop", unit], {
-          silent: true,
-          timeoutMs: 60_000,
-        });
-        if (result.exitCode !== 0) {
-          return {
-            status: "failed",
-            detail: result.stderr.trim() || `could not stop ${unit}`,
-          };
+        for (const { unit } of immediateSnapshot) {
+          // Stop every loaded unit, including one observed inactive. That
+          // closes the avoidable race where an inactive unit becomes active
+          // after discovery but before its data is removed.
+          const result = await systemctl.stop(unit);
+          if (result.exitCode !== 0) {
+            return {
+              status: "failed",
+              detail: result.stderr.trim() || `could not stop ${unit}`,
+            };
+          }
+          const stoppedState = await systemctl.show(unit, "ActiveState");
+          if (!isStoppedSystemdUnit(stoppedState)) {
+            return {
+              status: "failed",
+              detail:
+                stoppedState.stderr.trim() ||
+                `${unit} did not reach a terminal stopped state`,
+            };
+          }
         }
-        const activeState = await runElevated(
-          context,
-          "systemctl",
-          ["show", unit, "--property=ActiveState", "--value"],
-          { silent: true, timeoutMs: 30_000 },
-        );
-        if (!isStoppedSystemdUnit(activeState)) {
-          return {
+
+        // A socket, timer, dependency, or restart policy can reactivate a unit
+        // while the remaining services are being stopped. Confirm the entire
+        // coordinated set is still terminal before package/data cleanup begins.
+        for (const { unit } of immediateSnapshot) {
+          const stoppedState = await systemctl.show(unit, "ActiveState");
+          if (!isStoppedSystemdUnit(stoppedState)) {
+            return {
+              status: "failed",
+              detail:
+                stoppedState.stderr.trim() ||
+                `${unit} reactivated after the coordinated stop`,
+            };
+          }
+        }
+        return immediateSnapshot.length === 0
+          ? { status: "not-found" }
+          : { status: "removed" };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+}
+
+const LINUXBREW_PREFIX = "/home/linuxbrew/.linuxbrew";
+const LINUXBREW_CANDIDATE = `${LINUXBREW_PREFIX}/bin/brew`;
+const LINUXBREW_EXECUTABLE = `${LINUXBREW_PREFIX}/Homebrew/bin/brew`;
+
+interface LinuxBrewPathStats {
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+interface LinuxBrewFileIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly size: bigint;
+  readonly modifiedNanoseconds: bigint;
+}
+
+export interface LinuxBrewPathProbe {
+  lstat(path: string): Promise<LinuxBrewPathStats>;
+  realpath(path: string): Promise<string>;
+  access(path: string, mode: number): Promise<void>;
+  identity?(path: string): Promise<LinuxBrewFileIdentity>;
+}
+
+const NODE_LINUX_BREW_PATH_PROBE: LinuxBrewPathProbe = {
+  lstat: async (path) => await lstat(path),
+  realpath: async (path) => await realpath(path),
+  access: async (path, mode) => await access(path, mode),
+  identity: async (path) => {
+    const stat = await lstat(path, { bigint: true });
+    return {
+      device: stat.dev,
+      inode: stat.ino,
+      size: stat.size,
+      modifiedNanoseconds: stat.mtimeNs,
+    };
+  },
+};
+
+export interface ResolvedLinuxBrew {
+  readonly executable: string;
+  readonly identity?: LinuxBrewFileIdentity;
+}
+
+async function resolveDefinitionLinuxBrew(
+  probe: LinuxBrewPathProbe = NODE_LINUX_BREW_PATH_PROBE,
+): Promise<ResolvedLinuxBrew | undefined> {
+  try {
+    const candidate = await probe.lstat(LINUXBREW_CANDIDATE);
+    if (!candidate.isSymbolicLink()) return undefined;
+    if (
+      posix.normalize(await probe.realpath(LINUXBREW_CANDIDATE)) !==
+      LINUXBREW_EXECUTABLE
+    ) {
+      return undefined;
+    }
+
+    const executable = await probe.lstat(LINUXBREW_EXECUTABLE);
+    if (executable.isSymbolicLink() || !executable.isFile()) return undefined;
+    await probe.access(LINUXBREW_EXECUTABLE, constants.X_OK);
+    return {
+      executable: LINUXBREW_EXECUTABLE,
+      ...(probe.identity === undefined
+        ? {}
+        : { identity: await probe.identity(LINUXBREW_EXECUTABLE) }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export async function resolveDefinitionLinuxBrewExecutable(
+  probe: LinuxBrewPathProbe = NODE_LINUX_BREW_PATH_PROBE,
+): Promise<string | undefined> {
+  return (await resolveDefinitionLinuxBrew(probe))?.executable;
+}
+
+type LinuxBrewResolver = () => Promise<ResolvedLinuxBrew | undefined>;
+type LinuxBrewRunner = (
+  executable: string,
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+) => Promise<CommandResult>;
+
+function linuxBrewMutablePaths(context: RuntimeContext): {
+  readonly cache: string;
+  readonly logs: string;
+} {
+  const cache = posix.join(context.home, ".cache", "Homebrew");
+  return { cache, logs: posix.join(cache, "Logs") };
+}
+
+function linuxBrewEnvironment(context: RuntimeContext): NodeJS.ProcessEnv {
+  const paths = linuxBrewMutablePaths(context);
+  return {
+    HOME: context.home,
+    USER: "runner",
+    LOGNAME: "runner",
+    SHELL: "/bin/bash",
+    PATH: TRUSTED_UNIX_PATH,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    TERM: "dumb",
+    CI: "true",
+    GITHUB_ACTIONS: "true",
+    XDG_CACHE_HOME: posix.join(context.home, ".cache"),
+    // /dev/null cannot contain Homebrew's user brew.env. The system and
+    // definition-prefix configuration files are separately required absent.
+    XDG_CONFIG_HOME: "/dev/null",
+    HOMEBREW_PREFIX: LINUXBREW_PREFIX,
+    HOMEBREW_REPOSITORY: `${LINUXBREW_PREFIX}/Homebrew`,
+    HOMEBREW_CELLAR: `${LINUXBREW_PREFIX}/Cellar`,
+    HOMEBREW_CACHE: paths.cache,
+    HOMEBREW_LOGS: paths.logs,
+    HOMEBREW_TEMP: "/tmp",
+    HOMEBREW_NO_ANALYTICS: "1",
+    HOMEBREW_NO_AUTO_UPDATE: "1",
+    HOMEBREW_NO_AUTOREMOVE: "1",
+  };
+}
+
+const LINUXBREW_CONFIG_FILES = [
+  "/etc/homebrew/brew.env",
+  `${LINUXBREW_PREFIX}/etc/homebrew/brew.env`,
+] as const;
+
+export type LinuxBrewConfigProbe = (
+  path: string,
+) => Promise<LinuxBrewPathStats | undefined>;
+
+const NODE_LINUX_BREW_CONFIG_PROBE: LinuxBrewConfigProbe = async (path) => {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+};
+
+async function findLinuxBrewConfig(
+  probe: LinuxBrewConfigProbe,
+): Promise<string | undefined> {
+  for (const path of LINUXBREW_CONFIG_FILES) {
+    if ((await probe(path)) !== undefined) return path;
+  }
+  return undefined;
+}
+
+export function createLinuxHomebrewCleanupOperation(
+  context: RuntimeContext,
+  resolveExecutable: LinuxBrewResolver = async () =>
+    await resolveDefinitionLinuxBrew(),
+  execute: LinuxBrewRunner = async (executable, args, environment) =>
+    await runCommand(executable, args, {
+      env: environment,
+      silent: false,
+      timeoutMs: 10 * 60_000,
+    }),
+  inspectConfig: LinuxBrewConfigProbe = NODE_LINUX_BREW_CONFIG_PROBE,
+): Operation {
+  let validationComplete = false;
+  let validatedExecutable: ResolvedLinuxBrew | undefined;
+  let validatedConfig: string | undefined;
+  const validateMutablePaths = async (): Promise<void> => {
+    const paths = linuxBrewMutablePaths(context);
+    await assertSafeDirectoryTarget(paths.cache, [context.home], context);
+    await assertSafeDirectoryTarget(paths.logs, [paths.cache], context);
+  };
+  const validate = async (): Promise<void> => {
+    validatedExecutable = await resolveExecutable();
+    if (validatedExecutable !== undefined) {
+      await validateMutablePaths();
+      validatedConfig = await findLinuxBrewConfig(inspectConfig);
+    }
+    validationComplete = true;
+  };
+  const sameExecutable = (
+    current: ResolvedLinuxBrew | undefined,
+    validated: ResolvedLinuxBrew | undefined,
+  ): boolean =>
+    current?.executable === validated?.executable &&
+    current?.identity?.device === validated?.identity?.device &&
+    current?.identity?.inode === validated?.identity?.inode &&
+    current?.identity?.size === validated?.identity?.size &&
+    current?.identity?.modifiedNanoseconds ===
+      validated?.identity?.modifiedNanoseconds;
+
+  return createFunctionOperation({
+    id: "linux:brew:cleanup",
+    component: "homebrew",
+    description:
+      "Clean stale Linuxbrew artifacts while preserving installed packages",
+    phase: "package",
+    dedupeKey: "linux:brew:cleanup",
+    validate,
+    run: async () => {
+      if (!validationComplete) await validate();
+      const executable = await resolveExecutable();
+      if (!sameExecutable(executable, validatedExecutable)) {
+        return {
+          status: "failed",
+          detail: "Linuxbrew executable changed after plan validation",
+        };
+      }
+      if (executable === undefined) return { status: "not-found" };
+      await validateMutablePaths();
+      const config = await findLinuxBrewConfig(inspectConfig);
+      if (config !== undefined || validatedConfig !== undefined) {
+        return {
+          status: "unsupported",
+          detail: `Homebrew configuration can override cleanup paths (${config ?? validatedConfig})`,
+        };
+      }
+
+      // The pinned runner-image definition installs no formulae or casks.
+      // A recursive prefix removal or `uninstall --force` would therefore own
+      // workflow additions, not definition content. Native cleanup removes
+      // only stale package-manager artifacts and retains current packages.
+      const result = await execute(
+        LINUXBREW_CANDIDATE,
+        ["cleanup", "--prune=120"],
+        linuxBrewEnvironment(context),
+      );
+      return result.exitCode === 0
+        ? {
+            status: "removed",
+            detail: "installed formulae, casks, and the prefix were preserved",
+          }
+        : {
             status: "failed",
             detail:
-              activeState.stderr.trim() ||
-              `${unit} did not reach a terminal stopped state`,
+              result.stderr.trim() ||
+              `Linuxbrew cleanup exited ${result.exitCode}`,
           };
-        }
-        stopped = true;
-      }
-      return stopped ? { status: "removed" } : { status: "not-found" };
     },
   });
 }
@@ -1077,24 +1474,8 @@ export async function createLinuxAdapter(
         "/usr/share/java/selenium-server.jar",
       );
 
-      operations.push(
-        serviceStopOperation(
-          context,
-          "docker-engine",
-          ["docker", "containerd"],
-          {
-            id: "docker:stop",
-            description:
-              "Stop Docker and containerd before removing their data",
-          },
-        ),
-      );
-      operations.push(
-        serviceStopOperation(context, "postgresql", ["postgresql"]),
-        serviceStopOperation(context, "mysql", ["mysql", "mariadb"]),
-        serviceStopOperation(context, "apache", ["apache2"]),
-        serviceStopOperation(context, "nginx", ["nginx"]),
-      );
+      add(createLinuxServiceStopOperation(context, plan));
+      operations.push(createLinuxHomebrewCleanupOperation(context));
 
       const fixedPaths: readonly [
         component: ComponentId,
@@ -1259,12 +1640,6 @@ export async function createLinuxAdapter(
           join(home, ".cache", "conda"),
           [home],
           "Remove Conda download cache",
-        ],
-        [
-          "homebrew",
-          "/home/linuxbrew/.linuxbrew",
-          ["/home/linuxbrew"],
-          "Remove Linuxbrew installation",
         ],
         ["vcpkg", vcpkgRoot, ["/usr/local/share"], "Remove vcpkg"],
         ["vcpkg", join(home, ".cache", "vcpkg"), [home], "Remove vcpkg cache"],

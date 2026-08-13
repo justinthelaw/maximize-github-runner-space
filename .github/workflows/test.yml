@@ -107,6 +107,7 @@ jobs:
           test -d /usr/share/dotnet
           test -d "${RUNNER_TOOL_CACHE}/node"
           test -d "${RUNNER_TOOL_CACHE}/Python"
+          test -x /home/linuxbrew/.linuxbrew/bin/brew
           command -v azcopy >/dev/null
           command -v firefox >/dev/null
           command -v google-chrome >/dev/null
@@ -173,6 +174,7 @@ jobs:
           test -d /usr/share/dotnet
           test -d "${RUNNER_TOOL_CACHE}/node"
           test ! -e "${RUNNER_TOOL_CACHE}/Python"
+          test -x /home/linuxbrew/.linuxbrew/bin/brew
           command -v firefox >/dev/null
           if command -v google-chrome >/dev/null 2>&1; then
             echo "google-chrome should have been removed" >&2
@@ -205,6 +207,7 @@ jobs:
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
           test ! -e /usr/share/dotnet
+          test -x /home/linuxbrew/.linuxbrew/bin/brew
 
       - name: Remove the managed swapfile
         uses: ./

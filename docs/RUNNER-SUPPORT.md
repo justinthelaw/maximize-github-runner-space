@@ -210,7 +210,7 @@ Pinned manifests:
 | Java/build tools | `/usr/lib/jvm/temurin-*`, hosted Java toolcache, versioned Maven/Gradle under `/usr/share` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-java-tools.sh)) | Versions vary by label |
 | PowerShell | `/opt/microsoft/powershell/7` or apt package ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-powershell.sh)) | Installer mode can vary |
 | Miniconda | `$CONDA`, currently `/usr/share/miniconda` | Absent on arm64 and Ubuntu 26 |
-| Homebrew | `/home/linuxbrew/.linuxbrew` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-homebrew.sh)) | Not added to PATH by default |
+| Homebrew | Verified `/home/linuxbrew/.linuxbrew/Homebrew/bin/brew` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-homebrew.sh)) | The definition installs no formulae or casks and does not add Homebrew to PATH; cleanup preserves the prefix and installed packages |
 | vcpkg | `$VCPKG_INSTALLATION_ROOT`, currently `/usr/local/share/vcpkg` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-vcpkg.sh)) | Present on x64 and arm64 |
 | Browsers | apt packages plus manifest driver variables and `$SELENIUM_JAR_PATH` | arm64 has Firefox/Selenium but no Chrome, Chromium, or Edge |
 | Cloud/Kubernetes | apt packages or resolved `/usr/local/bin` tools; Ubuntu 26 arm64 GCloud uses `/opt/google-cloud-sdk` ([GCloud installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/ubuntu/scripts/build/install-google-cloud-cli.sh)) | Capability discovery is required |
@@ -246,19 +246,21 @@ Pinned manifests:
 
 | Component | Definition-derived location or manager | Architecture rule |
 | --- | --- | --- |
-| Homebrew | Resolve `brew --prefix` and `brew --cache` | `/usr/local` on Intel; `/opt/homebrew` on arm64. Never recursively delete either prefix. |
+| Homebrew | Verify the architecture-specific definition executable, inventory packages through it, and remove only finite definition-listed identities | `/usr/local` on Intel; `/opt/homebrew` on arm64. Never recursively delete either prefix or execute a PATH-selected shim. |
 | .NET | `$HOME/.dotnet`; resolved `/usr/local/bin/dotnet` link ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-dotnet.sh)) | Same user root on both architectures |
 | Android | `$ANDROID_SDK_ROOT`, currently `$HOME/Library/Android/sdk` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-android-sdk.sh)) | Same user-relative root |
 | CodeQL | Hosted toolcache `CodeQL` directory ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-codeql-bundle.sh)) | Use runner toolcache, not a fixed `/opt` path |
 | Java | Hosted Java toolcache plus links under `/Library/Java/JavaVirtualMachines` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-openjdk.sh)) | JDK environment variables encode architecture |
 | vcpkg | `/usr/local/share/vcpkg` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-vcpkg.sh)) | Same definition on both architectures |
 | Rust | Homebrew-managed Rustup plus `$HOME/.cargo` and `$HOME/.rustup` ([installer](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/scripts/build/install-rust.sh)) | Package-aware uninstall first |
-| Drivers | Chrome `/usr/local/share/chromedriver-mac-{x64,arm64}`; Edge `/usr/local/share/edge_driver`; Gecko through `brew --prefix geckodriver` | Never guess the Gecko Homebrew prefix |
+| Drivers | Chrome `/usr/local/share/chromedriver-mac-{x64,arm64}`; Edge `/usr/local/share/edge_driver`; Gecko through its exact Homebrew formula identity | Never guess a Homebrew prefix from workflow input |
 | Xcode | Dynamically enumerate `/Applications/Xcode_*.app`; resolve the selected developer directory with `xcode-select -p`; versions come from the pinned [14](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-14.json), [15](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-15.json), [26](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-26.json), and [Xcode 27](https://github.com/actions/runner-images/blob/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24/images/macos/toolsets/toolset-xcode-27.json) toolsets | Preserve the selected Xcode and `/Applications/Xcode.app` relationship |
 
 Many macOS project tools and CLIs are Homebrew formulae or casks. They are
-removed by exact package identity followed by `brew cleanup`, not by deleting
-the Homebrew prefix. Current macOS manifests omit GCloud, Kubernetes tools,
+removed from a finite definition-derived identity list through the verified
+Homebrew executable, followed by native cleanup; the action does not delete the
+prefix or uninstall every item in runtime inventory. Unknown packages added by
+an earlier workflow step are preserved. Current macOS manifests omit GCloud, Kubernetes tools,
 Docker/Buildah/Podman, Miniconda, Haskell, PostgreSQL, MySQL, Apache, and Nginx.
 PHP is present only on current Intel manifests.
 
@@ -377,9 +379,18 @@ legacy Ubuntu `remove-docker-images` volume-cleanup contract. Protect
 `ubuntu-slim` and current Windows arm64 images do not expose a supported Docker
 daemon cleanup.
 
-### Homebrew and macOS
+### Homebrew
 
-Use exact formula/cask identity and Homebrew's supported
+The pinned Ubuntu definition installs the Linuxbrew package manager but
+explicitly installs no formulae or casks. Consequently, the action cannot
+attribute anything in its Cellar to the runner image after a workflow has
+started. It verifies the exact definition-owned executable and runs only native
+stale-artifact cleanup. It does not recursively remove the Linuxbrew prefix or
+uninstall formulae, casks, or packages added by an earlier workflow step. This
+is intentionally safer than the v0.11 broad prefix deletion and can reclaim
+less space.
+
+On macOS, use exact formula/cask identity and Homebrew's supported
 [`uninstall`](https://docs.brew.sh/Manpage#uninstall-remove-rm-options-installed_formulainstalled_cask-)
 and [`cleanup`](https://docs.brew.sh/Manpage#cleanup-options-formulacask)
 operations. Never recursively delete `/usr/local`, `/opt/homebrew`, or the
@@ -492,7 +503,9 @@ strategy separates deterministic behavior from destructive image tests.
 3. Smoke one representative from each remaining environment class with the
    shared platform-smoke composite:
    `ubuntu-24.04-arm`, `ubuntu-slim`, `windows-latest`, `windows-11-arm`,
-   `macos-latest`, and `macos-15-intel`.
+   `macos-latest`, and `macos-15-intel`. Every row removes a known-present
+   AzCopy fixture; macOS additionally exercises a definition-owned Homebrew
+   package while a workflow-controlled `brew` PATH shim is present.
 Runtime jobs depend on the quality job, have explicit timeouts, and use bounded
 matrix parallelism. Superseded pull-request and branch runs are cancelled.
 Failures in Test's Quality job therefore do not launch destructive matrices,

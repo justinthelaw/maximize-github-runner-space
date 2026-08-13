@@ -140,6 +140,7 @@ export function createFunctionOperation(options: {
   readonly dedupeKey?: string;
   readonly blockedBy?: readonly ComponentId[];
   readonly coveredBy?: readonly ComponentId[];
+  readonly coveredBySuccessfulOperations?: readonly string[];
   readonly always?: boolean;
   readonly fatal?: boolean;
   readonly validate?: () => Promise<void>;
@@ -159,6 +160,11 @@ export function createFunctionOperation(options: {
     ...(options.coveredBy === undefined
       ? {}
       : { coveredBy: options.coveredBy }),
+    ...(options.coveredBySuccessfulOperations === undefined
+      ? {}
+      : {
+          coveredBySuccessfulOperations: options.coveredBySuccessfulOperations,
+        }),
     ...(options.always === undefined ? {} : { always: options.always }),
     ...(options.fatal === undefined ? {} : { fatal: options.fatal }),
     ...(options.validate === undefined ? {} : { validate: options.validate }),
@@ -237,9 +243,75 @@ async function runBounded(
   return results;
 }
 
+const PHASES = ["preflight", "package", "filesystem", "system"] as const;
+
+function assertValidResultCoverage(operations: readonly Operation[]): void {
+  const byId = new Map<string, Operation[]>();
+  for (const operation of operations) {
+    const matching = byId.get(operation.id) ?? [];
+    matching.push(operation);
+    byId.set(operation.id, matching);
+  }
+
+  const executionOrder = new Map<Operation, number>();
+  let cursor = 0;
+  for (const phase of PHASES) {
+    for (const operation of operations) {
+      if (operation.phase === phase) executionOrder.set(operation, cursor++);
+    }
+  }
+
+  for (const operation of operations) {
+    for (const coveringId of operation.coveredBySuccessfulOperations ?? []) {
+      const covering = byId.get(coveringId) ?? [];
+      if (covering.length === 0) continue;
+      if (covering.length > 1) {
+        throw new Error(
+          `${operation.id} has an ambiguous successful-operation coverage dependency on ${coveringId}`,
+        );
+      }
+      const coveringOperation = covering[0];
+      if (coveringOperation === undefined) continue;
+      const coveringOrder = executionOrder.get(coveringOperation);
+      const fallbackOrder = executionOrder.get(operation);
+      if (
+        coveringOrder === undefined ||
+        fallbackOrder === undefined ||
+        coveringOrder >= fallbackOrder ||
+        (operation.phase === "filesystem" &&
+          coveringOperation.phase === "filesystem")
+      ) {
+        throw new Error(
+          `${operation.id} must run after its serialized coverage dependency ${coveringId}`,
+        );
+      }
+    }
+  }
+}
+
+function successfulCoveringOperation(
+  operation: Operation,
+  resultsById: ReadonlyMap<string, OperationResult>,
+): string | undefined {
+  return operation.coveredBySuccessfulOperations?.find(
+    (id) => resultsById.get(id)?.status === "removed",
+  );
+}
+
+function isCoveredBySuccessfulOperation(
+  operation: Operation,
+  resultsById: ReadonlyMap<string, OperationResult>,
+): boolean {
+  const coveringId = successfulCoveringOperation(operation, resultsById);
+  if (coveringId === undefined) return false;
+  core.info(`• ${operation.description} (covered by successful ${coveringId})`);
+  return true;
+}
+
 export async function executeOperations(
   operations: readonly Operation[],
 ): Promise<readonly OperationResult[]> {
+  assertValidResultCoverage(operations);
   const validationFailures: string[] = [];
   for (const operation of operations) {
     if (operation.validate === undefined) continue;
@@ -257,22 +329,36 @@ export async function executeOperations(
   }
 
   const results: OperationResult[] = [];
-  for (const phase of [
-    "preflight",
-    "package",
-    "filesystem",
-    "system",
-  ] as const) {
+  const resultsById = new Map<string, OperationResult>();
+  for (const phase of PHASES) {
     const phaseOperations = operations.filter(
       (operation) => operation.phase === phase,
     );
     if (phaseOperations.length === 0) continue;
     await core.group(`${phase} cleanup`, async () => {
-      const phaseResults =
-        phase === "filesystem"
-          ? await runBounded(phaseOperations, 4)
-          : await runBounded(phaseOperations, 1);
-      results.push(...phaseResults);
+      if (phase === "filesystem") {
+        const eligible = phaseOperations.filter(
+          (operation) =>
+            !isCoveredBySuccessfulOperation(operation, resultsById),
+        );
+        const phaseResults = await runBounded(eligible, 4);
+        results.push(...phaseResults);
+        for (let index = 0; index < eligible.length; index++) {
+          const operation = eligible[index];
+          const result = phaseResults[index];
+          if (operation !== undefined && result !== undefined) {
+            resultsById.set(operation.id, result);
+          }
+        }
+        return;
+      }
+
+      for (const operation of phaseOperations) {
+        if (isCoveredBySuccessfulOperation(operation, resultsById)) continue;
+        const result = await runOne(operation);
+        results.push(result);
+        resultsById.set(operation.id, result);
+      }
     });
   }
   return results;

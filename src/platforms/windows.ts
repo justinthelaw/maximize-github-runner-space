@@ -737,7 +737,6 @@ const WINDOWS_SDK_COMPONENTS = [
 function windowsSdkOperation(
   paths: WindowsPaths,
   instances: AsyncValue<readonly VisualStudioInstance[]>,
-  coveredBy?: readonly ComponentId[],
 ): Operation {
   return createFunctionOperation({
     id: "windows:windows-sdk:remove-components",
@@ -745,7 +744,7 @@ function windowsSdkOperation(
     description: "Remove definition-listed Windows SDK and WDK components",
     phase: "package",
     dedupeKey: "windows:windows-sdk:remove-components",
-    ...(coveredBy === undefined ? {} : { coveredBy }),
+    coveredBySuccessfulOperations: ["windows:visual-studio:uninstall"],
     validate: async () => {
       await instances();
     },
@@ -1589,23 +1588,12 @@ export async function createWindowsAdapter(
       );
       operations.push(dockerEngineOperation(context, paths));
 
-      // A complete Visual Studio uninstall includes its SDK workloads. Avoid a
-      // costly modify pass immediately before removing the same instance, but
-      // schedule it when the full uninstall is blocked to honor a protected
-      // overlapping toolchain.
-      const visualStudioUninstallBlocked = VISUAL_STUDIO_OVERLAPS.some(
-        (component) => plan.skipped.has(component),
-      );
-      operations.push(
-        windowsSdkOperation(
-          paths,
-          visualStudioInstances,
-          plan.enabled.has("visual-studio") && !visualStudioUninstallBlocked
-            ? ["visual-studio"]
-            : undefined,
-        ),
-      );
+      // A successful complete Visual Studio uninstall includes its SDK
+      // workloads. Keep the narrower SDK operation as an outcome-dependent
+      // fallback so an absent or failed broad uninstall does not suppress an
+      // explicitly selected SDK cleanup.
       operations.push(visualStudioOperation(paths, visualStudioInstances));
+      operations.push(windowsSdkOperation(paths, visualStudioInstances));
 
       // Retaining Visual Studio while stripping one of its definition-owned
       // SDK/toolchain roots can leave the selected instance unusable.  A

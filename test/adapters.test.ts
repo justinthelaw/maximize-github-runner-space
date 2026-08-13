@@ -233,6 +233,31 @@ test("skipping Visual Studio preserves every overlapping Windows toolchain", asy
   );
 });
 
+test("Windows SDK cleanup is an outcome-dependent Visual Studio fallback", async () => {
+  const adapter = await createWindowsAdapter(contextFor("windows"));
+  const plan = planFor("visual-studio", "windows-sdk", "azcopy");
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+  const visualStudioIndex = prepared.findIndex(
+    ({ id }) => id === "windows:visual-studio:uninstall",
+  );
+  const windowsSdkIndex = prepared.findIndex(
+    ({ id }) => id === "windows:windows-sdk:remove-components",
+  );
+  const windowsSdk = prepared[windowsSdkIndex];
+
+  assert.notEqual(visualStudioIndex, -1);
+  assert.notEqual(windowsSdkIndex, -1);
+  assert.ok(visualStudioIndex < windowsSdkIndex);
+  assert.deepEqual(windowsSdk?.coveredBySuccessfulOperations, [
+    "windows:visual-studio:uninstall",
+  ]);
+  assert.equal(windowsSdk?.coveredBy, undefined);
+  assert.equal(
+    prepared.some(({ component }) => component === "azcopy"),
+    true,
+  );
+});
+
 for (const protectedPayload of [
   "android",
   "dotnet",
@@ -258,6 +283,11 @@ for (const protectedPayload of [
     assert.equal(
       prepared.some(({ component }) => component === protectedPayload),
       false,
+    );
+    assert.equal(
+      prepared.some(({ id }) => id === "windows:windows-sdk:remove-components"),
+      protectedPayload !== "windows-sdk",
+      "targeted SDK cleanup should remain when only the broad uninstall is blocked",
     );
     assert.equal(
       prepared.some(({ component }) => component === "azcopy"),
@@ -307,13 +337,14 @@ test("Linux Docker data cleanup has a fatal service-stop precondition", async ()
   const adapter = await createLinuxAdapter(contextFor("linux"));
   const plan = planFor("docker-engine");
   const prepared = prepareOperations(await adapter.operations(plan), plan);
-  const stop = prepared.find(({ id }) => id === "docker:stop");
+  const stop = prepared.find(({ id }) => id === "linux:services:stop");
   const data = prepared.find(
     ({ id }) => id === "docker-engine:/var/lib/docker",
   );
 
   assert.equal(stop?.phase, "preflight");
   assert.equal(stop?.fatal, true);
+  assert.equal(typeof stop?.validate, "function");
   assert.equal(data?.phase, "filesystem");
 });
 

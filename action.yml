@@ -60,7 +60,7 @@ inputs:
     required: false
     default: "false"
   remove-homebrew:
-    description: "Removes Homebrew-managed artifacts without deleting an unchecked prefix"
+    description: "Runs conservative Linuxbrew cleanup or removes definition-listed macOS packages without deleting either prefix"
     required: false
     default: "false"
   remove-vcpkg:

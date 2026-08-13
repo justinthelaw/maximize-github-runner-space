@@ -251,7 +251,7 @@ and defaults. The three OS-specific inputs at the end are additive in `v0.12.0`.
 | --- | --- | --- | --- |
 | `remove-powershell` | `powershell` | Linux, macOS, Windows | Remove runner-image PowerShell when safely discoverable. |
 | `remove-miniconda` | `miniconda` | Linux, Windows | Remove the environment-defined Miniconda installation and user cache. |
-| `remove-homebrew` | `homebrew` | Linux, macOS | Remove Linuxbrew or package-aware Homebrew artifacts without recursively deleting the macOS prefix. |
+| `remove-homebrew` | `homebrew` | Linux, macOS | Run conservative native cleanup for verified Linuxbrew, or uninstall only finite definition-listed macOS identities; preserve both prefixes and unknown workflow-installed packages. |
 | `remove-vcpkg` | `vcpkg` | Linux, macOS, Windows | Remove the environment-defined vcpkg installation and cache. |
 | `remove-browsers` | `browsers` | Linux, macOS, Windows | Remove applicable browsers, drivers, and Selenium as one group. |
 | `remove-chrome` | `chrome` | Linux, macOS, Windows | Remove Google Chrome when installed. |
@@ -348,8 +348,8 @@ of an image.
 
 For Ubuntu users moving from `v0.11.0`:
 
-- Existing input names, defaults, `max` behavior, `custom` behavior, skips, and
-  opt-in swap semantics remain supported.
+- Existing input names, defaults, `max`/`custom` profile-selection semantics,
+  skips, and opt-in swap semantics remain supported.
 - No-input usage remains aggressive `max`; it does not become a no-op.
 - The new OS-specific components do not apply to Ubuntu.
 - Image-absent components now produce explicit no-op statuses.

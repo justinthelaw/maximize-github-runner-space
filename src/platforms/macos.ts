@@ -1,6 +1,7 @@
-import { access, mkdir, readdir, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, sep } from "node:path";
-import { commandExists, runCommand, runResolvedCommand } from "../command.js";
+import { runCommand, TRUSTED_UNIX_PATH } from "../command.js";
 import { COMPONENTS } from "../components.js";
 import {
   createFunctionOperation,
@@ -9,7 +10,9 @@ import {
 import { assertSafeDirectoryTarget } from "../safety.js";
 import type {
   Adapter,
+  Architecture,
   CleanupPlan,
+  CommandResult,
   ComponentId,
   Operation,
   OperationResult,
@@ -20,6 +23,12 @@ const APPLICATIONS_ROOT = "/Applications";
 const LOCAL_ROOT = "/usr/local";
 const LOCAL_BIN = `${LOCAL_ROOT}/bin`;
 const LOCAL_SHARE = `${LOCAL_ROOT}/share`;
+const MACOS_RUNNER_HOME = "/Users/runner";
+const MACOS_BREW_TEMP = "/private/tmp";
+// Homebrew derives its user configuration directory from XDG_CONFIG_HOME.
+// A non-directory system device makes `${XDG_CONFIG_HOME}/homebrew/brew.env`
+// unreadable without trusting a workflow-selected or workflow-writable path.
+const DISABLED_BREW_USER_CONFIG_ROOT = "/dev/null";
 
 const SUPPORTED = new Set<ComponentId>(
   COMPONENTS.filter((component) =>
@@ -32,6 +41,7 @@ type BrewPackageKind = "formula" | "cask";
 interface BrewPackageDefinition {
   readonly kind: BrewPackageKind;
   readonly aliases: readonly string[];
+  readonly tap?: string;
   readonly components: readonly ComponentId[];
   readonly description: string;
 }
@@ -79,6 +89,7 @@ const BREW_PACKAGES = [
   {
     kind: "formula",
     aliases: ["aws-sam-cli"],
+    tap: "aws/tap",
     components: ["aws-sam-cli"],
     description: "Remove AWS SAM CLI with Homebrew",
   },
@@ -174,6 +185,90 @@ interface BrewState {
   readonly inventory: () => Promise<BrewInventory>;
 }
 
+interface BrewExecutionOptions {
+  readonly silent: boolean;
+  readonly timeoutMs: number;
+}
+
+export type MacOSBrewRunner = (
+  executable: string,
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+  options: BrewExecutionOptions,
+) => Promise<CommandResult>;
+
+export interface MacOSAdapterDependencies {
+  readonly resolveBrewExecutable?: (
+    architecture: Architecture,
+  ) => Promise<string | undefined>;
+  readonly executeBrew?: MacOSBrewRunner;
+  readonly inspectBrewConfig?: BrewConfigProbe;
+}
+
+interface BrewPathStats {
+  isFile(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+export interface BrewPathProbe {
+  lstat(path: string): Promise<BrewPathStats>;
+  realpath(path: string): Promise<string>;
+  access(path: string, mode: number): Promise<void>;
+}
+
+interface BrewDefinition {
+  readonly candidate: string;
+  readonly candidateKind: "file" | "symlink";
+  readonly executable: string;
+}
+
+const BREW_DEFINITIONS: Readonly<Record<Architecture, BrewDefinition>> = {
+  arm64: {
+    candidate: "/opt/homebrew/bin/brew",
+    candidateKind: "file",
+    executable: "/opt/homebrew/bin/brew",
+  },
+  x64: {
+    candidate: "/usr/local/bin/brew",
+    candidateKind: "symlink",
+    executable: "/usr/local/Homebrew/bin/brew",
+  },
+};
+
+const NODE_BREW_PATH_PROBE: BrewPathProbe = {
+  lstat: async (path) => await lstat(path),
+  realpath: async (path) => await realpath(path),
+  access: async (path, mode) => await access(path, mode),
+};
+
+const BREW_CONFIG_FILES: Readonly<Record<Architecture, readonly string[]>> = {
+  arm64: ["/etc/homebrew/brew.env", "/opt/homebrew/etc/homebrew/brew.env"],
+  x64: ["/etc/homebrew/brew.env", "/usr/local/etc/homebrew/brew.env"],
+};
+
+export type BrewConfigProbe = (
+  path: string,
+) => Promise<BrewPathStats | undefined>;
+
+const NODE_BREW_CONFIG_PROBE: BrewConfigProbe = async (path) => {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+};
+
+async function findBrewConfig(
+  architecture: Architecture,
+  probe: BrewConfigProbe,
+): Promise<string | undefined> {
+  for (const path of BREW_CONFIG_FILES[architecture]) {
+    if ((await probe(path)) !== undefined) return path;
+  }
+  return undefined;
+}
+
 function exactDefinitionPath(
   value: string | undefined,
   fallback: string,
@@ -209,37 +304,72 @@ function removeOperation(
   });
 }
 
-async function resolveBrewExecutable(
-  context: RuntimeContext,
+export async function resolveDefinitionBrewExecutable(
+  architecture: Architecture,
+  probe: BrewPathProbe = NODE_BREW_PATH_PROBE,
 ): Promise<string | undefined> {
-  const candidates =
-    context.architecture === "arm64"
-      ? ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
-      : ["/usr/local/bin/brew", "/opt/homebrew/bin/brew"];
+  const definition = BREW_DEFINITIONS[architecture];
+  try {
+    // The official installer creates an architecture-specific regular file on
+    // Apple Silicon and a fixed link on Intel. Resolve that definition path
+    // without executing anything and require its exact target; an executable
+    // found on workflow-controlled PATH is never considered.
+    const candidate = await probe.lstat(definition.candidate);
+    const candidateMatchesDefinition =
+      definition.candidateKind === "symlink"
+        ? candidate.isSymbolicLink()
+        : candidate.isFile() && !candidate.isSymbolicLink();
+    if (!candidateMatchesDefinition) return undefined;
 
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return candidate;
-    } catch {
-      // Try the next definition-derived prefix.
+    const resolved = normalize(await probe.realpath(definition.candidate));
+    if (resolved !== normalize(definition.executable)) return undefined;
+
+    // Execute the resolved repository file instead of traversing the link
+    // again after verification. The definition target itself must not be a
+    // link and must be an executable regular file.
+    if (definition.executable !== definition.candidate) {
+      const executable = await probe.lstat(definition.executable);
+      if (executable.isSymbolicLink() || !executable.isFile()) return undefined;
     }
+    await probe.access(definition.executable, constants.X_OK);
+    return definition.executable;
+  } catch {
+    return undefined;
   }
-
-  if (!(await commandExists("brew"))) return undefined;
-  const resolved = await runResolvedCommand("brew", ["--prefix"], {
-    silent: true,
-    timeoutMs: 10_000,
-  });
-  return resolved.exitCode === 0 ? "brew" : undefined;
 }
+
+const NODE_MACOS_BREW_RUNNER: MacOSBrewRunner = async (
+  executable,
+  args,
+  environment,
+  options,
+) =>
+  await runCommand(executable, args, {
+    env: environment,
+    silent: options.silent,
+    timeoutMs: options.timeoutMs,
+  });
 
 function brewEnvironment(): NodeJS.ProcessEnv {
   return {
-    ...process.env,
+    CI: "1",
+    HOME: MACOS_RUNNER_HOME,
+    LANG: "en_US.UTF-8",
+    LOGNAME: "runner",
+    PATH: TRUSTED_UNIX_PATH,
+    SHELL: "/bin/bash",
+    TERM: "dumb",
+    TMPDIR: MACOS_BREW_TEMP,
+    USER: "runner",
+    // Homebrew otherwise loads a workflow-created ~/.homebrew/brew.env. Its
+    // bin/brew bootstrap also consults PATH and several HOMEBREW_* executable
+    // overrides before it filters the environment, so pass an allowlist rather
+    // than inheriting arbitrary workflow state.
+    XDG_CONFIG_HOME: DISABLED_BREW_USER_CONFIG_ROOT,
     HOMEBREW_NO_ANALYTICS: "1",
     HOMEBREW_NO_AUTO_UPDATE: "1",
     HOMEBREW_NO_AUTOREMOVE: "1",
+    HOMEBREW_NO_ENV_HINTS: "1",
   };
 }
 
@@ -262,7 +392,10 @@ function parseBrewInventory(output: string, label: string): Set<string> {
   return new Set(values);
 }
 
-function createBrewState(executable: string | undefined): BrewState {
+function createBrewState(
+  executable: string | undefined,
+  execute: MacOSBrewRunner,
+): BrewState {
   let pending: Promise<BrewInventory> | undefined;
   return {
     inventory: () => {
@@ -271,14 +404,11 @@ function createBrewState(executable: string | undefined): BrewState {
           return { formulae: new Set<string>(), casks: new Set<string>() };
         }
 
-        const formulae = await runCommand(
+        const formulae = await execute(
           executable,
           ["list", "--formula", "--full-name"],
-          {
-            env: brewEnvironment(),
-            silent: true,
-            timeoutMs: 60_000,
-          },
+          brewEnvironment(),
+          { silent: true, timeoutMs: 60_000 },
         );
         if (formulae.exitCode !== 0) {
           throw new Error(
@@ -287,14 +417,11 @@ function createBrewState(executable: string | undefined): BrewState {
           );
         }
 
-        const casks = await runCommand(
+        const casks = await execute(
           executable,
           ["list", "--cask", "--full-name"],
-          {
-            env: brewEnvironment(),
-            silent: true,
-            timeoutMs: 60_000,
-          },
+          brewEnvironment(),
+          { silent: true, timeoutMs: 60_000 },
         );
         if (casks.exitCode !== 0) {
           throw new Error(
@@ -315,10 +442,29 @@ function createBrewState(executable: string | undefined): BrewState {
 
 function installedPackageMatches(
   installed: string,
-  aliases: readonly string[],
+  definition: BrewPackageDefinition,
 ): boolean {
-  return aliases.some(
-    (alias) => installed === alias || installed.endsWith(`/${alias}`),
+  const tap =
+    definition.tap ??
+    (definition.kind === "formula" ? "homebrew/core" : "homebrew/cask");
+  return definition.aliases.some(
+    (alias) => installed === alias || installed === `${tap}/${alias}`,
+  );
+}
+
+function inventoryForKind(
+  inventory: BrewInventory,
+  kind: BrewPackageKind,
+): Set<string> {
+  return kind === "formula" ? inventory.formulae : inventory.casks;
+}
+
+function matchingInstalledPackages(
+  inventory: BrewInventory,
+  definition: BrewPackageDefinition,
+): string[] {
+  return [...inventoryForKind(inventory, definition.kind)].filter((name) =>
+    installedPackageMatches(name, definition),
   );
 }
 
@@ -327,6 +473,7 @@ function brewPackageOperation(
   state: BrewState,
   definition: BrewPackageDefinition,
   component: ComponentId,
+  execute: MacOSBrewRunner,
 ): Operation {
   return createFunctionOperation({
     id: `brew:${definition.kind}:${definition.aliases.join("|")}:${component}`,
@@ -347,11 +494,8 @@ function brewPackageOperation(
         };
       }
 
-      const installed =
-        definition.kind === "formula" ? inventory.formulae : inventory.casks;
-      const matches = [...installed].filter((name) =>
-        installedPackageMatches(name, definition.aliases),
-      );
+      const installed = inventoryForKind(inventory, definition.kind);
+      const matches = matchingInstalledPackages(inventory, definition);
       if (matches.length === 0) return { status: "not-found" };
 
       const args = [
@@ -361,8 +505,7 @@ function brewPackageOperation(
         ...(definition.kind === "formula" ? ["--ignore-dependencies"] : []),
         ...matches,
       ];
-      const result = await runCommand(executable, args, {
-        env: brewEnvironment(),
+      const result = await execute(executable, args, brewEnvironment(), {
         silent: false,
         timeoutMs: 10 * 60_000,
       });
@@ -388,16 +531,31 @@ function chunks<T>(values: readonly T[], size: number): readonly T[][] {
   return result;
 }
 
-function removeAllHomebrewPackagesOperation(
+function definitionListedPackages(
+  inventory: BrewInventory,
+  kind: BrewPackageKind,
+): string[] {
+  const selected = new Set<string>();
+  for (const definition of BREW_PACKAGES) {
+    if (definition.kind !== kind) continue;
+    for (const name of matchingInstalledPackages(inventory, definition)) {
+      selected.add(name);
+    }
+  }
+  return [...selected];
+}
+
+function removeDefinitionHomebrewPackagesOperation(
   executable: string | undefined,
   state: BrewState,
+  execute: MacOSBrewRunner,
 ): Operation {
   return createFunctionOperation({
-    id: "brew:all-packages",
+    id: "brew:definition-packages",
     component: "homebrew",
-    description: "Uninstall runner-image Homebrew formulae and casks",
+    description: "Uninstall definition-listed Homebrew formulae and casks",
     phase: "package",
-    dedupeKey: "brew:all-packages",
+    dedupeKey: "brew:definition-packages",
     blockedBy: BREW_OWNER_COMPONENTS,
     run: async (): Promise<OperationResult> => {
       if (executable === undefined) return { status: "not-found" };
@@ -412,19 +570,20 @@ function removeAllHomebrewPackagesOperation(
         };
       }
 
-      const work: readonly [BrewPackageKind, Set<string>][] = [
-        ["cask", inventory.casks],
-        ["formula", inventory.formulae],
+      const work: readonly [BrewPackageKind, readonly string[]][] = [
+        ["cask", definitionListedPackages(inventory, "cask")],
+        ["formula", definitionListedPackages(inventory, "formula")],
       ];
       let removed = 0;
       const failures: string[] = [];
 
       // A fixed chunk size bounds argv while avoiding one expensive Homebrew
-      // startup per package. Casks go first so their formula dependencies can be
-      // removed afterwards.
-      for (const [kind, installed] of work) {
-        for (const batch of chunks([...installed], 24)) {
-          const result = await runCommand(
+      // startup per package. Only finite runner-definition identities are
+      // selected; unknown workflow-installed packages remain outside our
+      // ownership. Casks go first so listed formulae can follow.
+      for (const [kind, selected] of work) {
+        for (const batch of chunks(selected, 24)) {
+          const result = await execute(
             executable,
             [
               "uninstall",
@@ -433,11 +592,8 @@ function removeAllHomebrewPackagesOperation(
               ...(kind === "formula" ? ["--ignore-dependencies"] : []),
               ...batch,
             ],
-            {
-              env: brewEnvironment(),
-              silent: false,
-              timeoutMs: 15 * 60_000,
-            },
+            brewEnvironment(),
+            { silent: false, timeoutMs: 15 * 60_000 },
           );
           if (result.exitCode !== 0) {
             failures.push(
@@ -446,6 +602,7 @@ function removeAllHomebrewPackagesOperation(
             );
             continue;
           }
+          const installed = inventoryForKind(inventory, kind);
           for (const name of batch) installed.delete(name);
           removed += batch.length;
         }
@@ -459,7 +616,10 @@ function removeAllHomebrewPackagesOperation(
       }
       return removed === 0
         ? { status: "not-found" }
-        : { status: "removed", detail: `${removed} Homebrew packages` };
+        : {
+            status: "removed",
+            detail: `${removed} definition-listed Homebrew packages`,
+          };
     },
   });
 }
@@ -467,37 +627,33 @@ function removeAllHomebrewPackagesOperation(
 function brewCleanupOperation(
   executable: string | undefined,
   component: ComponentId,
+  execute: MacOSBrewRunner,
 ): Operation {
   return createFunctionOperation({
     id: `brew:cleanup:${component}`,
     component,
-    description: "Remove unused Homebrew dependencies and cached downloads",
+    description: "Clean stale Homebrew versions and cached downloads",
     phase: "package",
     dedupeKey: "brew:cleanup",
     run: async (): Promise<OperationResult> => {
       if (executable === undefined) return { status: "not-found" };
 
-      const autoremove = await runCommand(executable, ["autoremove"], {
-        env: brewEnvironment(),
-        silent: false,
-        timeoutMs: 10 * 60_000,
-      });
-      const cleanup = await runCommand(
+      // Explicit autoremove can claim an otherwise unknown package installed by
+      // the workflow. Native cleanup keeps current formulae and casks installed
+      // while reclaiming old versions and downloads.
+      const cleanup = await execute(
         executable,
         ["cleanup", "--prune=all", "-s"],
+        brewEnvironment(),
         {
-          env: brewEnvironment(),
           silent: false,
           timeoutMs: 10 * 60_000,
         },
       );
-      if (autoremove.exitCode !== 0 || cleanup.exitCode !== 0) {
+      if (cleanup.exitCode !== 0) {
         return {
           status: "failed",
-          detail:
-            autoremove.stderr.trim() ||
-            cleanup.stderr.trim() ||
-            "Homebrew cleanup failed",
+          detail: cleanup.stderr.trim() || "Homebrew cleanup failed",
         };
       }
       return { status: "removed" };
@@ -670,9 +826,42 @@ async function xcodeOperations(
 
 export async function createMacOSAdapter(
   context: RuntimeContext,
+  dependencies: MacOSAdapterDependencies = {},
 ): Promise<Adapter> {
-  const brew = await resolveBrewExecutable(context);
-  const brewState = createBrewState(brew);
+  const resolveBrew =
+    dependencies.resolveBrewExecutable ?? resolveDefinitionBrewExecutable;
+  const executeBrew = dependencies.executeBrew ?? NODE_MACOS_BREW_RUNNER;
+  const inspectBrewConfig =
+    dependencies.inspectBrewConfig ?? NODE_BREW_CONFIG_PROBE;
+  const brew = await resolveBrew(context.architecture);
+  const brewState = createBrewState(brew, executeBrew);
+  let validatedBrewConfig: string | undefined;
+
+  const validateBrewConfiguration = async (): Promise<void> => {
+    if (brew === undefined) return;
+    validatedBrewConfig = await findBrewConfig(
+      context.architecture,
+      inspectBrewConfig,
+    );
+    if (validatedBrewConfig !== undefined) {
+      throw new Error(
+        `Homebrew configuration can override cleanup paths (${validatedBrewConfig})`,
+      );
+    }
+  };
+
+  const recheckBrewConfiguration = async (): Promise<void> => {
+    if (brew === undefined) return;
+    const config = await findBrewConfig(
+      context.architecture,
+      inspectBrewConfig,
+    );
+    if (config !== undefined || validatedBrewConfig !== undefined) {
+      throw new Error(
+        `Homebrew configuration can override cleanup paths (${config ?? validatedBrewConfig})`,
+      );
+    }
+  };
 
   return {
     supportedComponents: SUPPORTED,
@@ -694,7 +883,7 @@ export async function createMacOSAdapter(
       };
 
       const home = normalize(context.home);
-      if (home !== "/Users/runner") {
+      if (home !== MACOS_RUNNER_HOME) {
         throw new Error(
           `Refusing unexpected macOS runner home '${context.home}'; no cleanup was scheduled.`,
         );
@@ -978,18 +1167,65 @@ export async function createMacOSAdapter(
         operations.push(...(await xcodeOperations(context)));
       }
 
+      const usesHomebrew =
+        plan.enabled.has("homebrew") ||
+        BREW_OWNER_COMPONENTS.some((component) => plan.enabled.has(component));
+      if (usesHomebrew) {
+        operations.push(
+          createFunctionOperation({
+            id: "macos:brew:configuration",
+            component: plan.enabled.has("homebrew")
+              ? "homebrew"
+              : (BREW_OWNER_COMPONENTS.find((component) =>
+                  plan.enabled.has(component),
+                ) ?? "homebrew"),
+            description: "Validate fixed Homebrew configuration sources",
+            phase: "preflight",
+            dedupeKey: "macos:brew:configuration",
+            fatal: true,
+            validate: validateBrewConfiguration,
+            run: async (): Promise<OperationResult> => {
+              try {
+                await recheckBrewConfiguration();
+                return brew === undefined
+                  ? { status: "not-found" }
+                  : { status: "removed" };
+              } catch (error) {
+                return {
+                  status: "failed",
+                  detail:
+                    error instanceof Error ? error.message : String(error),
+                };
+              }
+            },
+          }),
+        );
+      }
+
       const broadHomebrewAllowed =
         plan.enabled.has("homebrew") &&
         !BREW_OWNER_COMPONENTS.some((component) => plan.skipped.has(component));
 
       if (broadHomebrewAllowed) {
-        operations.push(removeAllHomebrewPackagesOperation(brew, brewState));
+        operations.push(
+          removeDefinitionHomebrewPackagesOperation(
+            brew,
+            brewState,
+            executeBrew,
+          ),
+        );
       } else {
         for (const definition of BREW_PACKAGES) {
           for (const component of definition.components) {
             if (plan.enabled.has(component)) {
               operations.push(
-                brewPackageOperation(brew, brewState, definition, component),
+                brewPackageOperation(
+                  brew,
+                  brewState,
+                  definition,
+                  component,
+                  executeBrew,
+                ),
               );
             }
           }
@@ -999,11 +1235,11 @@ export async function createMacOSAdapter(
       // Place cleanup after every uninstall operation. prepareOperations keeps
       // only the first enabled operation with this dedupe key.
       if (broadHomebrewAllowed) {
-        operations.push(brewCleanupOperation(brew, "homebrew"));
+        operations.push(brewCleanupOperation(brew, "homebrew", executeBrew));
       } else {
         for (const component of BREW_OWNER_COMPONENTS) {
           if (plan.enabled.has(component)) {
-            operations.push(brewCleanupOperation(brew, component));
+            operations.push(brewCleanupOperation(brew, component, executeBrew));
           }
         }
       }

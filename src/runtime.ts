@@ -5,7 +5,11 @@ import { homedir, tmpdir } from "node:os";
 import { posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Architecture, Platform, RuntimeContext } from "./types.js";
-import { runCommand } from "./command.js";
+import {
+  runCommand,
+  TRUSTED_UNIX_PATH,
+  UNIX_SUDO_EXECUTABLE,
+} from "./command.js";
 
 const MAX_IMAGE_DATA_BYTES = 256 * 1024;
 
@@ -370,10 +374,19 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
       hasPasswordlessSudo = true;
     } else {
       try {
-        const result = await runCommand("sudo", ["-n", "true"], {
-          silent: true,
-          timeoutMs: 5_000,
-        });
+        const result = await runCommand(
+          UNIX_SUDO_EXECUTABLE,
+          ["-n", "--", "/usr/bin/true"],
+          {
+            env: {
+              LANG: "C.UTF-8",
+              LC_ALL: "C.UTF-8",
+              PATH: TRUSTED_UNIX_PATH,
+            },
+            silent: true,
+            timeoutMs: 5_000,
+          },
+        );
         hasPasswordlessSudo = result.exitCode === 0;
       } catch {
         hasPasswordlessSudo = false;
