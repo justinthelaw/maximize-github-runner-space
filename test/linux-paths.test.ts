@@ -113,3 +113,16 @@ test("Linux never deletes a workflow PATH executable from an unrelated tree", as
     else process.env.PATH = originalPath;
   }
 });
+
+test("Linux resolves command removals only for the active plan", async () => {
+  const adapter = await createLinuxAdapter(contextFor("linux"));
+  const operations = await adapter.operations(planFor("azcopy"));
+  assert.equal(
+    operations.some(({ id }) => id === "binary:haskell:stack"),
+    false,
+  );
+  assert.equal(
+    operations.some(({ id }) => id === "binary:azcopy:azcopy"),
+    true,
+  );
+});

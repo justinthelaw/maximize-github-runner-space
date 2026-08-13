@@ -1678,6 +1678,10 @@ export async function createLinuxAdapter(
         ComponentId,
         readonly string[],
       ][]) {
+        // Do not inspect or validate unrelated PATH entries. Besides making
+        // custom cleanup cheaper, this prevents a protected runtime-owned
+        // executable for a disabled component from blocking the active plan.
+        if (!plan.enabled.has(component)) continue;
         for (const name of names) {
           commandOperations.push(commandRemoval(context, component, name));
         }
