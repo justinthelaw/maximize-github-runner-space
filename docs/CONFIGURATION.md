@@ -19,6 +19,7 @@ With `max`, every component applicable to the detected platform is selected unle
 - Skipping a protected component that overlaps Linux `large-packages` disables that broad legacy package purge.
 - When `docker-engine` is selected, its removal covers `docker-images`; the action does not start a daemon to run a redundant image prune.
 - On Windows, skipping `visual-studio` preserves its definition-owned Android, .NET, vcpkg, and Windows SDK payloads. Skipping one of those payloads blocks broad Visual Studio removal while allowing unrelated cleanup.
+- On macOS, broad Homebrew removal in `max` runs only when `homebrew` is selected and no Homebrew-owned component is skipped. The owner IDs are `browsers`, `chrome`, `edge`, `firefox`, `webdrivers`, `selenium`, `aws-cli`, `aws-sam-cli`, `azure-cli`, `gh-cli`, `kubectl`, `helm`, `kind`, `maven`, `gradle`, `ant`, `php`, `rust`, and `nginx`. Skipping any owner prevents broad Homebrew removal; enabled owners instead use their narrower definition-listed Homebrew operations, so retained packages are not removed by the broad operation.
 
 ### `swapfile-size`
 
@@ -96,6 +97,6 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 
 ## Failure behavior
 
-The action fails before mutation for invalid `cleanup-profile` or `skip-components` values, unsupported runner identities and containers, incompatible runner-image metadata, and invalid or unsupported swap requests. Swap failures and failures to stop a required service are also fatal because continuing could leave the machine in an unsafe state.
+The action fails before mutation for invalid `cleanup-profile` or `skip-components` values, unsupported runner identities and containers, incompatible runner-image metadata, and invalid or unsupported swap requests. Swap failures and failures to stop a required service are also fatal because continuing could leave the machine in an unsafe state. On macOS, when Homebrew cleanup or a Homebrew-owned component is selected, Homebrew configuration validation and preparation are fatal preflight requirements; a failure stops cleanup.
 
 Ordinary component cleanup is best-effort. The action records `removed`, `not-found`, `unsupported`, and `failed` results; ordinary failures do not stop later operations, are emitted as warnings, and increase `failed-operations`.

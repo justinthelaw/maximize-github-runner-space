@@ -27,7 +27,7 @@ The scheduled/manual compatibility sweep exercises these exact labels:
   `macos-15-intel`, `macos-26-intel`.
 <!-- compatibility-labels:end -->
 
-GitHub's `-latest` labels are moving aliases. Pin an explicit runner label when you need to control the operating-system image family, while recognizing that the installed image version can still change.
+GitHub's [standard public-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) and [standard private-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-private-repositories) tables are the authoritative current source for hosted-runner labels and resources. GitHub's `-latest` labels are moving aliases. Pin an explicit runner label when you need to control the operating-system image family, while recognizing that the installed image version can still change.
 
 ## Runtime image validation
 
@@ -43,7 +43,7 @@ This check is compatibility evidence, not signed attestation. A prior privileged
 
 ## Platform constraints and destructive caveats
 
-`ubuntu-slim` is an unprivileged, minimal container with a 15-minute job timeout. Its missing inventory and Docker daemon are normal conditions; the action never creates swap or mounts there.
+[`ubuntu-slim`](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#single-cpu-runners) is an unprivileged, minimal container with a 15-minute job timeout. Its missing inventory and Docker daemon are normal conditions; the action never creates swap or mounts there.
 
 On Windows, `max` can remove PowerShell 7, the default shell for later workflow `run` steps. Protect `powershell`, use `custom`, or choose a remaining shell explicitly. Windows base-image Microsoft Edge is preserved and reported as unsupported, although its separately installed WebDriver can be removed.
 
@@ -55,12 +55,12 @@ On Linux, `swapfile-size` works only on a privileged VM. Container, macOS, and W
 
 The complete cleanup plan is validated before its first mutation. Deletion targets are derived from runner context, native package metadata, resolved executables, or bounded runner-image definitions; protected roots and unsafe paths are rejected.
 
-Invalid profile or component names, an unsupported runner identity, an invalid swap request, a failed swap transaction, and a required service stop failure are fatal. Swap replacement rolls back when it cannot safely complete.
+Invalid profile or component names, an unsupported runner identity, an invalid swap request, a failed swap transaction, and a required service stop failure are fatal. Swap replacement rolls back when it cannot safely complete. On macOS, selecting Homebrew cleanup or a Homebrew-owned component makes Homebrew configuration validation and preparation a fatal preflight requirement; failure stops cleanup.
 
 Ordinary removal is best-effort for compatibility with existing workflows. Each operation reports `removed`, `not-found`, `unsupported`, or `failed`; the action continues after ordinary failures, emits a warning, and exposes their count through `failed-operations`.
 
 ## Image drift and CI coverage
 
-Runner images change independently of action releases. Use a full action commit SHA for immutable execution; the readable `v0.12.1` tag is the current release. Pinning an explicit runner label reduces surprises from `-latest`, but does not freeze GitHub's regularly refreshed image inventory. Treat an absent component as a normal image variation and re-measure reclaimed space after image changes.
+Runner images change independently of action releases. Use a full action commit SHA for immutable execution; the readable `v0.12.1` tag is the current release. Pinning an explicit runner label reduces surprises from `-latest`, but does not freeze GitHub's regularly refreshed image inventory. Track the official runner-images [latest-image migration process](https://github.com/actions/runner-images#latest-migration-process), [support policy](https://github.com/actions/runner-images#support-policy), and [available images](https://github.com/actions/runner-images#available-images). Treat an absent component as a normal image variation and re-measure reclaimed space after image changes.
 
 Pull requests run deterministic quality checks, Ubuntu swap/skip coverage, and representative destructive smoke tests for the remaining runner families. The scheduled/manual compatibility workflow covers the exact labels above. The project keeps component behavior and safety checks in fast tests rather than running every component against every operating-system image.
