@@ -5,6 +5,7 @@ This document captures breaking changes and notable behavior shifts between rele
 ## Table of Contents
 
 - [0.11.x -> 0.12.0](#011x---0120)
+- [0.12.0 -> 0.12.1](#0120---0121)
 - [0.6.x -> 0.7.0](#06x---070)
 - [0.7.x -> 0.8.0](#07x---080)
 - [0.8.x -> 0.9.0](#08x---090)
@@ -12,7 +13,8 @@ This document captures breaking changes and notable behavior shifts between rele
 ## 0.11.x -> 0.12.0
 
 > [!NOTE]
-> `v0.12.0` is planned but not yet published. Until release, test the pull request by pinning its full commit SHA.
+> `v0.12.0` introduced the cross-platform capability changes described in this
+> section. It is the stable baseline for migrations from `v0.11.x`.
 
 This release changes the implementation from an Ubuntu-only composite action to a bundled Node action with native Linux, macOS, and Windows adapters.
 
@@ -31,6 +33,15 @@ For a new macOS or Windows workflow, start with `cleanup-profile: custom` and en
 Linux `remove-homebrew` is intentionally more conservative than v0.11. The runner-image definition installs no formulae or casks, so the action now verifies the fixed Linuxbrew executable and runs native stale-artifact cleanup while preserving the prefix and workflow-installed packages. Workflows that depended on deleting the entire Linuxbrew installation should expect less reclaimed space rather than unsafe ownership of files added before the action runs.
 
 The action now rejects self-hosted runners, arbitrary job containers, and hosted image identities outside the supported Ubuntu, macOS, and Windows runner-image definitions before cleanup. VM authorization reads the fixed runner-images image-data record instead of trusting workflow-overridable `ImageOS` or `ImageVersion` values. This compatibility gate is not signed attestation and does not prove a runner's billing or size class, so larger runners remain unsupported and outside the tested contract rather than being guaranteed rejection cases. These checks apply to both `max` and `custom`; selecting `custom` does not extend the support boundary. See [Runner support](/docs/RUNNER-SUPPORT.md) for exact labels and limitations.
+
+## 0.12.0 -> 0.12.1
+
+This maintenance release consolidates the current dependency updates and refreshes
+the workflow's pinned Node setup action. Runtime cleanup behavior, public inputs,
+outputs, and the supported runner contract remain unchanged.
+
+No workflow migration is required. Continue pinning the full commit SHA while the
+`v0.12.1` tag is being prepared.
 
 ## 0.8.x -> 0.9.0
 

@@ -8,12 +8,13 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "npm run clean:dist && ncc build src/index.ts --out dist --minify --no-source-map-register --license licenses.txt",
+    "build": "npm run clean:dist && npm run build:typescript && ncc build build/action/index.js --out dist --minify --no-source-map-register --license licenses.txt",
+    "build:typescript": "npm run clean && tsc --project tsconfig.build.json",
     "postbuild": "node -e \"import('node:fs').then(({ appendFileSync, readFileSync }) => { const path = 'dist/index.js'; if (!readFileSync(path, 'utf8').endsWith('\\n')) appendFileSync(path, '\\n'); })\"",
     "clean": "node -e \"import('node:fs').then(({rmSync}) => { rmSync('build', { recursive: true, force: true }); })\"",
     "clean:dist": "node -e \"import('node:fs').then(({rmSync}) => { rmSync('dist', { recursive: true, force: true }); })\"",
-    "format": "prettier --write action.yml scripts src test package.json tsconfig.json",
-    "format:check": "prettier --check action.yml scripts src test package.json tsconfig.json",
+    "format": "prettier --write action.yml scripts src test package.json tsconfig.build.json tsconfig.json",
+    "format:check": "prettier --check action.yml scripts src test package.json tsconfig.build.json tsconfig.json",
     "test": "npm run clean && tsc --project tsconfig.json && node --test \"build/test/*.test.js\"",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "check-dist": "npm run build && node scripts/check-dist.mjs"
@@ -22,9 +23,9 @@
     "@actions/core": "3.0.1"
   },
   "devDependencies": {
-    "@types/node": "24.3.0",
+    "@types/node": "26.2.0",
     "@vercel/ncc": "0.45.0",
     "prettier": "3.9.6",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   }
 }
