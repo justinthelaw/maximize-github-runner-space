@@ -13,9 +13,9 @@ capabilities; callers do not select a platform manually.
 > workflow needs.
 
 > [!IMPORTANT]
-> The cross-platform examples describe the planned `v0.12.0` release. Until it
+> The cross-platform examples describe the planned `v0.12.1` release. Until it
 > is published, test this change by pinning the pull request's full commit SHA.
-> The current `v0.11.0` release remains Ubuntu-only.
+> The current `v0.12.0` release is the stable cross-platform baseline.
 
 ## Table of contents
 
@@ -49,7 +49,7 @@ This action provides:
 
 ## Quick start
 
-All examples below use the planned `v0.12.0` tag for readability. Pin a full
+All examples below use the planned `v0.12.1` tag for readability. Pin a full
 commit SHA for immutable or security-sensitive workflows.
 
 ### Existing Ubuntu usage remains valid
@@ -66,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.0
+        uses: justinthelaw/maximize-github-runner-space@v0.12.1
       - run: ./build.sh
 ```
 
@@ -83,7 +83,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.0
+        uses: justinthelaw/maximize-github-runner-space@v0.12.1
         with:
           skip-components: java,browsers,docker-engine,docker-images
           swapfile-size: 2GiB
@@ -111,7 +111,7 @@ jobs:
           persist-credentials: false
       - name: Free runner space
         id: cleanup
-        uses: justinthelaw/maximize-github-runner-space@v0.12.0
+        uses: justinthelaw/maximize-github-runner-space@v0.12.1
         with:
           cleanup-profile: custom
           remove-codeql: "true"
@@ -216,7 +216,7 @@ identical GitHub image remains indistinguishable and unsupported.
 ## Inputs
 
 The three global inputs and all historical `remove-*` inputs retain their names
-and defaults. The three OS-specific inputs at the end are additive in `v0.12.0`.
+and defaults. The three OS-specific inputs at the end are included in `v0.12.1`.
 
 ### Profiles and global options
 
@@ -294,9 +294,9 @@ and defaults. The three OS-specific inputs at the end are additive in `v0.12.0`.
 | `remove-apache` | `apache` | Linux, Windows | Stop and remove runner Apache artifacts when installed. |
 | `remove-nginx` | `nginx` | Linux, macOS, Windows | Stop and remove runner Nginx artifacts when installed. |
 | `remove-large-packages` | `large-packages` | Linux | Run the backward-compatible legacy bulk apt cleanup. |
-| `remove-xcode` | `xcode` | macOS | Remove non-selected runner Xcode installations while preserving the active Xcode. New in `v0.12.0`. |
-| `remove-visual-studio` | `visual-studio` | Windows | Remove adapter-defined, guarded Visual Studio installations. New in `v0.12.0`. |
-| `remove-windows-sdk` | `windows-sdk` | Windows | Remove adapter-defined, guarded Windows SDK installations. New in `v0.12.0`. |
+| `remove-xcode` | `xcode` | macOS | Remove non-selected runner Xcode installations while preserving the active Xcode. Included in `v0.12.1`. |
+| `remove-visual-studio` | `visual-studio` | Windows | Remove adapter-defined, guarded Visual Studio installations. Included in `v0.12.1`. |
+| `remove-windows-sdk` | `windows-sdk` | Windows | Remove adapter-defined, guarded Windows SDK installations. Included in `v0.12.1`. |
 
 Every `remove-*` input defaults to `"false"`. Under `max`, those defaults are
 intentionally overridden and all applicable components are selected unless
@@ -362,7 +362,7 @@ requirements are known.
 Use a release tag when you want normal semantic-version updates:
 
 ```yaml
-- uses: justinthelaw/maximize-github-runner-space@v0.12.0
+- uses: justinthelaw/maximize-github-runner-space@v0.12.1
 ```
 
 Use the release commit's complete SHA when you require immutable action code:

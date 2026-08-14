@@ -1,6 +1,6 @@
 # Runner support and implementation notes
 
-This document describes the runner contract for the planned `v0.12.0` release
+This document describes the runner contract for the planned `v0.12.1` release
 of Maximize GitHub Runner Space. The runner and image inventory was verified on
 2026-08-12 against GitHub's current documentation and
 [`actions/runner-images@20f9f7b`](https://github.com/actions/runner-images/tree/20f9f7b2d2dbcf53e5c5a7e133f4867e8a555c24).
@@ -462,7 +462,7 @@ Two independent versions affect a workflow:
 2. The runner label determines the operating system and installed inventory.
 
 Pin the action to a full commit SHA for immutable execution. A semantic release
-tag such as `v0.12.0` is easier to read but can only be used after that release
+tag such as `v0.12.1` is easier to read but can only be used after that release
 exists. Pull request testers must use the PR commit SHA, not a not-yet-published
 tag.
 
