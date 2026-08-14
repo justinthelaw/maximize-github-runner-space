@@ -13,8 +13,8 @@ This document captures breaking changes and notable behavior shifts between rele
 ## 0.11.x -> 0.12.0
 
 > [!NOTE]
-> `v0.12.0` is the stable cross-platform baseline. Test the planned `v0.12.1`
-> release by pinning the pull request's full commit SHA until its tag is published.
+> `v0.12.0` introduced the cross-platform capability changes described in this
+> section. It is the stable baseline for migrations from `v0.11.x`.
 
 This release changes the implementation from an Ubuntu-only composite action to a bundled Node action with native Linux, macOS, and Windows adapters.
 

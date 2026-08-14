@@ -15,7 +15,7 @@ capabilities; callers do not select a platform manually.
 > [!IMPORTANT]
 > The cross-platform examples describe the planned `v0.12.1` release. Until it
 > is published, test this change by pinning the pull request's full commit SHA.
-> The current `v0.12.0` release is the stable cross-platform baseline.
+> The cross-platform capability baseline was introduced in `v0.12.0`.
 
 ## Table of contents
 
