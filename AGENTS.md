@@ -17,7 +17,8 @@
 - `src/safety.ts`: mandatory deletion-target validation.
 - `test/`: fast, data-driven planner, safety, metadata, and adapter tests.
 - `.github/workflows/test.yml`: representative destructive runner smoke tests.
-- `docs/RUNNER-SUPPORT.md`: pinned runner-image evidence and support policy.
+- `docs/CONFIGURATION.md`: complete public input, output, and behavior reference.
+- `docs/RUNNER-SUPPORT.md`: runner support contract and compatibility policy.
 - `dist/`: committed `ncc` bundle consumed by Actions.
 
 ## Required validation
@@ -47,8 +48,9 @@ pre-commit run --all-files --hook-stage pre-push
 - Validate the complete plan before the first mutation. Swap replacement must
   be atomic and failure-fatal; ordinary absent/image-drift cleanup is
   best-effort for backward compatibility.
-- Update the registry, action metadata, unit coverage, live smoke assertions,
-  README, and runner support document together when adding a component.
+- Keep configuration or support-policy changes aligned across `action.yml`, the
+  relevant tests and workflows, README, `docs/CONFIGURATION.md`, and
+  `docs/RUNNER-SUPPORT.md`.
 
 ## CI cost policy
 
