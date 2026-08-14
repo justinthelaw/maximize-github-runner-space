@@ -11,6 +11,9 @@ platform and architecture automatically.
 
 ## Quick start
 
+These examples target `v0.12.2`; until that tag is published, pin the full
+commit SHA instead.
+
 Calling the action without `with:` uses the aggressive `max` profile, which
 removes every applicable component unless it is protected.
 
@@ -23,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.1
+        uses: justinthelaw/maximize-github-runner-space@v0.12.2
         with:
           skip-components: java,browsers,docker-engine,docker-images
           swapfile-size: 2GiB
@@ -46,7 +49,7 @@ jobs:
           persist-credentials: false
       - name: Free runner space
         id: cleanup
-        uses: justinthelaw/maximize-github-runner-space@v0.12.1
+        uses: justinthelaw/maximize-github-runner-space@v0.12.2
         with:
           cleanup-profile: custom
           remove-codeql: "true"
