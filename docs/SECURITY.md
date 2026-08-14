@@ -1,6 +1,6 @@
-# Security Policy
+# Security policy
 
-## Supported Versions
+## Supported versions
 
 The latest state of `main` and the latest published minor release receive security fixes.
 
@@ -10,15 +10,17 @@ The latest state of `main` and the latest published minor release receive securi
 | Latest published minor | Yes       |
 | Older minor releases   | No        |
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
 Do not open public issues for security vulnerabilities.
 
-1. Use GitHub private vulnerability reporting for this repository when available.
-2. If private reporting is unavailable, contact the maintainer through https://github.com/justinthelaw and request a private channel.
-3. Include impact, affected runner images, and reproduction steps.
+1. Use [GitHub private vulnerability reporting](https://github.com/justinthelaw/maximize-github-runner-space/security/advisories/new).
+2. If private reporting is unavailable, [contact the maintainer](https://github.com/justinthelaw) and request a private channel.
+3. Include the impact, affected runner image or label, action version and
+   configuration, and reproducible steps. Do not include credentials or other
+   secrets.
 
-## Response Targets
+## Response targets
 
 - Initial acknowledgement: within 3 business days.
 - Triage and severity assessment: within 7 business days.
