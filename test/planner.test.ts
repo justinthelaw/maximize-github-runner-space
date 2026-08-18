@@ -130,6 +130,10 @@ test("swap sizes preserve legacy binary-unit and rounding semantics", () => {
   assert.equal(parseSwapfileSize("2"), 2n * 1024n ** 3n);
   assert.equal(parseSwapfileSize(" 1.5 GiB "), 1536n * 1024n ** 2n);
   assert.equal(parseSwapfileSize("512MB"), 512n * 1024n ** 2n);
+  assert.throws(
+    () => parseSwapfileSize("0.0000000000000000001GiB"),
+    /at least 1 MiB/,
+  );
   assert.throws(() => parseSwapfileSize("0.5MiB"), /at least 1 MiB/);
   assert.throws(() => parseSwapfileSize("-1"), /Invalid swapfile-size/);
   assert.throws(() => parseSwapfileSize("1PB"), /Invalid swapfile-size/);

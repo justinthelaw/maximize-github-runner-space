@@ -103,7 +103,7 @@ export function parseSwapfileSize(rawValue: string): bigint | undefined {
   const scaled = numerator * multiplier;
   const bytes = (scaled + denominator / 2n) / denominator;
 
-  if (bytes !== 0n && bytes < 1024n ** 2n) {
+  if (numerator !== 0n && bytes < 1024n ** 2n) {
     throw new Error("Positive swapfile-size values must be at least 1 MiB.");
   }
   if (bytes > 2n ** 63n - 1n) {
