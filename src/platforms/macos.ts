@@ -690,6 +690,10 @@ function brewEnvironment(configRoot: string | undefined): NodeJS.ProcessEnv {
     TERM: "dumb",
     TMPDIR: MACOS_BREW_TEMP,
     USER: "runner",
+    // Homebrew otherwise derives `$XDG_CONFIG_HOME/homebrew` and tries to
+    // create that child directory. The isolated root is already created and
+    // protected by the root-owned preflight, so pin the exact config path.
+    HOMEBREW_CONFIG_HOME: configRoot,
     // Homebrew otherwise loads a workflow-created ~/.homebrew/brew.env. Its
     // bin/brew bootstrap also consults PATH and several HOMEBREW_* executable
     // overrides before it filters the environment, so pass an allowlist rather

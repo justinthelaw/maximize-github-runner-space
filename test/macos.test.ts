@@ -250,6 +250,7 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
     "PATH",
     "TMPDIR",
     "XDG_CONFIG_HOME",
+    "HOMEBREW_CONFIG_HOME",
     "HOMEBREW_BREW_FILE",
     "HOMEBREW_PATH",
     "HOMEBREW_FORCE_BREW_WRAPPER",
@@ -438,6 +439,7 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
     const expectedEnvironmentKeys = [
       "CI",
       "HOME",
+      "HOMEBREW_CONFIG_HOME",
       "HOMEBREW_NO_ANALYTICS",
       "HOMEBREW_NO_AUTOREMOVE",
       "HOMEBREW_NO_AUTO_UPDATE",
@@ -461,6 +463,7 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
       assert.equal(call.environment.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
       assert.equal(call.environment.TMPDIR, "/private/tmp");
       assert.equal(call.environment.XDG_CONFIG_HOME, configRoot);
+      assert.equal(call.environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(call.environment.HOMEBREW_BREW_FILE, undefined);
       assert.equal(call.environment.HOMEBREW_PATH, undefined);
       assert.equal(call.environment.HOMEBREW_FORCE_BREW_WRAPPER, undefined);
@@ -1035,6 +1038,7 @@ test("macOS releases its isolated configuration when Homebrew cleanup fails", as
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async (_executable, args, environment) => {
       assert.equal(environment.XDG_CONFIG_HOME, configRoot);
+      assert.equal(environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(environment.HOMEBREW_XDG_CONFIG_HOME, undefined);
       assert.deepEqual(args, ["cleanup", "--prune=all", "-s"]);
       return { exitCode: 23, stdout: "", stderr: "simulated cleanup failure" };
@@ -1176,6 +1180,7 @@ test("macOS broad Homebrew cleanup preserves protected owners while removing own
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async (_executable, args, environment) => {
       assert.equal(environment.XDG_CONFIG_HOME, configRoot);
+      assert.equal(environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(environment.HOMEBREW_XDG_CONFIG_HOME, undefined);
       commands.push([...args]);
       if (args.join(" ") === "list --formula --full-name") {
