@@ -33,6 +33,12 @@ export interface CommandResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /** True when captured stdout exceeded the bounded in-memory result. */
+  readonly stdoutTruncated?: boolean;
+  /** True when captured stderr exceeded the bounded in-memory result. */
+  readonly stderrTruncated?: boolean;
+  /** True when timeout handling could not confirm that the process tree ended. */
+  readonly terminationUnconfirmed?: boolean;
 }
 
 export type OperationPhase = "preflight" | "filesystem" | "package" | "system";
@@ -40,6 +46,8 @@ export type OperationPhase = "preflight" | "filesystem" | "package" | "system";
 export interface OperationResult {
   readonly status: "removed" | "not-found" | "unsupported" | "failed";
   readonly detail?: string;
+  /** Explicitly marks a failed result as terminal for older operation callers. */
+  readonly abortAction?: boolean;
 }
 
 export interface Operation {
@@ -62,6 +70,14 @@ export interface Operation {
   readonly fatal?: boolean;
   /** Read-only complete-plan validation, run before any operation mutates state. */
   readonly validate?: () => Promise<void>;
+  /** Restore reversible preflight state when a later operation fails. */
+  readonly rollback?: () => Promise<void>;
+  /**
+   * Allow only state-neutral housekeeping rollback after a payload operation
+   * may have partially mutated the runner. Service restarts must leave this
+   * false so they cannot revive a damaged installation.
+   */
+  readonly rollbackAfterPayloadMutation?: boolean;
   run(): Promise<OperationResult>;
 }
 

@@ -15,7 +15,7 @@
     "clean:dist": "node -e \"import('node:fs').then(({rmSync}) => { rmSync('dist', { recursive: true, force: true }); })\"",
     "format": "prettier --write action.yml scripts src test package.json tsconfig.build.json tsconfig.json",
     "format:check": "prettier --check action.yml scripts src test package.json tsconfig.build.json tsconfig.json",
-    "test": "npm run clean && tsc --project tsconfig.json && node --test \"build/test/*.test.js\"",
+    "test": "npm run clean && tsc --project tsconfig.json && node scripts/run-tests.mjs build/test",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "check-dist": "npm run build && node scripts/check-dist.mjs"
   },
@@ -25,6 +25,7 @@
   "devDependencies": {
     "@types/node": "26.2.0",
     "@vercel/ncc": "0.45.0",
+    "markdownlint-cli2": "0.23.2",
     "prettier": "3.9.6",
     "typescript": "7.0.2"
   }

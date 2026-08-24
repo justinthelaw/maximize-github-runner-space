@@ -111,12 +111,6 @@ async function run(): Promise<void> {
   core.setOutput("failed-operations", operationCounts.failed.toString());
   core.setOutput("platform", context.platform);
   core.setOutput("architecture", context.architecture);
-
-  if (operationCounts.failed > 0) {
-    core.warning(
-      `${operationCounts.failed} cleanup operation(s) failed. Cleanup remains best-effort for backward compatibility.`,
-    );
-  }
 }
 
 run().catch((error: unknown) => {

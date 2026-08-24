@@ -1,6 +1,13 @@
-import { access, lstat, mkdir, readdir } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, mkdir, mkdtemp, readdir } from "node:fs/promises";
 import { win32 } from "node:path";
-import { runCommand } from "../command.js";
+import {
+  assertCommandTerminationConfirmed,
+  inspectExecutable,
+  runCommand,
+  type CommandOptions,
+  UnconfirmedCommandTerminationError,
+} from "../command.js";
 import { COMPONENTS } from "../components.js";
 import {
   createFunctionOperation,
@@ -8,9 +15,13 @@ import {
   removePathTarget,
   validateRemovePathTarget,
 } from "../operations.js";
-import { assertSafeDirectoryTarget } from "../safety.js";
+import {
+  assertSafeDirectoryTarget,
+  captureSafeRemovalBoundary,
+} from "../safety.js";
 import type {
   Adapter,
+  Architecture,
   CleanupPlan,
   CommandResult,
   ComponentId,
@@ -25,8 +36,7 @@ const SUPPORTED = new Set<ComponentId>(
   ).map((component) => component.id),
 );
 
-const SUCCESS_EXIT_CODES = new Set([0, 3010]);
-const MSI_SUCCESS_EXIT_CODES = new Set([0, 1605, 1614, 3010]);
+const MSI_ABSENT_EXIT_CODES = new Set([1605, 1614]);
 const MAX_VERSIONED_CHILDREN = 64;
 const VISUAL_STUDIO_OVERLAPS = [
   "android",
@@ -141,11 +151,50 @@ export interface WindowsPathProbe {
 
 export type WindowsManagedPathProbe = WindowsPathProbe;
 
-interface WindowsPathIdentity {
+export interface WindowsPathIdentity {
   readonly dev: bigint;
   readonly ino: bigint;
   readonly size: bigint;
   readonly mtimeNs: bigint;
+  readonly ctimeNs?: bigint;
+  readonly mode?: bigint;
+  readonly uid?: bigint;
+  readonly gid?: bigint;
+  readonly contentSha256?: string;
+}
+
+export interface WindowsInventoryDependencies {
+  readonly expectedInventoryExecutable?: WindowsPathIdentity;
+  readonly inspectExecutable?: (
+    executable: string,
+  ) => Promise<WindowsPathIdentity | undefined>;
+  readonly runCommand?: (
+    executable: string,
+    args: readonly string[],
+    options: CommandOptions,
+  ) => Promise<CommandResult>;
+}
+
+export interface WindowsDockerDependencies {
+  readonly captureConfigBoundary?: typeof captureSafeRemovalBoundary;
+  readonly context?: RuntimeContext;
+  readonly inspectExecutable?: (
+    executable: string,
+  ) => Promise<WindowsPathIdentity | undefined>;
+  readonly runCommand?: (
+    executable: string,
+    args: readonly string[],
+    options: CommandOptions,
+  ) => Promise<CommandResult>;
+  readonly createConfigDirectory?: (prefix: string) => Promise<string>;
+  readonly inspectConfigDirectory?: (
+    path: string,
+  ) => Promise<WindowsPathIdentity>;
+  readonly removeConfigDirectory?: (
+    path: string,
+    expectedIdentity: WindowsPathIdentity,
+  ) => Promise<void>;
+  readonly removeConfigTarget?: typeof removePathTarget;
 }
 
 const NODE_WINDOWS_PATH_PROBE: WindowsPathProbe = {
@@ -165,38 +214,81 @@ function sameWindowsPathIdentity(
   left: WindowsPathIdentity | undefined,
   right: WindowsPathIdentity | undefined,
 ): boolean {
+  if (left === undefined || right === undefined) return false;
   return (
-    left?.dev === right?.dev &&
-    left?.ino === right?.ino &&
-    left?.size === right?.size &&
-    left?.mtimeNs === right?.mtimeNs
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.contentSha256 === right.contentSha256
+  );
+}
+
+function sameOptionalWindowsPathIdentity(
+  left: WindowsPathIdentity | undefined,
+  right: WindowsPathIdentity | undefined,
+): boolean {
+  return (
+    (left === undefined && right === undefined) ||
+    sameWindowsPathIdentity(left, right)
   );
 }
 
 interface WindowsServiceSnapshot extends WindowsServiceTarget {
   readonly status: "present" | "missing";
   readonly state: number;
+  readonly executable?: string;
+  readonly executableIdentity?: WindowsPathIdentity;
+  readonly configuration?: string;
 }
 
 export interface WindowsServiceControl {
   exists(): Promise<boolean>;
+  inspectExecutable?(
+    executable: string,
+  ): Promise<WindowsPathIdentity | undefined>;
   inventory(): Promise<CommandResult>;
   query(serviceName: string): Promise<CommandResult>;
+  config?(serviceName: string): Promise<CommandResult>;
   stop(serviceName: string): Promise<CommandResult>;
+  start?(serviceName: string): Promise<CommandResult>;
   delete(serviceName: string): Promise<CommandResult>;
+  wait?(milliseconds: number): Promise<void>;
 }
-const DEFINITION_POWERSHELL_MODULES = [
-  "DockerMsftProvider",
-  "MarkdownPS",
-  "Pester",
-  "PowerShellGet",
-  "PSScriptAnalyzer",
-  "PSWindowsUpdate",
-  "SqlServer",
-  "VSSetup",
-  "Microsoft.Graph",
-  "AWSPowershell",
-] as const;
+
+export interface WindowsDockerServiceLifecycle {
+  isRegistrationFinalized(): boolean;
+  finalizeRegistration(): void;
+}
+
+export function createWindowsDockerServiceLifecycle(): WindowsDockerServiceLifecycle {
+  let registrationFinalized = false;
+  return {
+    isRegistrationFinalized: () => registrationFinalized,
+    finalizeRegistration: () => {
+      registrationFinalized = true;
+    },
+  };
+}
+export function windowsInstallerExitDisposition(
+  exitCode: number,
+): "completed" | "restart-initiated" | "failed" {
+  if (exitCode === 0 || exitCode === 3010) return "completed";
+  if (exitCode === 1641) return "restart-initiated";
+  return "failed";
+}
+
+function restartInitiatedResult(executable: string): OperationResult {
+  return {
+    status: "failed",
+    detail: `${executable} exited 1641 after initiating a system restart; refusing further cleanup`,
+    abortAction: true,
+  };
+}
 
 export interface WindowsPaths {
   readonly drive: string;
@@ -213,17 +305,41 @@ export interface WindowsPaths {
   readonly serviceControl: string;
   readonly visualStudioInstaller: string;
   readonly vswhere: string;
+  readonly commandEnvironment: NodeJS.ProcessEnv;
+  readonly chocolateyEnvironment: NodeJS.ProcessEnv;
+  readonly installerEnvironment: NodeJS.ProcessEnv;
 }
 
-interface MsiProduct {
+export interface MsiProduct {
+  readonly registryKey: string;
   readonly productCode: string;
   readonly displayName: string;
+  readonly windowsInstaller: 1;
+}
+
+export interface WindowsUninstallRecord {
+  readonly registryKey: string;
+  readonly displayName?: string;
+  readonly displayVersion?: string;
+  readonly bundleCachePath?: string;
+  readonly windowsInstaller?: number;
 }
 
 interface VisualStudioInstance {
   readonly installationPath: string;
-  readonly installationVersion?: string;
-  readonly productId?: string;
+  readonly definitionRoot: string;
+  readonly installationIdentity: WindowsPathIdentity;
+  readonly installationVersion: string;
+  readonly productId: "Microsoft.VisualStudio.Product.Enterprise";
+}
+
+interface WindowsVisualStudioInventory {
+  readonly instances: readonly VisualStudioInstance[];
+  readonly vswhereExecutable: WindowsPathIdentity;
+}
+
+export interface WindowsVisualStudioDependencies extends WindowsInventoryDependencies {
+  readonly pathProbe?: WindowsPathProbe;
 }
 
 type AsyncValue<T> = () => Promise<T>;
@@ -245,7 +361,10 @@ function absoluteEnvironmentPath(name: string, fallback: string): string {
     : fallback;
 }
 
-export function windowsPaths(): WindowsPaths {
+export function windowsPaths(
+  home = "C:\\Users\\runneradmin",
+  architecture: Architecture = "x64",
+): WindowsPaths {
   // Every supported standard Windows runner definition uses C: for the OS and
   // image-owned software roots. Never let workflow-controlled HOME/SystemDrive
   // redirect system cleanup to another volume.
@@ -280,6 +399,52 @@ export function windowsPaths(): WindowsPaths {
     "Microsoft Visual Studio",
     "Installer",
   );
+  const normalizedHome = win32.normalize(home);
+  const homePath = normalizedHome
+    .toLowerCase()
+    .startsWith(`${drive.toLowerCase()}\\`)
+    ? normalizedHome.slice(drive.length)
+    : "\\Users\\runneradmin";
+  const systemPath = [
+    system32,
+    win32.join(system32, "Wbem"),
+    win32.join(system32, "WindowsPowerShell", "v1.0"),
+    win32.join(systemRoot, "System"),
+    systemRoot,
+  ].join(";");
+  const commandEnvironment: NodeJS.ProcessEnv = {
+    SystemRoot: systemRoot,
+    WINDIR: systemRoot,
+    SystemDrive: drive,
+    ProgramFiles: programFiles,
+    "ProgramFiles(x86)": programFilesX86,
+    ProgramData: programData,
+    CommonProgramFiles: commonProgramFiles,
+    USERPROFILE: normalizedHome,
+    HOMEDRIVE: drive,
+    HOMEPATH: homePath.startsWith("\\") ? homePath : `\\${homePath}`,
+    PATH: systemPath,
+    PATHEXT: ".COM;.EXE;.BAT;.CMD",
+    ComSpec: win32.join(system32, "cmd.exe"),
+    TEMP: win32.join(systemRoot, "Temp"),
+    TMP: win32.join(systemRoot, "Temp"),
+    NoDefaultCurrentDirectoryInExePath: "1",
+  };
+  const installerEnvironment: NodeJS.ProcessEnv = {
+    ...commandEnvironment,
+    ProgramW6432: programFiles,
+    CommonProgramW6432: commonProgramFiles,
+    PROCESSOR_ARCHITECTURE: architecture === "arm64" ? "ARM64" : "AMD64",
+    LOCALAPPDATA: win32.join(normalizedHome, "AppData", "Local"),
+    APPDATA: win32.join(normalizedHome, "AppData", "Roaming"),
+    ALLUSERSPROFILE: programData,
+  };
+  const chocolateyEnvironment: NodeJS.ProcessEnv = {
+    ...installerEnvironment,
+    ChocolateyInstall: chocolateyInstall,
+    ChocolateyToolsLocation: win32.join(drive, "tools"),
+    PATH: `${systemPath};${win32.join(chocolateyInstall, "bin")}`,
+  };
 
   return {
     drive,
@@ -296,15 +461,43 @@ export function windowsPaths(): WindowsPaths {
     serviceControl: win32.join(system32, "sc.exe"),
     visualStudioInstaller,
     vswhere: win32.join(visualStudioInstaller, "vswhere.exe"),
+    commandEnvironment,
+    chocolateyEnvironment,
+    installerEnvironment,
   };
 }
 
-async function pathExists(target: string): Promise<boolean> {
+async function inspectWindowsExecutable(
+  target: string,
+  probe: WindowsPathProbe = NODE_WINDOWS_PATH_PROBE,
+): Promise<WindowsPathIdentity | undefined> {
+  if (probe === NODE_WINDOWS_PATH_PROBE) {
+    const identity = await inspectExecutable(target);
+    return identity === undefined
+      ? undefined
+      : {
+          dev: identity.device,
+          ino: identity.inode,
+          size: identity.size,
+          mtimeNs: identity.modifiedNanoseconds,
+          ...(identity.changedNanoseconds === undefined
+            ? {}
+            : { ctimeNs: identity.changedNanoseconds }),
+          ...(identity.mode === undefined ? {} : { mode: identity.mode }),
+          ...(identity.userId === undefined ? {} : { uid: identity.userId }),
+          ...(identity.groupId === undefined ? {} : { gid: identity.groupId }),
+          ...(identity.contentSha256 === undefined
+            ? {}
+            : { contentSha256: identity.contentSha256 }),
+        };
+  }
   try {
-    await access(target);
-    return true;
-  } catch {
-    return false;
+    const stats = await probe.lstat(target);
+    if (stats.isSymbolicLink() || !stats.isFile()) return undefined;
+    return windowsPathIdentity(stats);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
   }
 }
 
@@ -317,32 +510,81 @@ function failureDetail(
 }
 
 function windowsServiceControl(paths: WindowsPaths): WindowsServiceControl {
+  let validatedExecutable: WindowsPathIdentity | undefined;
+  const assertStableExecutable = async (): Promise<void> => {
+    const current = await inspectWindowsExecutable(paths.serviceControl);
+    if (current === undefined) throw new Error("sc.exe is unavailable");
+    if (
+      validatedExecutable !== undefined &&
+      !sameWindowsPathIdentity(validatedExecutable, current)
+    ) {
+      throw new Error("sc.exe changed after plan validation");
+    }
+    validatedExecutable ??= current;
+  };
   return {
-    exists: async () => await pathExists(paths.serviceControl),
-    inventory: async () =>
-      await runCommand(
+    inspectExecutable: async (executable) =>
+      await inspectWindowsExecutable(executable),
+    exists: async () => {
+      try {
+        await assertStableExecutable();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    inventory: async () => {
+      await assertStableExecutable();
+      return await runCommand(
         paths.serviceControl,
         POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
         {
+          env: paths.commandEnvironment,
           silent: true,
           timeoutMs: 30_000,
         },
-      ),
-    query: async (serviceName) =>
-      await runCommand(paths.serviceControl, ["query", serviceName], {
+      );
+    },
+    query: async (serviceName) => {
+      await assertStableExecutable();
+      return await runCommand(paths.serviceControl, ["query", serviceName], {
+        env: paths.commandEnvironment,
         silent: true,
         timeoutMs: 30_000,
-      }),
-    stop: async (serviceName) =>
-      await runCommand(paths.serviceControl, ["stop", serviceName], {
+      });
+    },
+    config: async (serviceName) => {
+      await assertStableExecutable();
+      return await runCommand(paths.serviceControl, ["qc", serviceName], {
+        env: paths.commandEnvironment,
         silent: true,
         timeoutMs: 30_000,
-      }),
-    delete: async (serviceName) =>
-      await runCommand(paths.serviceControl, ["delete", serviceName], {
+      });
+    },
+    stop: async (serviceName) => {
+      await assertStableExecutable();
+      return await runCommand(paths.serviceControl, ["stop", serviceName], {
+        env: paths.commandEnvironment,
         silent: true,
         timeoutMs: 30_000,
-      }),
+      });
+    },
+    start: async (serviceName) => {
+      await assertStableExecutable();
+      return await runCommand(paths.serviceControl, ["start", serviceName], {
+        env: paths.commandEnvironment,
+        silent: true,
+        timeoutMs: 30_000,
+      });
+    },
+    delete: async (serviceName) => {
+      await assertStableExecutable();
+      return await runCommand(paths.serviceControl, ["delete", serviceName], {
+        env: paths.commandEnvironment,
+        silent: true,
+        timeoutMs: 30_000,
+      });
+    },
   };
 }
 
@@ -353,7 +595,9 @@ function selectedFixedWindowsServices(
     {
       component: "docker-engine",
       serviceName: "docker",
-      unregister: true,
+      // Service registration is retained until Docker engine removal has
+      // completed. Preflight owns only the reversible stop transition.
+      unregister: false,
     },
     {
       component: "apache",
@@ -383,6 +627,98 @@ function windowsServiceFailure(
   );
 }
 
+function assertCompleteWindowsCommandOutput(
+  result: CommandResult,
+  description: string,
+): void {
+  if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+    throw new Error(`${description} exceeded the safe output bound`);
+  }
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return (
+    win32.normalize(left).toLowerCase() === win32.normalize(right).toLowerCase()
+  );
+}
+
+function isWindowsPathAtOrBelow(candidate: string, parent: string): boolean {
+  return (
+    sameWindowsPath(candidate, parent) ||
+    isStrictWindowsDescendant(candidate, parent)
+  );
+}
+
+function executableFromWindowsServiceCommandLine(commandLine: string): string {
+  const value = commandLine.trim();
+  if (value.startsWith('"')) {
+    const closingQuote = value.indexOf('"', 1);
+    if (closingQuote <= 1) {
+      throw new Error("service returned an unterminated executable path");
+    }
+    return value.slice(1, closingQuote);
+  }
+  const executable = /^(\S+?\.exe)(?:\s|$)/i.exec(value)?.[1];
+  if (executable === undefined) {
+    throw new Error("service returned an unsafe unquoted executable path");
+  }
+  return executable;
+}
+
+export function parseAndValidateWindowsServiceExecutable(
+  paths: WindowsPaths,
+  component: ComponentId,
+  serviceName: string,
+  output: string,
+): string {
+  const commandLine = /^\s*BINARY_PATH_NAME\s*:\s*(.+?)\s*$/im.exec(
+    output,
+  )?.[1];
+  if (commandLine === undefined) {
+    throw new Error(`${serviceName}: sc.exe returned no binary path`);
+  }
+  const executable = win32.normalize(
+    executableFromWindowsServiceCommandLine(commandLine),
+  );
+  const accepted =
+    component === "docker-engine"
+      ? sameWindowsPath(executable, win32.join(paths.system32, "dockerd.exe"))
+      : component === "apache"
+        ? win32.basename(executable).toLowerCase() === "httpd.exe" &&
+          isWindowsPathAtOrBelow(
+            executable,
+            win32.join(paths.drive, "tools", "Apache24"),
+          )
+        : component === "nginx"
+          ? win32.basename(executable).toLowerCase() === "nginx.exe" &&
+            isWindowsPathAtOrBelow(executable, win32.join(paths.drive, "tools"))
+          : component === "postgresql"
+            ? win32.basename(executable).toLowerCase() === "pg_ctl.exe" &&
+              isWindowsPathAtOrBelow(
+                executable,
+                win32.join(paths.programFiles, "PostgreSQL"),
+              )
+            : false;
+  if (!accepted) {
+    throw new Error(
+      `${serviceName}: service executable is outside its runner-image installation root`,
+    );
+  }
+  return executable;
+}
+
+function windowsServiceState(result: CommandResult): number | undefined {
+  const stateText = /^\s*STATE\s*:\s*(\d+)\s+[A-Z_]+\b/im.exec(
+    result.stdout,
+  )?.[1];
+  const state = stateText === undefined ? undefined : Number(stateText);
+  return state !== undefined && Number.isSafeInteger(state) ? state : undefined;
+}
+
+function normalizedWindowsServiceConfiguration(output: string): string {
+  return output.trim().replace(/\r\n/g, "\n");
+}
+
 async function discoverWindowsServices(
   paths: WindowsPaths,
   plan: CleanupPlan,
@@ -393,6 +729,7 @@ async function discoverWindowsServices(
   const targets = [...selectedFixedWindowsServices(plan)];
   if (plan.enabled.has("postgresql")) {
     const inventory = await control.inventory();
+    assertCompleteWindowsCommandOutput(inventory, "Windows service inventory");
     if (inventory.exitCode !== 0) {
       throw windowsServiceFailure(paths, "PostgreSQL inventory", inventory);
     }
@@ -412,6 +749,10 @@ async function discoverWindowsServices(
   const snapshots: WindowsServiceSnapshot[] = [];
   for (const target of targets) {
     const result = await control.query(target.serviceName);
+    assertCompleteWindowsCommandOutput(
+      result,
+      `${target.serviceName} service query`,
+    );
     if (isMissingWindowsService(result)) {
       snapshots.push({ ...target, status: "missing", state: 0 });
       continue;
@@ -419,16 +760,57 @@ async function discoverWindowsServices(
     if (result.exitCode !== 0) {
       throw windowsServiceFailure(paths, target.serviceName, result);
     }
-    const stateText = /^\s*STATE\s*:\s*(\d+)\s+[A-Z_]+\b/im.exec(
-      result.stdout,
-    )?.[1];
-    const state = stateText === undefined ? undefined : Number(stateText);
-    if (state === undefined || !Number.isSafeInteger(state)) {
+    const state = windowsServiceState(result);
+    if (state === undefined) {
       throw new Error(
         `${target.serviceName}: sc.exe returned no service state`,
       );
     }
-    snapshots.push({ ...target, status: "present", state });
+    if (state !== 1 && state !== 4) {
+      throw new Error(
+        `${target.serviceName}: service must be in a stable STOPPED or RUNNING state before cleanup`,
+      );
+    }
+    let executable: string | undefined;
+    let executableIdentity: WindowsPathIdentity | undefined;
+    let configuration: string | undefined;
+    if (
+      control.config === undefined ||
+      control.inspectExecutable === undefined
+    ) {
+      throw new Error(
+        `${target.serviceName}: service configuration and executable identity cannot be verified`,
+      );
+    }
+    const config = await control.config(target.serviceName);
+    assertCompleteWindowsCommandOutput(
+      config,
+      `${target.serviceName} service configuration`,
+    );
+    if (config.exitCode !== 0) {
+      throw windowsServiceFailure(paths, target.serviceName, config);
+    }
+    executable = parseAndValidateWindowsServiceExecutable(
+      paths,
+      target.component,
+      target.serviceName,
+      config.stdout,
+    );
+    executableIdentity = await control.inspectExecutable(executable);
+    if (executableIdentity === undefined) {
+      throw new Error(
+        `${target.serviceName}: registered service executable is unavailable`,
+      );
+    }
+    configuration = normalizedWindowsServiceConfiguration(config.stdout);
+    snapshots.push({
+      ...target,
+      status: "present",
+      state,
+      ...(executable === undefined ? {} : { executable }),
+      ...(executableIdentity === undefined ? {} : { executableIdentity }),
+      ...(configuration === undefined ? {} : { configuration }),
+    });
   }
   return snapshots;
 }
@@ -445,7 +827,13 @@ function sameWindowsServiceSnapshot(
         target.serviceName === right[index]?.serviceName &&
         target.unregister === right[index]?.unregister &&
         target.status === right[index]?.status &&
-        target.state === right[index]?.state,
+        target.state === right[index]?.state &&
+        target.executable === right[index]?.executable &&
+        sameOptionalWindowsPathIdentity(
+          target.executableIdentity,
+          right[index]?.executableIdentity,
+        ) &&
+        target.configuration === right[index]?.configuration,
     )
   );
 }
@@ -459,11 +847,15 @@ async function stopWindowsService(
   if (target.state === 1) return;
   const stop = await control.stop(target.serviceName);
   if (isMissingWindowsService(stop)) return;
-  if (stop.exitCode !== 0) {
+  if (stop.exitCode !== 0 && stop.exitCode !== 1062) {
     throw windowsServiceFailure(paths, target.serviceName, stop);
   }
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const status = await control.query(target.serviceName);
+    assertCompleteWindowsCommandOutput(
+      status,
+      `${target.serviceName} service query`,
+    );
     if (isMissingWindowsService(status) || isStoppedWindowsService(status)) {
       return;
     }
@@ -479,13 +871,179 @@ export function createWindowsServiceCoordinator(
   paths: WindowsPaths,
   plan: CleanupPlan,
   control: WindowsServiceControl = windowsServiceControl(paths),
+  dockerLifecycle?: WindowsDockerServiceLifecycle,
 ): Operation | undefined {
   const fixed = selectedFixedWindowsServices(plan);
   if (fixed.length === 0 && !plan.enabled.has("postgresql")) return undefined;
   const component = fixed[0]?.component ?? "postgresql";
+  const wait =
+    control.wait ??
+    (async (milliseconds: number) =>
+      await new Promise((resolve) => setTimeout(resolve, milliseconds)));
   let validated: readonly WindowsServiceSnapshot[] | undefined;
+  let stoppedByAction: WindowsServiceSnapshot[] = [];
+  let rollbackInFlight: Promise<void> | undefined;
   const validate = async (): Promise<void> => {
     validated = await discoverWindowsServices(paths, plan, control);
+  };
+  const performRollback = async (): Promise<void> => {
+    assertCommandTerminationConfirmed();
+    if (stoppedByAction.length === 0) return;
+    const pending = [...stoppedByAction];
+    const restored = new Set<WindowsServiceSnapshot>();
+    const failures: string[] = [];
+    for (const target of [...pending].reverse()) {
+      assertCommandTerminationConfirmed();
+      try {
+        if (
+          target.component === "docker-engine" &&
+          dockerLifecycle?.isRegistrationFinalized() === true
+        ) {
+          restored.add(target);
+          continue;
+        }
+        const current = await control.query(target.serviceName);
+        assertCompleteWindowsCommandOutput(
+          current,
+          `${target.serviceName} rollback query`,
+        );
+        if (isMissingWindowsService(current)) {
+          throw new Error(`${target.serviceName} disappeared before restart`);
+        }
+        if (current.exitCode !== 0) {
+          throw windowsServiceFailure(paths, target.serviceName, current);
+        }
+        const currentState = windowsServiceState(current);
+        if (currentState === 4) {
+          restored.add(target);
+          continue;
+        }
+        if (currentState !== 1) {
+          throw new Error(
+            `${target.serviceName} entered an unsafe state before restart`,
+          );
+        }
+        if (control.start === undefined) {
+          throw new Error(`${target.serviceName} could not be restarted`);
+        }
+        if (
+          target.configuration === undefined ||
+          target.executable === undefined ||
+          target.executableIdentity === undefined ||
+          control.config === undefined ||
+          control.inspectExecutable === undefined
+        ) {
+          throw new Error(
+            `${target.serviceName} configuration and executable identity cannot be revalidated before restart`,
+          );
+        }
+        const configuration = await control.config(target.serviceName);
+        assertCompleteWindowsCommandOutput(
+          configuration,
+          `${target.serviceName} rollback configuration`,
+        );
+        if (configuration.exitCode !== 0) {
+          throw windowsServiceFailure(paths, target.serviceName, configuration);
+        }
+        const executable = parseAndValidateWindowsServiceExecutable(
+          paths,
+          target.component,
+          target.serviceName,
+          configuration.stdout,
+        );
+        if (
+          !sameWindowsPath(executable, target.executable) ||
+          normalizedWindowsServiceConfiguration(configuration.stdout) !==
+            target.configuration
+        ) {
+          throw new Error(
+            `${target.serviceName} configuration changed before rollback`,
+          );
+        }
+        const executableIdentity = await control.inspectExecutable(executable);
+        if (
+          !sameWindowsPathIdentity(
+            target.executableIdentity,
+            executableIdentity,
+          )
+        ) {
+          throw new Error(
+            `${target.serviceName} executable identity changed before rollback`,
+          );
+        }
+
+        const started = await control.start(target.serviceName);
+        if (started.exitCode !== 0 && started.exitCode !== 1056) {
+          throw windowsServiceFailure(paths, target.serviceName, started);
+        }
+
+        let running = false;
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+          const currentResult = await control.query(target.serviceName);
+          assertCompleteWindowsCommandOutput(
+            currentResult,
+            `${target.serviceName} rollback query`,
+          );
+          if (isMissingWindowsService(currentResult)) {
+            throw new Error(
+              `${target.serviceName} disappeared while restarting`,
+            );
+          }
+          if (currentResult.exitCode !== 0) {
+            throw windowsServiceFailure(
+              paths,
+              target.serviceName,
+              currentResult,
+            );
+          }
+          const state = windowsServiceState(currentResult);
+          if (state === 4) {
+            running = true;
+            break;
+          }
+          if (state !== 2 && state !== 3) break;
+          await wait(500);
+        }
+        if (!running) {
+          throw new Error(
+            `${target.serviceName} did not reach RUNNING during rollback`,
+          );
+        }
+        restored.add(target);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    stoppedByAction = pending.filter((target) => !restored.has(target));
+    if (failures.length > 0) {
+      throw new Error(failures.join("; "));
+    }
+  };
+  const rollback = async (): Promise<void> => {
+    if (rollbackInFlight !== undefined) {
+      await rollbackInFlight;
+      return;
+    }
+    const currentRollback = performRollback();
+    rollbackInFlight = currentRollback;
+    try {
+      await currentRollback;
+    } finally {
+      if (rollbackInFlight === currentRollback) rollbackInFlight = undefined;
+    }
+  };
+  const failWithRollback = async (detail: string): Promise<OperationResult> => {
+    try {
+      await rollback();
+      return { status: "failed", detail };
+    } catch (error) {
+      const rollbackDetail =
+        error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        detail: `${detail}; rollback: ${rollbackDetail}`,
+      };
+    }
   };
   return createFunctionOperation({
     id: "windows:services:stop",
@@ -495,17 +1053,25 @@ export function createWindowsServiceCoordinator(
     dedupeKey: "windows:services:stop",
     fatal: true,
     validate,
+    rollback,
     run: async (): Promise<OperationResult> => {
+      if (stoppedByAction.length !== 0) {
+        return await failWithRollback(
+          "Windows service rollback state remained before execution",
+        );
+      }
       try {
         validated ??= await discoverWindowsServices(paths, plan, control);
         const immediate = await discoverWindowsServices(paths, plan, control);
         if (!sameWindowsServiceSnapshot(validated, immediate)) {
-          return {
-            status: "failed",
-            detail: "Windows service inventory changed after plan validation",
-          };
+          return await failWithRollback(
+            "Windows service inventory changed after plan validation",
+          );
         }
         for (const target of immediate) {
+          if (target.status === "present" && target.state !== 1) {
+            stoppedByAction.push(target);
+          }
           await stopWindowsService(paths, target, control);
         }
         const stopped = await discoverWindowsServices(paths, plan, control);
@@ -516,30 +1082,29 @@ export function createWindowsServiceCoordinator(
               target.component !== immediate[index]?.component ||
               target.serviceName !== immediate[index]?.serviceName ||
               target.unregister !== immediate[index]?.unregister ||
+              target.executable !== immediate[index]?.executable ||
+              !sameOptionalWindowsPathIdentity(
+                target.executableIdentity,
+                immediate[index]?.executableIdentity,
+              ) ||
+              target.configuration !== immediate[index]?.configuration ||
               (target.status === "present" && target.state !== 1),
           )
         ) {
-          return {
-            status: "failed",
-            detail:
-              "Windows service inventory changed or reactivated after stop",
-          };
+          return await failWithRollback(
+            "Windows service inventory changed or reactivated after stop",
+          );
         }
-        for (const target of immediate) {
-          if (!target.unregister || target.status === "missing") continue;
-          const deleted = await control.delete(target.serviceName);
-          if (deleted.exitCode !== 0 && !isMissingWindowsService(deleted)) {
-            throw windowsServiceFailure(paths, target.serviceName, deleted);
-          }
-        }
+        // Preflight never unregisters a service. A later component-owned
+        // operation may remove registration only after its payload cleanup and
+        // postconditions have succeeded.
         return immediate.some(({ status }) => status === "present")
           ? { status: "removed" }
           : { status: "not-found" };
       } catch (error) {
-        return {
-          status: "failed",
-          detail: error instanceof Error ? error.message : String(error),
-        };
+        return await failWithRollback(
+          error instanceof Error ? error.message : String(error),
+        );
       }
     },
   });
@@ -602,15 +1167,20 @@ async function versionedDirectories(
 ): Promise<readonly string[]> {
   try {
     const entries = await readdir(parent, { withFileTypes: true });
-    return entries
+    const selected = entries
       .filter(
         (entry) =>
           (entry.isDirectory() || entry.isSymbolicLink()) &&
           pattern.test(entry.name),
       )
       .map((entry) => win32.join(parent, entry.name))
-      .sort((left, right) => left.localeCompare(right))
-      .slice(0, MAX_VERSIONED_CHILDREN);
+      .sort((left, right) => left.localeCompare(right));
+    if (selected.length > MAX_VERSIONED_CHILDREN) {
+      throw new Error(
+        `versioned directory inventory under '${parent}' exceeded ${MAX_VERSIONED_CHILDREN} entries`,
+      );
+    }
+    return selected;
   } catch (error) {
     if (
       error instanceof Error &&
@@ -624,56 +1194,181 @@ async function versionedDirectories(
   }
 }
 
-async function listChocolateyPackages(
+export async function listChocolateyPackages(
   executable: string,
-): Promise<ReadonlySet<string>> {
-  if (!(await pathExists(executable))) return new Set();
-  const result = await runCommand(
+  environment: NodeJS.ProcessEnv = windowsPaths().chocolateyEnvironment,
+  dependencies: WindowsInventoryDependencies = {},
+): Promise<WindowsChocolateyInventory> {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  const executableIdentity = await inspect(executable);
+  if (executableIdentity === undefined) {
+    throw new Error(`Chocolatey executable is unavailable: ${executable}`);
+  }
+  if (
+    dependencies.expectedInventoryExecutable !== undefined &&
+    !sameWindowsPathIdentity(
+      dependencies.expectedInventoryExecutable,
+      executableIdentity,
+    )
+  ) {
+    throw new Error("Chocolatey executable changed before package inventory");
+  }
+  const result = await execute(
     executable,
     // Chocolatey 2 made `list` local-only and removed --local-only. Hosted
     // Windows images use Chocolatey 2+, so avoid the removed compatibility flag.
     ["list", "--limit-output", "--no-color"],
-    { silent: true, timeoutMs: 2 * 60_000 },
+    {
+      env: environment,
+      silent: true,
+      timeoutMs: 2 * 60_000,
+    },
   );
-  if (result.exitCode !== 0) return new Set();
+  if (result.exitCode !== 0) {
+    throw new Error(
+      failureDetail(
+        result.stderr || result.stdout,
+        executable,
+        result.exitCode,
+      ),
+    );
+  }
+  if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+    throw new Error(
+      "Chocolatey package inventory exceeded the safe output bound",
+    );
+  }
+  const currentExecutable = await inspect(executable);
+  if (!sameWindowsPathIdentity(executableIdentity, currentExecutable)) {
+    throw new Error(
+      "Chocolatey executable changed while reading package inventory",
+    );
+  }
 
-  return new Set(
-    result.stdout
-      .split(/\r?\n/)
-      .map((line) => line.split("|", 1)[0]?.trim().toLowerCase())
-      .filter((name): name is string => name !== undefined && name !== ""),
-  );
+  const versions = new Map<string, string>();
+  for (const line of result.stdout.split(/\r?\n/)) {
+    if (line.trim() === "") continue;
+    const separator = line.indexOf("|");
+    if (separator === -1 || separator !== line.lastIndexOf("|")) {
+      throw new Error("Chocolatey returned an unsafe package inventory record");
+    }
+    const name = line.slice(0, separator).trim().toLowerCase();
+    const version = line.slice(separator + 1).trim();
+    if (
+      !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(name) ||
+      version === "" ||
+      version.length > 128
+    ) {
+      throw new Error("Chocolatey returned an unsafe package inventory record");
+    }
+    const existing = versions.get(name);
+    if (existing !== undefined && existing !== version) {
+      throw new Error(`Chocolatey returned conflicting versions for ${name}`);
+    }
+    versions.set(name, version);
+  }
+  return {
+    packages: new Set(versions.keys()),
+    versions,
+    executable: executableIdentity,
+  };
 }
 
-function chocolateyOperation(
+export interface WindowsChocolateyInventory {
+  readonly packages: ReadonlySet<string>;
+  readonly versions: ReadonlyMap<string, string>;
+  readonly executable: WindowsPathIdentity;
+}
+
+export function createWindowsChocolateyOperation(
   paths: WindowsPaths,
   component: ComponentId,
   packageNames: readonly string[],
-  installedPackages: AsyncValue<ReadonlySet<string>>,
+  installedPackages: AsyncValue<WindowsChocolateyInventory>,
   dedupeKey?: string,
+  dependencies: WindowsInventoryDependencies = {},
 ): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
   return createFunctionOperation({
     id: `windows:choco:${component}:${packageNames.join(",")}`,
     component,
     description: `Uninstall ${packageNames.join(", ")} with Chocolatey`,
     phase: "package",
     dedupeKey: dedupeKey ?? `windows:choco:${packageNames.join(",")}`,
+    validate: async () => {
+      await installedPackages();
+    },
     run: async (): Promise<OperationResult> => {
-      if (!(await pathExists(paths.chocolatey))) return { status: "not-found" };
       const installed = await installedPackages();
+      const current = await inspect(paths.chocolatey);
+      if (!sameWindowsPathIdentity(installed.executable, current)) {
+        return {
+          status: "failed",
+          detail: "Chocolatey executable changed after plan validation",
+        };
+      }
       const selected = packageNames.filter((name) =>
-        installed.has(name.toLowerCase()),
+        installed.packages.has(name.toLowerCase()),
       );
       if (selected.length === 0) return { status: "not-found" };
 
-      const result = await runCommand(
-        paths.chocolatey,
-        ["uninstall", ...selected, "--yes", "--no-progress", "--limit-output"],
-        { silent: false, timeoutMs: 20 * 60_000 },
-      );
-      return result.exitCode === 0
-        ? { status: "removed", detail: selected.join(", ") }
-        : {
+      let removed = 0;
+      for (const name of selected) {
+        const canonicalName = name.toLowerCase();
+        const expectedVersion = installed.versions.get(canonicalName);
+        if (expectedVersion === undefined) {
+          return {
+            status: "failed",
+            detail: `Chocolatey inventory has no version for ${name}`,
+          };
+        }
+        const fresh = await listChocolateyPackages(
+          paths.chocolatey,
+          paths.chocolateyEnvironment,
+          {
+            ...dependencies,
+            expectedInventoryExecutable: installed.executable,
+          },
+        );
+        if (fresh.versions.get(canonicalName) !== expectedVersion) {
+          return {
+            status: "failed",
+            detail: `Chocolatey package ${name} changed after plan validation`,
+          };
+        }
+        const beforeSpawn = await inspect(paths.chocolatey);
+        if (!sameWindowsPathIdentity(installed.executable, beforeSpawn)) {
+          return {
+            status: "failed",
+            detail: "Chocolatey executable changed immediately before spawn",
+          };
+        }
+        const result = await execute(
+          paths.chocolatey,
+          [
+            "uninstall",
+            name,
+            "--version",
+            expectedVersion,
+            "--exact",
+            "--yes",
+            "--no-progress",
+            "--limit-output",
+          ],
+          {
+            env: paths.chocolateyEnvironment,
+            silent: false,
+            timeoutMs: 20 * 60_000,
+          },
+        );
+        const disposition = windowsInstallerExitDisposition(result.exitCode);
+        if (disposition === "restart-initiated") {
+          return restartInitiatedResult(paths.chocolatey);
+        }
+        if (disposition === "failed") {
+          return {
             status: "failed",
             detail: failureDetail(
               result.stderr,
@@ -681,93 +1376,382 @@ function chocolateyOperation(
               result.exitCode,
             ),
           };
+        }
+        const after = await listChocolateyPackages(
+          paths.chocolatey,
+          paths.chocolateyEnvironment,
+          {
+            ...dependencies,
+            expectedInventoryExecutable: installed.executable,
+          },
+        );
+        if (after.packages.has(canonicalName)) {
+          return {
+            status: "failed",
+            detail: `Chocolatey package ${name} remained installed after uninstall`,
+          };
+        }
+        removed += 1;
+      }
+      return removed === 0
+        ? { status: "not-found" }
+        : { status: "removed", detail: selected.join(", ") };
     },
   });
 }
 
-const UNINSTALL_REGISTRY_ROOTS = [
+export const UNINSTALL_REGISTRY_ROOTS = Object.freeze([
   "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
   "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-  "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-] as const;
+] as const);
 
-function parseMsiProducts(output: string): readonly MsiProduct[] {
-  const products: MsiProduct[] = [];
-  let currentProductCode: string | undefined;
+export function parseWindowsUninstallRecords(
+  output: string,
+): readonly WindowsUninstallRecord[] {
+  const records: WindowsUninstallRecord[] = [];
+  let currentKey: string | undefined;
+  let values = new Map<string, string>();
+  const flush = (): void => {
+    if (currentKey === undefined) return;
+    const displayName = values.get("displayname");
+    const displayVersion = values.get("displayversion");
+    const bundleCachePath = values.get("bundlecachepath");
+    const windowsInstallerText = values.get("windowsinstaller");
+    const windowsInstaller =
+      windowsInstallerText === undefined
+        ? undefined
+        : /^0x[0-9a-f]+$/i.test(windowsInstallerText)
+          ? Number.parseInt(windowsInstallerText.slice(2), 16)
+          : /^\d+$/.test(windowsInstallerText)
+            ? Number.parseInt(windowsInstallerText, 10)
+            : undefined;
+    records.push({
+      registryKey: currentKey,
+      ...(displayName === undefined ? {} : { displayName }),
+      ...(displayVersion === undefined ? {} : { displayVersion }),
+      ...(bundleCachePath === undefined ? {} : { bundleCachePath }),
+      ...(windowsInstaller === undefined ? {} : { windowsInstaller }),
+    });
+  };
+
   for (const line of output.split(/\r?\n/)) {
     const trimmed = line.trim();
-    if (/^HKEY_/i.test(trimmed)) {
-      const candidate = win32.basename(trimmed);
-      currentProductCode =
-        /^\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}$/i.test(
-          candidate,
-        )
-          ? candidate
-          : undefined;
+    if (/^HKEY_[A-Z_]+\\/i.test(trimmed)) {
+      flush();
+      currentKey = trimmed;
+      values = new Map<string, string>();
       continue;
     }
-    const displayName = /^DisplayName\s+REG_\w+\s+(.+)$/i.exec(trimmed)?.[1];
-    if (currentProductCode !== undefined && displayName !== undefined) {
-      products.push({
-        productCode: currentProductCode,
-        displayName: displayName.trim(),
-      });
+    if (currentKey === undefined) continue;
+    const value =
+      /^\s*([^\s]+)\s+REG_(?:SZ|EXPAND_SZ|DWORD|QWORD)\s+(.*?)\s*$/i.exec(line);
+    const name = value?.[1];
+    const contents = value?.[2];
+    if (name !== undefined && contents !== undefined) {
+      values.set(name.toLowerCase(), contents);
     }
   }
-  return products;
+  flush();
+  return records;
 }
 
-async function listMsiProducts(
+function msiProductFromRecord(
+  record: WindowsUninstallRecord,
+): MsiProduct | undefined {
+  const productCode = win32.basename(record.registryKey);
+  if (
+    !/^\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}$/i.test(
+      productCode,
+    ) ||
+    record.displayName === undefined ||
+    record.windowsInstaller !== 1
+  ) {
+    return undefined;
+  }
+  return {
+    registryKey: record.registryKey,
+    productCode,
+    displayName: record.displayName,
+    windowsInstaller: 1,
+  };
+}
+
+export interface WindowsMsiInventory {
+  readonly products: readonly MsiProduct[];
+  readonly registryExecutable: WindowsPathIdentity;
+}
+
+export interface WindowsUninstallInventory {
+  readonly records: readonly WindowsUninstallRecord[];
+  readonly registryExecutable: WindowsPathIdentity;
+}
+
+function isMissingRegistryValue(result: CommandResult): boolean {
+  return (
+    result.exitCode === 1 &&
+    /The system was unable to find the specified registry key or value\.?/i.test(
+      `${result.stdout}\n${result.stderr}`,
+    )
+  );
+}
+
+export async function listWindowsUninstallRecords(
   paths: WindowsPaths,
-): Promise<readonly MsiProduct[]> {
-  if (!(await pathExists(paths.reg))) return [];
-  const byCode = new Map<string, MsiProduct>();
+  dependencies: WindowsInventoryDependencies = {},
+): Promise<WindowsUninstallInventory> {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  const registryExecutable = await inspect(paths.reg);
+  if (registryExecutable === undefined) {
+    throw new Error(`reg.exe is unavailable at ${paths.reg}`);
+  }
+  const byKey = new Map<string, WindowsUninstallRecord>();
   for (const root of UNINSTALL_REGISTRY_ROOTS) {
-    const result = await runCommand(
-      paths.reg,
-      ["query", root, "/s", "/v", "DisplayName"],
-      { silent: true, timeoutMs: 2 * 60_000 },
-    );
-    // reg.exe returns 1 when a root or value is absent. Other roots can still
-    // contain the requested MSI product, so absence is intentionally ignored.
-    if (result.exitCode !== 0 && result.stdout.trim() === "") continue;
-    for (const product of parseMsiProducts(result.stdout)) {
+    const result = await execute(paths.reg, ["query", root, "/s"], {
+      env: paths.commandEnvironment,
+      silent: true,
+      timeoutMs: 2 * 60_000,
+    });
+    if (isMissingRegistryValue(result)) continue;
+    if (result.exitCode !== 0) {
+      throw new Error(
+        failureDetail(
+          result.stderr || result.stdout,
+          paths.reg,
+          result.exitCode,
+        ),
+      );
+    }
+    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+      throw new Error(
+        "uninstall registry inventory exceeded the safe output bound",
+      );
+    }
+    for (const record of parseWindowsUninstallRecords(result.stdout)) {
+      byKey.set(win32.normalize(record.registryKey).toLowerCase(), record);
+    }
+  }
+  const currentRegistryExecutable = await inspect(paths.reg);
+  if (!sameWindowsPathIdentity(registryExecutable, currentRegistryExecutable)) {
+    throw new Error("reg.exe changed while reading the installed product list");
+  }
+  return {
+    records: [...byKey.values()],
+    registryExecutable,
+  };
+}
+
+export async function listMsiProducts(
+  paths: WindowsPaths,
+  dependencies: WindowsInventoryDependencies = {},
+): Promise<WindowsMsiInventory> {
+  const inventory = await listWindowsUninstallRecords(paths, dependencies);
+  const byCode = new Map<string, MsiProduct>();
+  for (const record of inventory.records) {
+    const product = msiProductFromRecord(record);
+    if (product !== undefined) {
       byCode.set(product.productCode.toLowerCase(), product);
     }
   }
-  return [...byCode.values()];
+  return {
+    products: [...byCode.values()],
+    registryExecutable: inventory.registryExecutable,
+  };
 }
 
-function msiOperation(
+async function readExactUninstallRecord(
+  paths: WindowsPaths,
+  registryKey: string,
+  expectedRegistryExecutable: WindowsPathIdentity,
+  dependencies: WindowsInventoryDependencies,
+): Promise<WindowsUninstallRecord | undefined> {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  const before = await inspect(paths.reg);
+  if (!sameWindowsPathIdentity(expectedRegistryExecutable, before)) {
+    throw new Error("reg.exe changed before exact product verification");
+  }
+  const result = await execute(paths.reg, ["query", registryKey], {
+    env: paths.commandEnvironment,
+    silent: true,
+    timeoutMs: 30_000,
+  });
+  let record: WindowsUninstallRecord | undefined;
+  if (!isMissingRegistryValue(result)) {
+    if (result.exitCode !== 0) {
+      throw new Error(
+        failureDetail(
+          result.stderr || result.stdout,
+          paths.reg,
+          result.exitCode,
+        ),
+      );
+    }
+    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+      throw new Error("exact product query exceeded the safe output bound");
+    }
+    const matches = parseWindowsUninstallRecords(result.stdout).filter(
+      ({ registryKey: candidate }) =>
+        win32.normalize(candidate).toLowerCase() ===
+        win32.normalize(registryKey).toLowerCase(),
+    );
+    if (matches.length !== 1) {
+      throw new Error(
+        `exact product query returned ${matches.length} matching records`,
+      );
+    }
+    record = matches[0];
+  }
+  const after = await inspect(paths.reg);
+  if (!sameWindowsPathIdentity(expectedRegistryExecutable, after)) {
+    throw new Error("reg.exe changed during exact product verification");
+  }
+  return record;
+}
+
+function sameMsiProduct(left: MsiProduct, right: MsiProduct): boolean {
+  return (
+    win32.normalize(left.registryKey).toLowerCase() ===
+      win32.normalize(right.registryKey).toLowerCase() &&
+    left.productCode.toLowerCase() === right.productCode.toLowerCase() &&
+    left.displayName === right.displayName &&
+    left.windowsInstaller === right.windowsInstaller
+  );
+}
+
+export function createWindowsMsiOperation(
   paths: WindowsPaths,
   component: ComponentId,
   displayNamePatterns: readonly RegExp[],
-  products: AsyncValue<readonly MsiProduct[]>,
+  products: AsyncValue<WindowsMsiInventory>,
   id: string,
   description: string,
+  dependencies: WindowsInventoryDependencies = {},
 ): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  let validatedMsiexec: WindowsPathIdentity | undefined;
+  let msiexecValidationComplete = false;
   return createFunctionOperation({
     id: `windows:msi:${component}:${id}`,
     component,
     description,
     phase: "package",
     dedupeKey: `windows:msi:${id}`,
+    validate: async () => {
+      const inventory = await products();
+      const selected = inventory.products.filter((product) =>
+        displayNamePatterns.some((pattern) =>
+          pattern.test(product.displayName),
+        ),
+      );
+      if (selected.length !== 0 && inventory.registryExecutable === undefined) {
+        throw new Error("reg.exe identity is unavailable for MSI products");
+      }
+      validatedMsiexec = await inspect(paths.msiexec);
+      if (selected.length !== 0 && validatedMsiexec === undefined) {
+        throw new Error(`msiexec.exe is unavailable at ${paths.msiexec}`);
+      }
+      msiexecValidationComplete = true;
+    },
     run: async (): Promise<OperationResult> => {
-      if (!(await pathExists(paths.msiexec))) return { status: "not-found" };
-      const selected = (await products()).filter((product) =>
+      const inventory = await products();
+      const selected = inventory.products.filter((product) =>
         displayNamePatterns.some((pattern) =>
           pattern.test(product.displayName),
         ),
       );
       if (selected.length === 0) return { status: "not-found" };
-
+      if (inventory.registryExecutable === undefined) {
+        return {
+          status: "failed",
+          detail: "reg.exe identity is unavailable for MSI products",
+        };
+      }
+      const msiexec = await inspect(paths.msiexec);
+      if (
+        msiexecValidationComplete &&
+        validatedMsiexec === undefined &&
+        msiexec === undefined
+      ) {
+        return {
+          status: "failed",
+          detail: `msiexec.exe is unavailable at ${paths.msiexec}`,
+        };
+      }
+      if (
+        msiexecValidationComplete &&
+        !sameWindowsPathIdentity(validatedMsiexec, msiexec)
+      ) {
+        return {
+          status: "failed",
+          detail: "msiexec.exe changed after plan validation",
+        };
+      }
+      if (msiexec === undefined) {
+        return {
+          status: "failed",
+          detail: `msiexec.exe is unavailable at ${paths.msiexec}`,
+        };
+      }
+      const registry = await inspect(paths.reg);
+      if (
+        inventory.registryExecutable !== undefined &&
+        !sameWindowsPathIdentity(inventory.registryExecutable, registry)
+      ) {
+        return {
+          status: "failed",
+          detail: "reg.exe changed after product discovery",
+        };
+      }
+      let removed = 0;
       for (const product of selected) {
-        const result = await runCommand(
+        let exact: MsiProduct | undefined;
+        try {
+          const record = await readExactUninstallRecord(
+            paths,
+            product.registryKey,
+            inventory.registryExecutable,
+            dependencies,
+          );
+          exact =
+            record === undefined ? undefined : msiProductFromRecord(record);
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (exact === undefined || !sameMsiProduct(product, exact)) {
+          return {
+            status: "failed",
+            detail: `${product.displayName} registry identity changed before uninstall`,
+          };
+        }
+        const beforeSpawn = await inspect(paths.msiexec);
+        if (!sameWindowsPathIdentity(msiexec, beforeSpawn)) {
+          return {
+            status: "failed",
+            detail: "msiexec.exe changed immediately before spawn",
+          };
+        }
+        const result = await execute(
           paths.msiexec,
           ["/x", product.productCode, "/qn", "/norestart"],
-          { silent: true, timeoutMs: 30 * 60_000 },
+          {
+            env: paths.installerEnvironment,
+            silent: true,
+            timeoutMs: 30 * 60_000,
+          },
         );
-        if (!MSI_SUCCESS_EXIT_CODES.has(result.exitCode)) {
+        const disposition = windowsInstallerExitDisposition(result.exitCode);
+        if (disposition === "restart-initiated") {
+          return restartInitiatedResult(paths.msiexec);
+        }
+        if (
+          disposition === "failed" &&
+          !MSI_ABSENT_EXIT_CODES.has(result.exitCode)
+        ) {
           return {
             status: "failed",
             detail: `${product.displayName}: ${failureDetail(
@@ -777,11 +1761,34 @@ function msiOperation(
             )}`,
           };
         }
+        let after: WindowsUninstallRecord | undefined;
+        try {
+          after = await readExactUninstallRecord(
+            paths,
+            product.registryKey,
+            inventory.registryExecutable,
+            dependencies,
+          );
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+        if (after !== undefined) {
+          return {
+            status: "failed",
+            detail: `${product.displayName} remained registered after msiexec exited ${result.exitCode}`,
+          };
+        }
+        if (disposition === "completed") removed += 1;
       }
-      return {
-        status: "removed",
-        detail: selected.map((product) => product.displayName).join(", "),
-      };
+      return removed === 0
+        ? { status: "not-found" }
+        : {
+            status: "removed",
+            detail: selected.map((product) => product.displayName).join(", "),
+          };
     },
   });
 }
@@ -846,6 +1853,9 @@ async function inspectExecutableUninstallCandidate(
   context: RuntimeContext,
   candidate: WindowsExecutableUninstallCandidate,
   probe: WindowsPathProbe,
+  inspectFile?: (
+    executable: string,
+  ) => Promise<WindowsPathIdentity | undefined>,
 ): Promise<WindowsExecutableUninstallSnapshot> {
   await validateExactTarget(context, candidate.installationRoot);
   await validateRemovePathTarget(
@@ -887,11 +1897,20 @@ async function inspectExecutableUninstallCandidate(
       `Refusing executable uninstaller with an unexpected executable type: '${candidate.executable}'.`,
     );
   }
+  const executableIdentity =
+    inspectFile === undefined
+      ? windowsPathIdentity(executable)
+      : await inspectFile(candidate.executable);
+  if (executableIdentity === undefined) {
+    throw new Error(
+      `Unable to establish executable content identity: '${candidate.executable}'.`,
+    );
+  }
   return {
     candidate,
     status: "present",
     root: windowsPathIdentity(root),
-    executable: windowsPathIdentity(executable),
+    executable: executableIdentity,
   };
 }
 
@@ -904,19 +1923,36 @@ export function executableUninstallOperation(options: {
   readonly args: readonly string[];
   readonly timeoutMs?: number;
   readonly probe?: WindowsPathProbe;
+  readonly inspectExecutable?: (
+    executable: string,
+  ) => Promise<WindowsPathIdentity | undefined>;
   readonly execute?: (
     executable: string,
     args: readonly string[],
   ) => Promise<CommandResult>;
+  readonly removeInstallationRoot?: (
+    target: string,
+  ) => Promise<OperationResult>;
 }): Operation {
   const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const inspectFile =
+    options.inspectExecutable ??
+    (probe === NODE_WINDOWS_PATH_PROBE
+      ? async (target: string) => await inspectWindowsExecutable(target)
+      : undefined);
   const execute =
     options.execute ??
     (async (executable: string, args: readonly string[]) =>
       await runCommand(executable, args, {
+        env: windowsPaths(options.context.home, options.context.architecture)
+          .installerEnvironment,
         silent: true,
         timeoutMs: options.timeoutMs ?? 20 * 60_000,
       }));
+  const removeInstallationRoot =
+    options.removeInstallationRoot ??
+    (async (target: string) =>
+      await removeExactTarget(options.context, target));
   const candidates = [
     ...new Map(
       options.candidates.map((candidate) => [
@@ -937,6 +1973,7 @@ export function executableUninstallOperation(options: {
             options.context,
             candidate,
             probe,
+            inspectFile,
           ),
       ),
     );
@@ -962,30 +1999,71 @@ export function executableUninstallOperation(options: {
         }
         let removed = false;
         for (const snapshot of validated) {
-          if (snapshot.status !== "present") continue;
-          const beforeSpawn = await inspectExecutableUninstallCandidate(
+          if (snapshot.status === "root-absent") continue;
+          if (snapshot.status === "present") {
+            const beforeSpawn = await inspectExecutableUninstallCandidate(
+              options.context,
+              snapshot.candidate,
+              probe,
+              inspectFile,
+            );
+            if (!sameExecutableUninstallSnapshot(snapshot, beforeSpawn)) {
+              return {
+                status: "failed",
+                detail:
+                  "executable uninstaller changed immediately before spawn",
+              };
+            }
+            const result = await execute(
+              snapshot.candidate.executable,
+              options.args,
+            );
+            const disposition = windowsInstallerExitDisposition(
+              result.exitCode,
+            );
+            if (disposition === "restart-initiated") {
+              return restartInitiatedResult(snapshot.candidate.executable);
+            }
+            if (disposition === "failed") {
+              return {
+                status: "failed",
+                detail: failureDetail(
+                  result.stderr,
+                  snapshot.candidate.executable,
+                  result.exitCode,
+                ),
+              };
+            }
+          }
+          const afterUninstall = await inspectExecutableUninstallCandidate(
             options.context,
             snapshot.candidate,
             probe,
+            inspectFile,
           );
-          if (!sameExecutableUninstallSnapshot(snapshot, beforeSpawn)) {
+          if (afterUninstall.status === "root-absent") {
+            removed = true;
+            continue;
+          }
+          const residualRemoval = await removeInstallationRoot(
+            snapshot.candidate.installationRoot,
+          );
+          if (residualRemoval.status === "failed") {
             return {
               status: "failed",
-              detail: "executable uninstaller changed immediately before spawn",
+              detail: `could not remove residual installation root '${snapshot.candidate.installationRoot}': ${residualRemoval.detail ?? "removal failed"}`,
             };
           }
-          const result = await execute(
-            snapshot.candidate.executable,
-            options.args,
+          const verified = await inspectExecutableUninstallCandidate(
+            options.context,
+            snapshot.candidate,
+            probe,
+            inspectFile,
           );
-          if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+          if (verified.status !== "root-absent") {
             return {
               status: "failed",
-              detail: failureDetail(
-                result.stderr,
-                snapshot.candidate.executable,
-                result.exitCode,
-              ),
+              detail: `installation root remained after cleanup: '${snapshot.candidate.installationRoot}'`,
             };
           }
           removed = true;
@@ -1017,20 +2095,89 @@ export function isStrictWindowsDescendant(
   );
 }
 
-async function listVisualStudioInstances(
+export async function assertWindowsDirectoryChain(
+  candidate: string,
+  parent: string,
+  probe: WindowsPathProbe = NODE_WINDOWS_PATH_PROBE,
+): Promise<WindowsPathIdentity> {
+  if (!isStrictWindowsDescendant(candidate, parent)) {
+    throw new Error(`'${candidate}' is outside '${parent}'`);
+  }
+  const relative = win32.relative(
+    win32.resolve(parent),
+    win32.resolve(candidate),
+  );
+  const paths = [parent];
+  let current = parent;
+  for (const segment of relative.split(win32.sep)) {
+    current = win32.join(current, segment);
+    paths.push(current);
+  }
+  let identity: WindowsPathIdentity | undefined;
+  for (const path of paths) {
+    const stats = await probe.lstat(path);
+    if (stats.isSymbolicLink()) {
+      throw new Error(
+        `Refusing Windows directory path containing a reparse point: '${path}'`,
+      );
+    }
+    if (!stats.isDirectory()) {
+      throw new Error(`Refusing non-directory Windows path: '${path}'`);
+    }
+    identity = windowsPathIdentity(stats);
+  }
+  if (identity === undefined) {
+    throw new Error(`Unable to inspect Windows directory path '${candidate}'`);
+  }
+  return identity;
+}
+
+export async function listVisualStudioInstances(
   paths: WindowsPaths,
-): Promise<readonly VisualStudioInstance[]> {
-  const vswhere = (await pathExists(paths.vswhere))
-    ? paths.vswhere
-    : win32.join(win32.dirname(paths.chocolatey), "vswhere.exe");
-  if (!(await pathExists(vswhere))) return [];
-  const result = await runCommand(
+  dependencies: WindowsVisualStudioDependencies = {},
+  requiredComponents: readonly string[] = [],
+): Promise<WindowsVisualStudioInventory> {
+  const vswhere = paths.vswhere;
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  const vswhereExecutable = await inspect(vswhere);
+  if (vswhereExecutable === undefined) {
+    throw new Error(`vswhere.exe is unavailable at ${vswhere}`);
+  }
+  if (
+    dependencies.expectedInventoryExecutable !== undefined &&
+    !sameWindowsPathIdentity(
+      dependencies.expectedInventoryExecutable,
+      vswhereExecutable,
+    )
+  ) {
+    throw new Error("vswhere.exe changed before Visual Studio inventory");
+  }
+  const result = await execute(
     vswhere,
-    ["-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"],
-    { silent: true, timeoutMs: 2 * 60_000 },
+    [
+      "-all",
+      "-prerelease",
+      "-products",
+      "*",
+      ...(requiredComponents.length === 0
+        ? []
+        : ["-requiresAny", "-requires", ...requiredComponents]),
+      "-format",
+      "json",
+      "-utf8",
+    ],
+    {
+      env: paths.commandEnvironment,
+      silent: true,
+      timeoutMs: 2 * 60_000,
+    },
   );
   if (result.exitCode !== 0) {
     throw new Error(failureDetail(result.stderr, vswhere, result.exitCode));
+  }
+  if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+    throw new Error("vswhere inventory exceeded the safe output bound");
   }
 
   const parsed: unknown = JSON.parse(result.stdout);
@@ -1040,39 +2187,159 @@ async function listVisualStudioInstances(
     win32.join(paths.programFilesX86, "Microsoft Visual Studio"),
   ];
   const instances: VisualStudioInstance[] = [];
-  for (const value of parsed) {
-    if (typeof value !== "object" || value === null) continue;
+  for (const [index, value] of parsed.entries()) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(
+        `vswhere returned an unclassified Visual Studio record at index ${index}`,
+      );
+    }
     const record = value as Record<string, unknown>;
     const installationPath = record.installationPath;
     const installationVersion = record.installationVersion;
     const productId = record.productId;
     if (
-      typeof installationPath !== "string" ||
-      !win32.isAbsolute(installationPath) ||
-      !roots.some((root) =>
-        isStrictWindowsDescendant(installationPath, root),
-      ) ||
-      productId !== "Microsoft.VisualStudio.Product.Enterprise" ||
-      typeof installationVersion !== "string" ||
-      !/^(?:17|18)\./.test(installationVersion)
+      typeof productId === "string" &&
+      productId !== "Microsoft.VisualStudio.Product.Enterprise"
     ) {
       continue;
     }
+    if (productId !== "Microsoft.VisualStudio.Product.Enterprise") {
+      throw new Error(
+        `vswhere returned an unclassified Visual Studio record at index ${index}`,
+      );
+    }
+    const definitionRoot =
+      typeof installationPath === "string"
+        ? roots.find((root) =>
+            isStrictWindowsDescendant(installationPath, root),
+          )
+        : undefined;
+    if (
+      typeof installationPath !== "string" ||
+      !win32.isAbsolute(installationPath) ||
+      definitionRoot === undefined ||
+      typeof installationVersion !== "string" ||
+      !/^(?:17|18)\./.test(installationVersion)
+    ) {
+      throw new Error(
+        `vswhere returned a malformed Visual Studio Enterprise record at index ${index}`,
+      );
+    }
+    const normalizedInstallationPath = win32.normalize(installationPath);
+    const installationIdentity = await assertWindowsDirectoryChain(
+      normalizedInstallationPath,
+      definitionRoot,
+      dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
+    );
     instances.push({
-      installationPath: win32.normalize(installationPath),
-      ...(typeof installationVersion === "string"
-        ? { installationVersion }
-        : {}),
-      ...(typeof productId === "string" ? { productId } : {}),
+      installationPath: normalizedInstallationPath,
+      definitionRoot,
+      installationIdentity,
+      installationVersion,
+      productId,
     });
   }
-  return instances.slice(0, 8);
+  const byPath = new Map<string, VisualStudioInstance>();
+  for (const instance of instances) {
+    const key = instance.installationPath.toLowerCase();
+    if (byPath.has(key)) {
+      throw new Error(
+        `vswhere returned a duplicate Visual Studio instance: ${instance.installationPath}`,
+      );
+    }
+    byPath.set(key, instance);
+  }
+  if (byPath.size > 8) {
+    throw new Error("Visual Studio inventory exceeded 8 instances");
+  }
+  const currentVswhereExecutable = await inspect(vswhere);
+  if (!sameWindowsPathIdentity(vswhereExecutable, currentVswhereExecutable)) {
+    throw new Error(
+      "vswhere.exe changed while reading Visual Studio instances",
+    );
+  }
+  return {
+    instances: [...byPath.values()].sort((left, right) =>
+      left.installationPath.localeCompare(right.installationPath),
+    ),
+    vswhereExecutable,
+  };
 }
 
-function visualStudioOperation(
+async function verifyVisualStudioInstance(
+  instance: VisualStudioInstance,
+  dependencies: WindowsVisualStudioDependencies = {},
+): Promise<boolean> {
+  try {
+    const current = await assertWindowsDirectoryChain(
+      instance.installationPath,
+      instance.definitionRoot,
+      dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
+    );
+    return sameWindowsPathIdentity(instance.installationIdentity, current);
+  } catch {
+    return false;
+  }
+}
+
+function sameVisualStudioInstance(
+  left: VisualStudioInstance,
+  right: VisualStudioInstance,
+): boolean {
+  return (
+    left.installationPath.toLowerCase() ===
+      right.installationPath.toLowerCase() &&
+    left.definitionRoot.toLowerCase() === right.definitionRoot.toLowerCase() &&
+    left.installationVersion === right.installationVersion &&
+    left.productId === right.productId &&
+    sameWindowsPathIdentity(
+      left.installationIdentity,
+      right.installationIdentity,
+    )
+  );
+}
+
+function sameVisualStudioInstances(
+  left: readonly VisualStudioInstance[],
+  right: readonly VisualStudioInstance[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((instance, index) => {
+      const other = right[index];
+      return other !== undefined && sameVisualStudioInstance(instance, other);
+    })
+  );
+}
+
+function usesVisualStudioInventoryExecutable(
+  expected: WindowsPathIdentity | undefined,
+  inventory: WindowsVisualStudioInventory,
+): boolean {
+  return sameWindowsPathIdentity(expected, inventory.vswhereExecutable);
+}
+
+const VISUAL_STUDIO_INVENTORY_EXECUTABLE_CHANGED =
+  "vswhere.exe changed after Visual Studio inventory validation";
+
+function changedVisualStudioInventoryExecutable(): OperationResult {
+  return {
+    status: "failed",
+    detail: VISUAL_STUDIO_INVENTORY_EXECUTABLE_CHANGED,
+  };
+}
+
+export function createWindowsVisualStudioOperation(
   paths: WindowsPaths,
-  instances: AsyncValue<readonly VisualStudioInstance[]>,
+  instances: AsyncValue<WindowsVisualStudioInventory>,
+  dependencies: WindowsVisualStudioDependencies = {},
 ): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  let validatedSetup: WindowsPathIdentity | undefined;
+  let validatedInstances: readonly VisualStudioInstance[] | undefined;
+  let validatedVswhereExecutable: WindowsPathIdentity | undefined;
+  let setupValidationComplete = false;
   return createFunctionOperation({
     id: "windows:visual-studio:uninstall",
     component: "visual-studio",
@@ -1081,16 +2348,83 @@ function visualStudioOperation(
     dedupeKey: "windows:visual-studio:uninstall",
     blockedBy: VISUAL_STUDIO_OVERLAPS,
     validate: async () => {
-      await instances();
+      const inventory = await instances();
+      validatedInstances = inventory.instances;
+      validatedVswhereExecutable = inventory.vswhereExecutable;
+      validatedSetup = await inspect(
+        win32.join(paths.visualStudioInstaller, "setup.exe"),
+      );
+      if (validatedInstances.length !== 0 && validatedSetup === undefined) {
+        throw new Error(
+          "Visual Studio setup.exe is unavailable for discovered instances",
+        );
+      }
+      setupValidationComplete = true;
     },
     run: async (): Promise<OperationResult> => {
       const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
-      if (!(await pathExists(setup))) return { status: "not-found" };
-      const selected = await instances();
-      if (selected.length === 0) return { status: "not-found" };
+      if (
+        validatedInstances === undefined ||
+        validatedVswhereExecutable === undefined
+      ) {
+        const inventory = await instances();
+        validatedInstances = inventory.instances;
+        validatedVswhereExecutable = inventory.vswhereExecutable;
+      }
+      if (validatedInstances.length === 0) return { status: "not-found" };
+      const setupIdentity = await inspect(setup);
+      if (
+        !setupValidationComplete ||
+        !sameWindowsPathIdentity(validatedSetup, setupIdentity)
+      ) {
+        return {
+          status: "failed",
+          detail:
+            "Visual Studio setup executable changed after plan validation",
+        };
+      }
+      if (setupIdentity === undefined) {
+        return {
+          status: "failed",
+          detail: "Visual Studio setup.exe is unavailable",
+        };
+      }
 
-      for (const instance of selected) {
-        const result = await runCommand(
+      let expected = [...validatedInstances];
+      for (const instance of validatedInstances) {
+        const fresh = await listVisualStudioInstances(paths, {
+          ...dependencies,
+          expectedInventoryExecutable: validatedVswhereExecutable,
+        });
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            fresh,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        if (!sameVisualStudioInstances(expected, fresh.instances)) {
+          return {
+            status: "failed",
+            detail: "Visual Studio instance inventory changed before uninstall",
+          };
+        }
+        if (!(await verifyVisualStudioInstance(instance, dependencies))) {
+          return {
+            status: "failed",
+            detail: `Visual Studio installation path changed before uninstall: ${instance.installationPath}`,
+          };
+        }
+        const beforeSpawn = await inspect(setup);
+        if (!sameWindowsPathIdentity(setupIdentity, beforeSpawn)) {
+          return {
+            status: "failed",
+            detail:
+              "Visual Studio setup executable changed immediately before spawn",
+          };
+        }
+        const result = await execute(
           setup,
           [
             "uninstall",
@@ -1100,21 +2434,56 @@ function visualStudioOperation(
             "--norestart",
             "--force",
           ],
-          { silent: false, timeoutMs: 75 * 60_000 },
+          {
+            env: paths.installerEnvironment,
+            silent: false,
+            timeoutMs: 75 * 60_000,
+          },
         );
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+        const disposition = windowsInstallerExitDisposition(result.exitCode);
+        if (disposition === "restart-initiated") {
+          return restartInitiatedResult(setup);
+        }
+        if (disposition === "failed") {
           return {
             status: "failed",
             detail: failureDetail(result.stderr, setup, result.exitCode),
           };
         }
+        expected = expected.filter(
+          ({ installationPath }) =>
+            installationPath.toLowerCase() !==
+            instance.installationPath.toLowerCase(),
+        );
+        const after = await listVisualStudioInstances(paths, {
+          ...dependencies,
+          expectedInventoryExecutable: validatedVswhereExecutable,
+        });
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            after,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        if (!sameVisualStudioInstances(expected, after.instances)) {
+          return {
+            status: "failed",
+            detail: `Visual Studio instance remained registered or inventory changed after uninstall: ${instance.installationPath}`,
+          };
+        }
       }
-      return { status: "removed", detail: `${selected.length} instance(s)` };
+      return {
+        status: "removed",
+        detail: `${validatedInstances.length} instance(s)`,
+      };
     },
   });
 }
 
 const WINDOWS_SDK_COMPONENTS = [
+  "Microsoft.VisualStudio.Component.Windows10SDK",
   "Microsoft.VisualStudio.Component.Windows10SDK.19041",
   "Microsoft.VisualStudio.Component.Windows11SDK.22621",
   "Microsoft.VisualStudio.Component.Windows11SDK.26100",
@@ -1125,32 +2494,146 @@ const WINDOWS_SDK_COMPONENTS = [
 // installer component IDs from the image definitions; never delete Windows Kits,
 // invoke DISM package removal, or touch WinSxS directly.
 
-function windowsSdkOperation(
+export function createWindowsSdkComponentOperation(
   paths: WindowsPaths,
-  instances: AsyncValue<readonly VisualStudioInstance[]>,
+  instances: AsyncValue<WindowsVisualStudioInventory>,
+  dependencies: WindowsVisualStudioDependencies = {},
 ): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  let validatedSetup: WindowsPathIdentity | undefined;
+  let validatedInstances: readonly VisualStudioInstance[] | undefined;
+  let validatedAllInstances: readonly VisualStudioInstance[] | undefined;
+  let validatedVswhereExecutable: WindowsPathIdentity | undefined;
+  let setupValidationComplete = false;
   return createFunctionOperation({
     id: "windows:windows-sdk:remove-components",
     component: "windows-sdk",
     description: "Remove definition-listed Windows SDK and WDK components",
     phase: "package",
     dedupeKey: "windows:windows-sdk:remove-components",
-    coveredBySuccessfulOperations: ["windows:visual-studio:uninstall"],
     validate: async () => {
-      await instances();
+      const allInventory = await instances();
+      validatedAllInstances = allInventory.instances;
+      validatedVswhereExecutable = allInventory.vswhereExecutable;
+      const componentInventory = await listVisualStudioInstances(
+        paths,
+        {
+          ...dependencies,
+          expectedInventoryExecutable: validatedVswhereExecutable,
+        },
+        WINDOWS_SDK_COMPONENTS,
+      );
+      if (
+        !usesVisualStudioInventoryExecutable(
+          validatedVswhereExecutable,
+          componentInventory,
+        )
+      ) {
+        throw new Error(VISUAL_STUDIO_INVENTORY_EXECUTABLE_CHANGED);
+      }
+      validatedInstances = componentInventory.instances;
+      validatedSetup = await inspect(
+        win32.join(paths.visualStudioInstaller, "setup.exe"),
+      );
+      if (validatedInstances.length !== 0 && validatedSetup === undefined) {
+        throw new Error(
+          "Visual Studio setup.exe is unavailable for SDK components",
+        );
+      }
+      setupValidationComplete = true;
     },
     run: async (): Promise<OperationResult> => {
       const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
-      if (!(await pathExists(setup))) return { status: "not-found" };
-      const selected = await instances();
-      if (selected.length === 0) return { status: "not-found" };
+      if (
+        validatedAllInstances === undefined ||
+        validatedVswhereExecutable === undefined
+      ) {
+        const allInventory = await instances();
+        validatedAllInstances = allInventory.instances;
+        validatedVswhereExecutable = allInventory.vswhereExecutable;
+      }
+      if (validatedInstances === undefined) {
+        const componentInventory = await listVisualStudioInstances(
+          paths,
+          {
+            ...dependencies,
+            expectedInventoryExecutable: validatedVswhereExecutable,
+          },
+          WINDOWS_SDK_COMPONENTS,
+        );
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            componentInventory,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        validatedInstances = componentInventory.instances;
+      }
+      if (validatedInstances.length === 0) return { status: "not-found" };
 
       const removeArguments = WINDOWS_SDK_COMPONENTS.flatMap((component) => [
         "--remove",
         component,
       ]);
-      for (const instance of selected) {
-        const result = await runCommand(
+      let removed = 0;
+      for (const instance of validatedInstances) {
+        const currentComponents = await listVisualStudioInstances(
+          paths,
+          {
+            ...dependencies,
+            expectedInventoryExecutable: validatedVswhereExecutable,
+          },
+          WINDOWS_SDK_COMPONENTS,
+        );
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            currentComponents,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        const current = currentComponents.instances.find(
+          ({ installationPath }) =>
+            installationPath.toLowerCase() ===
+            instance.installationPath.toLowerCase(),
+        );
+        if (current === undefined) continue;
+        if (!sameVisualStudioInstance(instance, current)) {
+          return {
+            status: "failed",
+            detail: `Visual Studio SDK component inventory changed before removal: ${instance.installationPath}`,
+          };
+        }
+        const setupIdentity = await inspect(setup);
+        if (
+          !setupValidationComplete ||
+          !sameWindowsPathIdentity(validatedSetup, setupIdentity)
+        ) {
+          return {
+            status: "failed",
+            detail:
+              "Visual Studio setup executable changed after plan validation",
+          };
+        }
+        if (!(await verifyVisualStudioInstance(instance, dependencies))) {
+          return {
+            status: "failed",
+            detail: `Visual Studio installation path changed before SDK removal: ${instance.installationPath}`,
+          };
+        }
+        const beforeSpawn = await inspect(setup);
+        if (!sameWindowsPathIdentity(setupIdentity, beforeSpawn)) {
+          return {
+            status: "failed",
+            detail:
+              "Visual Studio setup executable changed immediately before spawn",
+          };
+        }
+        const result = await execute(
           setup,
           [
             "modify",
@@ -1160,61 +2643,558 @@ function windowsSdkOperation(
             "--quiet",
             "--norestart",
           ],
-          { silent: false, timeoutMs: 75 * 60_000 },
+          {
+            env: paths.installerEnvironment,
+            silent: false,
+            timeoutMs: 75 * 60_000,
+          },
         );
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+        const disposition = windowsInstallerExitDisposition(result.exitCode);
+        if (disposition === "restart-initiated") {
+          return restartInitiatedResult(setup);
+        }
+        if (disposition === "failed") {
           return {
             status: "failed",
             detail: failureDetail(result.stderr, setup, result.exitCode),
           };
         }
+        const residual = await listVisualStudioInstances(
+          paths,
+          {
+            ...dependencies,
+            expectedInventoryExecutable: validatedVswhereExecutable,
+          },
+          WINDOWS_SDK_COMPONENTS,
+        );
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            residual,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        if (
+          residual.instances.some(
+            ({ installationPath }) =>
+              installationPath.toLowerCase() ===
+              instance.installationPath.toLowerCase(),
+          )
+        ) {
+          return {
+            status: "failed",
+            detail: `Windows SDK or WDK components remained registered after modify: ${instance.installationPath}`,
+          };
+        }
+        const preservedInventory = await listVisualStudioInstances(paths, {
+          ...dependencies,
+          expectedInventoryExecutable: validatedVswhereExecutable,
+        });
+        if (
+          !usesVisualStudioInventoryExecutable(
+            validatedVswhereExecutable,
+            preservedInventory,
+          )
+        ) {
+          return changedVisualStudioInventoryExecutable();
+        }
+        const preservedInstance = preservedInventory.instances.find(
+          ({ installationPath }) =>
+            installationPath.toLowerCase() ===
+            instance.installationPath.toLowerCase(),
+        );
+        if (preservedInstance === undefined) {
+          return {
+            status: "failed",
+            detail: `Visual Studio instance disappeared during Windows SDK removal: ${instance.installationPath}`,
+          };
+        }
+        if (!sameVisualStudioInstance(instance, preservedInstance)) {
+          return {
+            status: "failed",
+            detail: `Visual Studio instance identity changed during Windows SDK removal: ${instance.installationPath}`,
+          };
+        }
+        if (
+          !sameVisualStudioInstances(
+            validatedAllInstances,
+            preservedInventory.instances,
+          )
+        ) {
+          return {
+            status: "failed",
+            detail:
+              "Visual Studio instance inventory changed during Windows SDK removal",
+          };
+        }
+        removed += 1;
       }
-      return { status: "removed", detail: `${selected.length} instance(s)` };
+      return removed === 0
+        ? { status: "not-found" }
+        : { status: "removed", detail: `${removed} instance(s)` };
     },
   });
 }
 
-function dockerImagesOperation(paths: WindowsPaths): Operation {
+export interface WindowsSdkBundleDependencies extends WindowsInventoryDependencies {
+  readonly pathProbe?: WindowsPathProbe;
+}
+
+interface WindowsSdkBundleSnapshot {
+  readonly record: WindowsUninstallRecord;
+  readonly kind: "sdk" | "wdk";
+  readonly executable: string;
+  readonly executableIdentity: WindowsPathIdentity;
+}
+
+function windowsSdkBundleKind(
+  displayName: string | undefined,
+): "sdk" | "wdk" | undefined {
+  if (
+    /^Windows Software Development Kit(?:\s+-\s+Windows)?\s+10\.[0-9.]+$/i.test(
+      displayName ?? "",
+    )
+  ) {
+    return "sdk";
+  }
+  if (
+    /^Windows Driver Kit(?:\s+-\s+Windows)?\s+10\.[0-9.]+$/i.test(
+      displayName ?? "",
+    )
+  ) {
+    return "wdk";
+  }
+  return undefined;
+}
+
+function sameWindowsUninstallRecord(
+  left: WindowsUninstallRecord,
+  right: WindowsUninstallRecord,
+): boolean {
+  return (
+    win32.normalize(left.registryKey).toLowerCase() ===
+      win32.normalize(right.registryKey).toLowerCase() &&
+    left.displayName === right.displayName &&
+    left.displayVersion === right.displayVersion &&
+    left.bundleCachePath === right.bundleCachePath &&
+    left.windowsInstaller === right.windowsInstaller
+  );
+}
+
+async function inspectWindowsSdkBundle(
+  paths: WindowsPaths,
+  record: WindowsUninstallRecord,
+  dependencies: WindowsSdkBundleDependencies,
+): Promise<WindowsSdkBundleSnapshot | undefined> {
+  const kind = windowsSdkBundleKind(record.displayName);
+  if (kind === undefined) return undefined;
+  if (record.bundleCachePath === undefined) {
+    throw new Error(`${record.displayName} has no BundleCachePath`);
+  }
+  const executable = win32.normalize(record.bundleCachePath);
+  const expectedName = kind === "sdk" ? "winsdksetup.exe" : "wdksetup.exe";
+  if (
+    !win32.isAbsolute(executable) ||
+    win32.basename(executable).toLowerCase() !== expectedName
+  ) {
+    throw new Error(`${record.displayName} has an unsafe bundle executable`);
+  }
+  const cacheRoot = win32.join(paths.programData, "Package Cache");
+  if (!isStrictWindowsDescendant(executable, cacheRoot)) {
+    throw new Error(`${record.displayName} bundle is outside Package Cache`);
+  }
+  await assertWindowsDirectoryChain(
+    win32.dirname(executable),
+    cacheRoot,
+    dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
+  );
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const executableIdentity = await inspect(executable);
+  if (executableIdentity === undefined) {
+    throw new Error(`${record.displayName} bundle executable is unavailable`);
+  }
+  return { record, kind, executable, executableIdentity };
+}
+
+export function createWindowsSdkBundleOperation(
+  paths: WindowsPaths,
+  inventory: AsyncValue<WindowsUninstallInventory>,
+  dependencies: WindowsSdkBundleDependencies = {},
+): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  let validated: readonly WindowsSdkBundleSnapshot[] | undefined;
+  const inspectSelected = async (): Promise<
+    readonly WindowsSdkBundleSnapshot[]
+  > => {
+    const source = await inventory();
+    const snapshots: WindowsSdkBundleSnapshot[] = [];
+    for (const record of source.records) {
+      const snapshot = await inspectWindowsSdkBundle(
+        paths,
+        record,
+        dependencies,
+      );
+      if (snapshot !== undefined) snapshots.push(snapshot);
+    }
+    if (snapshots.length > 16) {
+      throw new Error("Windows SDK bundle inventory exceeded 16 records");
+    }
+    return snapshots;
+  };
+  return createFunctionOperation({
+    id: "windows:windows-sdk:standalone-bundles",
+    component: "windows-sdk",
+    description: "Uninstall standalone Windows SDK and WDK bundles",
+    phase: "package",
+    dedupeKey: "windows:windows-sdk:standalone-bundles",
+    validate: async () => {
+      validated = await inspectSelected();
+    },
+    run: async (): Promise<OperationResult> => {
+      try {
+        validated ??= await inspectSelected();
+        if (validated.length === 0) return { status: "not-found" };
+        const source = await inventory();
+        let removed = 0;
+        for (const snapshot of validated) {
+          const currentRecord = await readExactUninstallRecord(
+            paths,
+            snapshot.record.registryKey,
+            source.registryExecutable,
+            dependencies,
+          );
+          if (
+            currentRecord === undefined ||
+            !sameWindowsUninstallRecord(snapshot.record, currentRecord)
+          ) {
+            return {
+              status: "failed",
+              detail: `${snapshot.record.displayName ?? "Windows SDK bundle"} registry identity changed before uninstall`,
+            };
+          }
+          const immediate = await inspectWindowsSdkBundle(
+            paths,
+            currentRecord,
+            dependencies,
+          );
+          if (
+            immediate === undefined ||
+            immediate.kind !== snapshot.kind ||
+            immediate.executable.toLowerCase() !==
+              snapshot.executable.toLowerCase() ||
+            !sameWindowsPathIdentity(
+              snapshot.executableIdentity,
+              immediate.executableIdentity,
+            )
+          ) {
+            return {
+              status: "failed",
+              detail: `${snapshot.record.displayName ?? "Windows SDK bundle"} executable changed before uninstall`,
+            };
+          }
+          const beforeSpawn = await inspect(snapshot.executable);
+          if (
+            !sameWindowsPathIdentity(snapshot.executableIdentity, beforeSpawn)
+          ) {
+            return {
+              status: "failed",
+              detail: `${snapshot.record.displayName ?? "Windows SDK bundle"} executable changed immediately before spawn`,
+            };
+          }
+          const result = await execute(
+            snapshot.executable,
+            ["/uninstall", "/quiet", "/norestart"],
+            {
+              env: paths.installerEnvironment,
+              silent: false,
+              timeoutMs: 45 * 60_000,
+            },
+          );
+          const disposition = windowsInstallerExitDisposition(result.exitCode);
+          if (disposition === "restart-initiated") {
+            return restartInitiatedResult(snapshot.executable);
+          }
+          if (disposition === "failed") {
+            return {
+              status: "failed",
+              detail: failureDetail(
+                result.stderr,
+                snapshot.executable,
+                result.exitCode,
+              ),
+            };
+          }
+          const residual = await readExactUninstallRecord(
+            paths,
+            snapshot.record.registryKey,
+            source.registryExecutable,
+            dependencies,
+          );
+          if (residual !== undefined) {
+            return {
+              status: "failed",
+              detail: `${snapshot.record.displayName ?? "Windows SDK bundle"} remained registered after successful uninstall`,
+            };
+          }
+          removed += 1;
+        }
+        return {
+          status: "removed",
+          detail: `${removed} standalone bundle(s)`,
+        };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+}
+
+export function createWindowsDockerPruneOperation(
+  paths: WindowsPaths,
+  dependencies: WindowsDockerDependencies = {},
+): Operation {
+  const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
+  const execute = dependencies.runCommand ?? runCommand;
+  const createConfigDirectory = dependencies.createConfigDirectory ?? mkdtemp;
+  const dockerTempRoot = win32.join(paths.systemRoot, "Temp");
+  const inspectConfigDirectory =
+    dependencies.inspectConfigDirectory ??
+    (async (path: string): Promise<WindowsPathIdentity> => {
+      const identity = await assertWindowsDirectoryChain(path, dockerTempRoot);
+      const entries = await readdir(path);
+      if (entries.length !== 0) {
+        throw new Error("isolated Docker configuration is not empty");
+      }
+      return identity;
+    });
+  const captureConfigBoundary =
+    dependencies.captureConfigBoundary ?? captureSafeRemovalBoundary;
+  const removeConfigTarget =
+    dependencies.removeConfigTarget ?? removePathTarget;
+  const removeConfigDirectory =
+    dependencies.removeConfigDirectory ??
+    (async (path: string, expectedIdentity: WindowsPathIdentity) => {
+      if (dependencies.context === undefined) {
+        throw new Error(
+          "Windows Docker config cleanup has no locked removal context",
+        );
+      }
+      const removal = await removeConfigTarget(
+        path,
+        [dockerTempRoot],
+        dependencies.context,
+        {
+          boundary: async (target, allowedParents, context) => {
+            const snapshot = await captureConfigBoundary(
+              target,
+              allowedParents,
+              context,
+            );
+            const targetIdentity = snapshot.entries.at(-1);
+            if (
+              !snapshot.targetExists ||
+              targetIdentity === undefined ||
+              targetIdentity.device !== expectedIdentity.dev ||
+              targetIdentity.inode !== expectedIdentity.ino
+            ) {
+              throw new Error(
+                "isolated Docker configuration identity changed before locked removal",
+              );
+            }
+            return snapshot;
+          },
+        },
+      );
+      if (removal.status !== "removed") {
+        throw new Error(
+          `locked removal boundary did not remove isolated Docker configuration: ${removal.detail ?? removal.status}`,
+        );
+      }
+    });
+  const docker = win32.join(paths.system32, "docker.exe");
+  let validated: WindowsPathIdentity | undefined;
+  let validationComplete = false;
   return createFunctionOperation({
     id: "windows:docker:prune",
     component: "docker-images",
     description: "Prune unused Windows Docker data",
     phase: "system",
     dedupeKey: "windows:docker:prune",
+    validate: async () => {
+      validated = await inspect(docker);
+      validationComplete = true;
+    },
     run: async (): Promise<OperationResult> => {
-      const docker = win32.join(paths.system32, "docker.exe");
-      if (!(await pathExists(docker))) return { status: "not-found" };
-      const responsive = await runCommand(docker, ["info"], {
-        silent: true,
-        timeoutMs: 15_000,
-      });
-      if (responsive.exitCode !== 0) {
-        return { status: "unsupported", detail: "Docker daemon unavailable" };
+      const current = await inspect(docker);
+      if (
+        validationComplete &&
+        validated === undefined &&
+        current === undefined
+      ) {
+        return { status: "not-found" };
       }
-      const result = await runCommand(
-        docker,
-        ["system", "prune", "--all", "--volumes", "--force"],
-        { silent: false, timeoutMs: 20 * 60_000 },
-      );
-      return result.exitCode === 0
-        ? { status: "removed" }
-        : {
+      if (!validationComplete || !sameWindowsPathIdentity(validated, current)) {
+        return {
+          status: "failed",
+          detail: "Docker executable changed after plan validation",
+        };
+      }
+      if (current === undefined) return { status: "not-found" };
+      let configDirectory: string;
+      try {
+        configDirectory = await createConfigDirectory(
+          `${dockerTempRoot}\\maximize-github-runner-space-docker-`,
+        );
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: `could not create isolated Docker configuration: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      let configIdentity: WindowsPathIdentity | undefined;
+      let executionError: unknown;
+      try {
+        try {
+          configIdentity = await inspectConfigDirectory(configDirectory);
+        } catch (error) {
+          return {
             status: "failed",
-            detail: failureDetail(result.stderr, docker, result.exitCode),
+            detail: `unsafe isolated Docker configuration: ${error instanceof Error ? error.message : String(error)}`,
           };
+        }
+        const localDockerHost = "npipe:////./pipe/docker_engine";
+        const environment = {
+          ...paths.commandEnvironment,
+          DOCKER_CONFIG: configDirectory,
+          DOCKER_HOST: localDockerHost,
+        };
+        const beforeProbe = await inspect(docker);
+        if (!sameWindowsPathIdentity(current, beforeProbe)) {
+          return {
+            status: "failed",
+            detail: "Docker executable changed before daemon inspection",
+          };
+        }
+        const responsive = await execute(
+          docker,
+          ["--host", localDockerHost, "--config", configDirectory, "info"],
+          {
+            env: environment,
+            silent: true,
+            timeoutMs: 15_000,
+          },
+        );
+        if (responsive.exitCode !== 0) {
+          const output =
+            `${responsive.stdout}\n${responsive.stderr}`.toLowerCase();
+          const daemonUnavailable =
+            responsive.exitCode === 1 &&
+            responsive.stdoutTruncated !== true &&
+            responsive.stderrTruncated !== true &&
+            output.includes("docker_engine") &&
+            (output.includes("the system cannot find the file specified") ||
+              output.includes("the system cannot find the path specified"));
+          return daemonUnavailable
+            ? {
+                status: "unsupported",
+                detail: "local Docker daemon unavailable",
+              }
+            : {
+                status: "failed",
+                detail: failureDetail(
+                  responsive.stderr,
+                  docker,
+                  responsive.exitCode,
+                ),
+              };
+        }
+        const beforeMutation = await inspect(docker);
+        if (!sameWindowsPathIdentity(current, beforeMutation)) {
+          return {
+            status: "failed",
+            detail: "Docker executable changed before image mutation",
+          };
+        }
+        let configBeforeMutation: WindowsPathIdentity;
+        try {
+          configBeforeMutation = await inspectConfigDirectory(configDirectory);
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: `unsafe isolated Docker configuration before mutation: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+        if (!sameWindowsPathIdentity(configIdentity, configBeforeMutation)) {
+          return {
+            status: "failed",
+            detail: "isolated Docker configuration changed before mutation",
+          };
+        }
+        const result = await execute(
+          docker,
+          [
+            "--host",
+            localDockerHost,
+            "--config",
+            configDirectory,
+            "system",
+            "prune",
+            "--all",
+            "--volumes",
+            "--force",
+          ],
+          { env: environment, silent: false, timeoutMs: 20 * 60_000 },
+        );
+        return result.exitCode === 0
+          ? { status: "removed" }
+          : {
+              status: "failed",
+              detail: failureDetail(result.stderr, docker, result.exitCode),
+            };
+      } catch (error) {
+        executionError = error;
+        throw error;
+      } finally {
+        // Preserve the original fatal timeout and leave its configuration in
+        // place: an escaped launcher may still be reading this directory.
+        if (!(executionError instanceof UnconfirmedCommandTerminationError)) {
+          assertCommandTerminationConfirmed();
+          if (configIdentity !== undefined) {
+            await removeConfigDirectory(configDirectory, configIdentity);
+          }
+        }
+      }
     },
   });
 }
 
-function recreateToolCacheOperation(
+export interface WindowsToolCacheDependencies {
+  readonly createDirectory?: (target: string) => Promise<void>;
+  readonly accessDirectory?: (target: string, mode: number) => Promise<void>;
+}
+
+export function createWindowsToolCacheRecreateOperation(
   context: RuntimeContext,
   target: string,
+  dependencies: WindowsToolCacheDependencies = {},
 ): Operation {
+  const createDirectory =
+    dependencies.createDirectory ??
+    (async (path: string): Promise<void> => {
+      await mkdir(path, { recursive: true });
+    });
+  const accessDirectory = dependencies.accessDirectory ?? access;
   return createFunctionOperation({
     id: "windows:toolcache:recreate",
     component: "cached-tools",
     description: "Recreate the hosted toolcache directory",
     phase: "system",
+    fatal: true,
     validate: async () =>
       await assertSafeDirectoryTarget(target, [win32.dirname(target)], context),
     run: async () => {
@@ -1224,7 +3204,13 @@ function recreateToolCacheOperation(
           [win32.dirname(target)],
           context,
         );
-        await mkdir(target, { recursive: true });
+        await createDirectory(target);
+        await assertSafeDirectoryTarget(
+          target,
+          [win32.dirname(target)],
+          context,
+        );
+        await accessDirectory(target, constants.W_OK);
         await assertSafeDirectoryTarget(
           target,
           [win32.dirname(target)],
@@ -1264,16 +3250,26 @@ export function managedDirectoryUninstallOperation(options: {
   readonly uninstaller: string;
   readonly args: readonly string[];
   readonly probe?: WindowsPathProbe;
+  readonly inspectExecutable?: (
+    executable: string,
+  ) => Promise<WindowsPathIdentity | undefined>;
   readonly execute?: (
     executable: string,
     args: readonly string[],
   ) => Promise<CommandResult>;
 }): Operation {
   const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const inspectFile =
+    options.inspectExecutable ??
+    (probe === NODE_WINDOWS_PATH_PROBE
+      ? async (target: string) => await inspectWindowsExecutable(target)
+      : undefined);
   const execute =
     options.execute ??
     (async (path: string, args: readonly string[]) =>
       await runCommand(path, args, {
+        env: windowsPaths(options.context.home, options.context.architecture)
+          .installerEnvironment,
         silent: true,
         timeoutMs: 30 * 60_000,
       }));
@@ -1308,10 +3304,19 @@ export function managedDirectoryUninstallOperation(options: {
           `Refusing managed uninstaller with an unexpected target type: '${executable}'.`,
         );
       }
+      const uninstallerIdentity =
+        inspectFile === undefined
+          ? windowsPathIdentity(uninstaller)
+          : await inspectFile(executable);
+      if (uninstallerIdentity === undefined) {
+        throw new Error(
+          `Unable to establish managed uninstaller content identity: '${executable}'.`,
+        );
+      }
       return {
         status: "root-present",
         root: windowsPathIdentity(root),
-        uninstaller: windowsPathIdentity(uninstaller),
+        uninstaller: uninstallerIdentity,
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -1326,7 +3331,7 @@ export function managedDirectoryUninstallOperation(options: {
     (left.status === "root-absent" ||
       (right.status === "root-present" &&
         sameWindowsPathIdentity(left.root, right.root) &&
-        sameWindowsPathIdentity(left.uninstaller, right.uninstaller)));
+        sameOptionalWindowsPathIdentity(left.uninstaller, right.uninstaller)));
   return createFunctionOperation({
     id: `windows:managed-directory:${options.component}:${options.id}`,
     component: options.component,
@@ -1359,7 +3364,11 @@ export function managedDirectoryUninstallOperation(options: {
       }
       if (validatedState.uninstaller !== undefined) {
         const result = await execute(executable, options.args);
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+        const disposition = windowsInstallerExitDisposition(result.exitCode);
+        if (disposition === "restart-initiated") {
+          return restartInitiatedResult(executable);
+        }
+        if (disposition === "failed") {
           return {
             status: "failed",
             detail: failureDetail(result.stderr, executable, result.exitCode),
@@ -1392,16 +3401,103 @@ function residualPathOperation(
   });
 }
 
-function dockerEngineOperation(
+export interface WindowsDockerEngineDependencies {
+  readonly control?: WindowsServiceControl;
+  readonly lifecycle?: WindowsDockerServiceLifecycle;
+  readonly validateTarget?: (target: string) => Promise<void>;
+  readonly removeTarget?: (target: string) => Promise<OperationResult>;
+}
+
+function sameDockerServiceRegistrationIdentity(
+  left: WindowsServiceSnapshot,
+  right: WindowsServiceSnapshot,
+): boolean {
+  return (
+    left.component === "docker-engine" &&
+    right.component === "docker-engine" &&
+    left.serviceName === "docker" &&
+    right.serviceName === "docker" &&
+    left.status === right.status &&
+    left.executable === right.executable &&
+    sameOptionalWindowsPathIdentity(
+      left.executableIdentity,
+      right.executableIdentity,
+    ) &&
+    left.configuration === right.configuration
+  );
+}
+
+async function inspectDockerServiceRegistration(
+  paths: WindowsPaths,
+  control: WindowsServiceControl,
+): Promise<WindowsServiceSnapshot> {
+  const snapshots = await discoverWindowsServices(
+    paths,
+    {
+      profile: "custom",
+      enabled: new Set<ComponentId>(["docker-engine"]),
+      skipped: new Set<ComponentId>(),
+      swapfileBytes: undefined,
+    },
+    control,
+  );
+  const snapshot = snapshots[0];
+  if (snapshot === undefined || snapshots.length !== 1) {
+    throw new Error("Unable to establish the exact docker service identity");
+  }
+  if (
+    snapshot.status === "present" &&
+    (snapshot.executable === undefined ||
+      snapshot.executableIdentity === undefined ||
+      snapshot.configuration === undefined)
+  ) {
+    throw new Error(
+      "Unable to establish the exact docker service configuration and executable identity",
+    );
+  }
+  return snapshot;
+}
+
+function assertDockerServiceReadyForPayloadMutation(
+  validated: WindowsServiceSnapshot,
+  current: WindowsServiceSnapshot,
+): void {
+  if (!sameDockerServiceRegistrationIdentity(validated, current)) {
+    throw new Error(
+      "docker service configuration changed after plan validation",
+    );
+  }
+  if (current.status === "present" && current.state !== 1) {
+    throw new Error("docker service was not stopped before terminal cleanup");
+  }
+}
+
+function isWindowsServiceDeletionPending(result: CommandResult): boolean {
+  return result.exitCode === 1072;
+}
+
+export function createWindowsDockerEngineOperation(
   context: RuntimeContext,
   paths: WindowsPaths,
+  dependencies: WindowsDockerEngineDependencies = {},
 ): Operation {
-  const targets = [
+  const control = dependencies.control ?? windowsServiceControl(paths);
+  const lifecycle =
+    dependencies.lifecycle ?? createWindowsDockerServiceLifecycle();
+  const validateTarget =
+    dependencies.validateTarget ??
+    (async (target: string) => await validateExactTarget(context, target));
+  const removeTarget =
+    dependencies.removeTarget ??
+    (async (target: string) => await removeExactTarget(context, target));
+  const serviceExecutable = win32.join(paths.system32, "dockerd.exe");
+  const payloadTargets = [
     win32.join(paths.system32, "docker.exe"),
-    win32.join(paths.system32, "dockerd.exe"),
     win32.join(paths.systemRoot, "SysWOW64", "docker.exe"),
     win32.join(paths.programData, "docker", "cli-plugins"),
   ];
+  const targets = [...payloadTargets, serviceExecutable];
+  let validatedRegistration: WindowsServiceSnapshot | undefined;
   return createFunctionOperation({
     id: "windows:docker:engine",
     component: "docker-engine",
@@ -1410,28 +3506,157 @@ function dockerEngineOperation(
     dedupeKey: "windows:docker:engine",
     validate: async () => {
       for (const target of targets) {
-        await validateExactTarget(context, target);
+        await validateTarget(target);
       }
+      validatedRegistration = await inspectDockerServiceRegistration(
+        paths,
+        control,
+      );
     },
     run: async (): Promise<OperationResult> => {
-      const hadTargets = (await Promise.all(targets.map(pathExists))).some(
-        Boolean,
-      );
-      if (!hadTargets) return { status: "not-found" };
+      try {
+        validatedRegistration ??= await inspectDockerServiceRegistration(
+          paths,
+          control,
+        );
+        const beforePayload = await inspectDockerServiceRegistration(
+          paths,
+          control,
+        );
+        assertDockerServiceReadyForPayloadMutation(
+          validatedRegistration,
+          beforePayload,
+        );
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
 
-      const failures: string[] = [];
       let removed = false;
-      for (const target of targets) {
-        const result = await removeExactTarget(context, target);
+      // Keep the service executable available for coordinator rollback until
+      // the exact stopped registration is verified absent.
+      for (const target of payloadTargets) {
+        const result = await removeTarget(target);
         if (result.status === "removed") removed = true;
         if (result.status === "failed") {
-          failures.push(`${target}: ${result.detail ?? "removal failed"}`);
+          return {
+            status: "failed",
+            detail: `${target}: ${result.detail ?? "removal failed"}`,
+          };
         }
       }
-      if (failures.length > 0) {
-        return { status: "failed", detail: failures.join("; ") };
+
+      try {
+        if (validatedRegistration === undefined) {
+          throw new Error("docker service validation state is unavailable");
+        }
+        const immediate = await inspectDockerServiceRegistration(
+          paths,
+          control,
+        );
+        assertDockerServiceReadyForPayloadMutation(
+          validatedRegistration,
+          immediate,
+        );
+        if (immediate.status === "missing") {
+          lifecycle.finalizeRegistration();
+        } else {
+          const deletion = await control.delete("docker");
+          assertCompleteWindowsCommandOutput(
+            deletion,
+            "docker service deletion",
+          );
+          if (
+            deletion.exitCode !== 0 &&
+            !isMissingWindowsService(deletion) &&
+            !isWindowsServiceDeletionPending(deletion)
+          ) {
+            return {
+              status: "failed",
+              detail: failureDetail(
+                deletion.stderr || deletion.stdout,
+                paths.serviceControl,
+                deletion.exitCode,
+              ),
+            };
+          }
+
+          const wait =
+            control.wait ??
+            (async (milliseconds: number) =>
+              await new Promise((resolve) =>
+                setTimeout(resolve, milliseconds),
+              ));
+          let registrationRemoved = false;
+          for (let attempt = 0; attempt < 60; attempt += 1) {
+            const current = await control.query("docker");
+            assertCompleteWindowsCommandOutput(
+              current,
+              "docker service deletion verification",
+            );
+            if (isMissingWindowsService(current)) {
+              lifecycle.finalizeRegistration();
+              registrationRemoved = true;
+              removed = true;
+              break;
+            }
+            if (isWindowsServiceDeletionPending(current)) {
+              await wait(500);
+              continue;
+            }
+            if (current.exitCode !== 0) {
+              return {
+                status: "failed",
+                detail: failureDetail(
+                  current.stderr || current.stdout,
+                  paths.serviceControl,
+                  current.exitCode,
+                ),
+              };
+            }
+            await wait(500);
+          }
+          if (!registrationRemoved) {
+            return {
+              status: "failed",
+              detail: "docker service remained registered after deletion",
+            };
+          }
+        }
+
+        const executableRemoval = await removeTarget(serviceExecutable);
+        if (executableRemoval.status === "failed") {
+          return {
+            status: "failed",
+            detail: `${serviceExecutable}: ${executableRemoval.detail ?? "removal failed"}`,
+          };
+        }
+        if (executableRemoval.status === "removed") removed = true;
+        const finalRegistration = await inspectDockerServiceRegistration(
+          paths,
+          control,
+        );
+        if (finalRegistration.status !== "missing") {
+          return {
+            status: "failed",
+            detail:
+              "docker service was recreated or remained registered after dockerd removal",
+          };
+        }
+        return removed
+          ? {
+              status: "removed",
+              detail: "removed Docker payload and service registration",
+            }
+          : { status: "not-found" };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
       }
-      return removed ? { status: "removed" } : { status: "not-found" };
     },
   });
 }
@@ -1445,13 +3670,31 @@ export async function createWindowsAdapter(
       `Refusing unexpected Windows runner home '${context.home}'; no cleanup was scheduled.`,
     );
   }
-  const paths = windowsPaths();
+  const paths = windowsPaths(normalizedHome, context.architecture);
   const installedChocolateyPackages = lazyAsync(
-    async () => await listChocolateyPackages(paths.chocolatey),
+    async () =>
+      await listChocolateyPackages(
+        paths.chocolatey,
+        paths.chocolateyEnvironment,
+      ),
   );
-  const installedMsiProducts = lazyAsync(
-    async () => await listMsiProducts(paths),
+  const installedUninstallRecords = lazyAsync(
+    async () => await listWindowsUninstallRecords(paths),
   );
+  const installedMsiProducts = lazyAsync(async () => {
+    const inventory = await installedUninstallRecords();
+    const byCode = new Map<string, MsiProduct>();
+    for (const record of inventory.records) {
+      const product = msiProductFromRecord(record);
+      if (product !== undefined) {
+        byCode.set(product.productCode.toLowerCase(), product);
+      }
+    }
+    return {
+      products: [...byCode.values()],
+      registryExecutable: inventory.registryExecutable,
+    };
+  });
   const visualStudioInstances = lazyAsync(
     async () => await listVisualStudioInstances(paths),
   );
@@ -1460,7 +3703,14 @@ export async function createWindowsAdapter(
     supportedComponents: SUPPORTED,
     operations: async (plan: CleanupPlan): Promise<readonly Operation[]> => {
       const operations: Operation[] = [];
-      const serviceCoordinator = createWindowsServiceCoordinator(paths, plan);
+      const serviceControl = windowsServiceControl(paths);
+      const dockerServiceLifecycle = createWindowsDockerServiceLifecycle();
+      const serviceCoordinator = createWindowsServiceCoordinator(
+        paths,
+        plan,
+        serviceControl,
+        dockerServiceLifecycle,
+      );
       if (serviceCoordinator !== undefined) {
         operations.push(serviceCoordinator);
       }
@@ -1494,6 +3744,7 @@ export async function createWindowsAdapter(
           expectedToolCache.toLowerCase()
           ? expectedToolCache
           : undefined;
+      const localAppData = win32.join(normalizedHome, "AppData", "Local");
 
       addFixed(
         "dotnet",
@@ -1506,6 +3757,11 @@ export async function createWindowsAdapter(
         "Remove default-user .NET tools",
       );
       addFixed(
+        "dotnet",
+        win32.join(normalizedHome, ".dotnet"),
+        "Remove runner-user .NET tools",
+      );
+      addFixed(
         "android",
         win32.join(paths.programFilesX86, "Android", "android-sdk"),
         "Remove Android SDK",
@@ -1514,6 +3770,11 @@ export async function createWindowsAdapter(
         "android",
         win32.join(paths.drive, "Android", "android-sdk"),
         "Remove Android SDK definition link",
+      );
+      addFixed(
+        "android",
+        win32.join(normalizedHome, ".android"),
+        "Remove Android user state",
       );
       addFixed(
         "haskell",
@@ -1538,9 +3799,29 @@ export async function createWindowsAdapter(
         }),
       );
       addFixed(
+        "miniconda",
+        win32.join(normalizedHome, ".conda"),
+        "Remove Conda user cache",
+      );
+      addFixed(
+        "miniconda",
+        win32.join(localAppData, "conda"),
+        "Remove Conda download cache",
+      );
+      addFixed(
         "vcpkg",
         win32.join(paths.drive, "vcpkg"),
         "Remove vcpkg checkout",
+      );
+      addFixed(
+        "vcpkg",
+        win32.join(normalizedHome, ".vcpkg"),
+        "Remove vcpkg user state",
+      );
+      addFixed(
+        "vcpkg",
+        win32.join(localAppData, "vcpkg"),
+        "Remove vcpkg cache",
       );
       addFixed(
         "rust",
@@ -1586,29 +3867,6 @@ export async function createWindowsAdapter(
         win32.join(paths.commonProgramFiles, "AzureCliExtensionDirectory"),
         "Remove Azure CLI extension cache",
       );
-      addFixed(
-        "powershell",
-        win32.join(paths.drive, "Modules"),
-        "Remove runner-image Azure PowerShell modules",
-      );
-      const allUsersPowerShellModules = win32.join(
-        paths.programFiles,
-        "WindowsPowerShell",
-        "Modules",
-      );
-      for (const moduleName of DEFINITION_POWERSHELL_MODULES) {
-        addFixed(
-          "powershell",
-          win32.join(allUsersPowerShellModules, moduleName),
-          `Remove PowerShell module ${moduleName}`,
-        );
-      }
-      addFixed(
-        "maven",
-        win32.join(paths.programData, "m2"),
-        "Remove runner-image Maven repository cache",
-      );
-
       if (toolCache === undefined) {
         const missingToolcacheComponents = [
           "cached-tools",
@@ -1631,7 +3889,9 @@ export async function createWindowsAdapter(
         }
       } else {
         addFixed("cached-tools", toolCache, "Remove hosted toolcache");
-        operations.push(recreateToolCacheOperation(context, toolCache));
+        operations.push(
+          createWindowsToolCacheRecreateOperation(context, toolCache),
+        );
         const cachedTargets: readonly [ComponentId, string, string][] = [
           ["codeql", "CodeQL", "Remove CodeQL bundles"],
           ["cached-go", "go", "Remove cached Go versions"],
@@ -1693,7 +3953,7 @@ export async function createWindowsAdapter(
 
       const addChrome = (component: "browsers" | "chrome"): void => {
         operations.push(
-          msiOperation(
+          createWindowsMsiOperation(
             paths,
             component,
             [/^Google Chrome$/i],
@@ -1745,7 +4005,7 @@ export async function createWindowsAdapter(
       addSelenium("selenium");
 
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "powershell",
           [/^PowerShell 7(?:-(?:x64|arm64))?$/i],
@@ -1755,7 +4015,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        chocolateyOperation(
+        createWindowsChocolateyOperation(
           paths,
           "julia",
           ["julia"],
@@ -1771,7 +4031,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        chocolateyOperation(
+        createWindowsChocolateyOperation(
           paths,
           "aws-cli",
           ["awscli"],
@@ -1779,7 +4039,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "aws-cli",
           [/^AWS Systems Manager Session Manager Plugin$/i],
@@ -1789,7 +4049,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "aws-sam-cli",
           [/^AWS SAM Command Line Interface(?: \(.+\))?$/i],
@@ -1799,7 +4059,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "azure-cli",
           [/^Microsoft Azure CLI(?: \(64-bit\))?$/i],
@@ -1809,7 +4069,7 @@ export async function createWindowsAdapter(
         ),
       );
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "gh-cli",
           [/^GitHub CLI$/i],
@@ -1833,7 +4093,7 @@ export async function createWindowsAdapter(
       ];
       for (const [component, packageNames] of chocoComponents) {
         operations.push(
-          chocolateyOperation(
+          createWindowsChocolateyOperation(
             paths,
             component,
             packageNames,
@@ -1876,13 +4136,13 @@ export async function createWindowsAdapter(
       }
 
       operations.push(
-        msiOperation(
+        createWindowsMsiOperation(
           paths,
           "mysql",
           [/^MySQL Server 8\.0$/i],
           installedMsiProducts,
           "mysql-server-8",
-          "Uninstall MySQL Server MSI",
+          "Uninstall runner-image MySQL CLI MSI",
         ),
       );
 
@@ -1936,7 +4196,11 @@ export async function createWindowsAdapter(
         }
       }
 
-      operations.push(dockerImagesOperation(paths));
+      operations.push(
+        createWindowsDockerPruneOperation(paths, {
+          context,
+        }),
+      );
       operations.push(
         createRemovePathOperation({
           id: "windows:docker:data",
@@ -1948,14 +4212,25 @@ export async function createWindowsAdapter(
           blockedBy: ["docker-images"],
         }),
       );
-      operations.push(dockerEngineOperation(context, paths));
+      operations.push(
+        createWindowsDockerEngineOperation(context, paths, {
+          control: serviceControl,
+          lifecycle: dockerServiceLifecycle,
+        }),
+      );
 
-      // A successful complete Visual Studio uninstall includes its SDK
-      // workloads. Keep the narrower SDK operation as an outcome-dependent
-      // fallback so an absent or failed broad uninstall does not suppress an
-      // explicitly selected SDK cleanup.
-      operations.push(visualStudioOperation(paths, visualStudioInstances));
-      operations.push(windowsSdkOperation(paths, visualStudioInstances));
+      // Visual Studio-owned SDK components and standalone SDK/WDK bundles are
+      // independently installed on current runner images, so both cleanup
+      // paths remain independently eligible.
+      operations.push(
+        createWindowsVisualStudioOperation(paths, visualStudioInstances),
+      );
+      operations.push(
+        createWindowsSdkComponentOperation(paths, visualStudioInstances),
+      );
+      operations.push(
+        createWindowsSdkBundleOperation(paths, installedUninstallRecords),
+      );
 
       // Retaining Visual Studio while stripping one of its definition-owned
       // SDK/toolchain roots can leave the selected instance unusable.  A

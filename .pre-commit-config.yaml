@@ -2,63 +2,78 @@ minimum_pre_commit_version: "4.6.2"
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit, pre-push]
 
+# CI installs every entry point from hash-locked pip requirements, the npm
+# lockfile, or a checksum-verified actionlint release before running hooks.
 repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+  - repo: local
     hooks:
       - id: check-added-large-files
         name: Large Files Check
-        args: ["--maxkb=1024"]
+        entry: check-added-large-files
+        language: system
+        args: ["--maxkb=1024", "--enforce-all"]
         stages: [pre-push]
 
       - id: detect-private-key
         name: Private Key Check
+        entry: detect-private-key
+        language: system
+        types: [text]
         stages: [pre-push]
 
       - id: check-merge-conflict
         name: Merge Conflict Resolution Check
+        entry: check-merge-conflict
+        language: system
+        types: [text]
         stages: [pre-commit, pre-push]
 
       - id: end-of-file-fixer
         name: Newline EOF Checker
+        entry: end-of-file-fixer
+        language: system
+        types: [text]
         exclude: ^CHANGELOG\.md$
         stages: [pre-commit, pre-push]
 
       - id: trailing-whitespace
         name: Whitespace Cleaning Check
+        entry: trailing-whitespace-fixer
+        language: system
+        types: [text]
         args: [--markdown-linebreak-ext=md]
         exclude: ^CHANGELOG\.md$
         stages: [pre-commit, pre-push]
 
-  - repo: https://github.com/sirosen/fix-smartquotes
-    rev: 0.2.0
-    hooks:
       - id: fix-smartquotes
         name: Fix Quotes
+        entry: fix-smartquotes
+        language: system
+        types: [text]
         exclude: ^CHANGELOG\.md$
         stages: [pre-commit, pre-push]
 
-  - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.23.2
-    hooks:
       - id: markdownlint-cli2
         name: Markdown Lint
+        entry: node_modules/.bin/markdownlint-cli2
+        language: system
+        types: [markdown]
         args: ["--fix", "--config=.markdownlint-cli2.jsonc"]
         exclude: ^CHANGELOG\.md$
         stages: [pre-commit, pre-push]
 
-  - repo: https://github.com/adrienverge/yamllint.git
-    rev: v1.38.0
-    hooks:
       - id: yamllint
         name: YAML Lint
+        entry: yamllint
+        language: system
+        types: [file, yaml]
         args: ["--strict", "-c=.yamllint"]
         stages: [pre-commit, pre-push]
 
-  - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.12
-    hooks:
       - id: actionlint
         name: GitHub Workflow Lint
+        entry: node_modules/.bin/actionlint
+        language: system
+        types: [yaml]
         files: ^\.github/workflows/.*\.ya?ml$
         stages: [pre-commit, pre-push]

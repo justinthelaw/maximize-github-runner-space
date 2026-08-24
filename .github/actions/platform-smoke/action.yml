@@ -1,5 +1,5 @@
 name: Platform smoke test
-description: Exercise one bounded cleanup and verify native runner identity
+description: Exercise bounded cleanup, native identity, and dependency-free runtimes
 
 inputs:
   expected-platform:
@@ -12,6 +12,103 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Record dependency-free runtime paths on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        smoke_root="${RUNNER_TEMP}/maximize-runner-space-runtime-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        mkdir -p "$smoke_root"
+        printf 'SMOKE_ROOT=%s\n' "$smoke_root" >>"$GITHUB_ENV"
+
+        bash_runtime=/bin/bash
+        [[ -x "$bash_runtime" ]]
+        [[ "$("$bash_runtime" --noprofile --norc -c 'printf %s runtime-ok')" == runtime-ok ]]
+        printf 'SMOKE_BASH_RUNTIME=%s\n' "$bash_runtime" >>"$GITHUB_ENV"
+
+        sh_runtime=/bin/sh
+        [[ -x "$sh_runtime" ]]
+        [[ "$("$sh_runtime" -c 'printf %s runtime-ok')" == runtime-ok ]]
+        printf 'SMOKE_SH_RUNTIME=%s\n' "$sh_runtime" >>"$GITHUB_ENV"
+
+        node_runtime="$(command -v node)"
+        [[ -x "$node_runtime" ]]
+        "$node_runtime" -e 'if (process.version.length === 0) process.exit(1)'
+        printf 'SMOKE_NODE_RUNTIME=%s\n' "$node_runtime" >>"$GITHUB_ENV"
+
+        python_runtime=""
+        for candidate_path in /usr/bin/python3 /usr/bin/python; do
+          if [[ -x "$candidate_path" ]] &&
+            "$candidate_path" -c 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)'
+          then
+            python_runtime="$candidate_path"
+            break
+          fi
+        done
+        if [[ -n "$python_runtime" ]]; then
+          printf 'SMOKE_PYTHON_PRESENT=1\nSMOKE_PYTHON_RUNTIME=%s\n' "$python_runtime" >>"$GITHUB_ENV"
+        else
+          printf 'SMOKE_PYTHON_PRESENT=0\n' >>"$GITHUB_ENV"
+          echo "::notice::No working image-provided Python runtime was available before cleanup."
+        fi
+
+        perl_runtime=/usr/bin/perl
+        if [[ -x "$perl_runtime" ]] &&
+          "$perl_runtime" -e 'exit(("runtime-ok" eq "runtime-ok") ? 0 : 1)'
+        then
+          printf 'SMOKE_PERL_PRESENT=1\nSMOKE_PERL_RUNTIME=%s\n' "$perl_runtime" >>"$GITHUB_ENV"
+        else
+          printf 'SMOKE_PERL_PRESENT=0\n' >>"$GITHUB_ENV"
+          echo "::notice::No working image-provided Perl runtime was available before cleanup."
+        fi
+
+    - name: Record dependency-free runtime paths on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $smokeRoot = Join-Path $env:RUNNER_TEMP "maximize-runner-space-runtime-smoke-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+        New-Item -ItemType Directory -Path $smokeRoot -Force | Out-Null
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_ROOT=$smokeRoot" -Encoding utf8
+
+        $powershellRuntime = (Get-Process -Id $PID).Path
+        & $powershellRuntime -NoLogo -NoProfile -NonInteractive -Command "if (`$PSVersionTable.PSVersion.Major -lt 7) { exit 1 }"
+        if ($LASTEXITCODE -ne 0) { throw 'The image PowerShell runtime failed before cleanup.' }
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_POWERSHELL_RUNTIME=$powershellRuntime" -Encoding utf8
+
+        $cmdRuntime = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        & $cmdRuntime /d /s /c 'exit 0'
+        if ($LASTEXITCODE -ne 0) { throw 'The OS cmd.exe runtime failed before cleanup.' }
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_CMD_RUNTIME=$cmdRuntime" -Encoding utf8
+
+        $nodeRuntime = Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        & $nodeRuntime.Source -e 'if (process.version.length === 0) process.exit(1)'
+        if ($LASTEXITCODE -ne 0) { throw 'The image Node.js runtime failed before cleanup.' }
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_NODE_RUNTIME=$($nodeRuntime.Source)" -Encoding utf8
+
+        $pythonRuntime = $null
+        foreach ($candidate in @('python3', 'python', 'py')) {
+          $command = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $command) { continue }
+          try {
+            & $command.Source -c 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)' 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $pythonRuntime = $command.Source
+              break
+            }
+          } catch {
+            continue
+          }
+        }
+        if ($pythonRuntime) {
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SMOKE_PYTHON_PRESENT=1' -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_PYTHON_RUNTIME=$pythonRuntime" -Encoding utf8
+        } else {
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SMOKE_PYTHON_PRESENT=0' -Encoding utf8
+          Write-Host '::notice::No working image-provided Python runtime was available before cleanup.'
+        }
+
     - name: Assert AzCopy fixture exists on Unix
       if: runner.os != 'Windows'
       shell: bash
@@ -85,6 +182,69 @@ runs:
         if (Get-Command azcopy -ErrorAction SilentlyContinue) { throw 'AzCopy was not removed.' }
         if (Get-Command azcopy10 -ErrorAction SilentlyContinue) { throw 'AzCopy 10 alias was not removed.' }
 
+    - name: Assert the Windows GitHub CLI MSI fixture exists
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not (Get-Command gh -CommandType Application -ErrorAction SilentlyContinue)) {
+          throw 'Expected the runner image to contain GitHub CLI.'
+        }
+        $roots = @(
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        $products = @(
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            Get-ChildItem -LiteralPath $root |
+              ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+              Where-Object DisplayName -EQ 'GitHub CLI'
+          }
+        )
+        if ($products.Count -ne 1) {
+          throw "Expected one GitHub CLI MSI record, found $($products.Count)."
+        }
+        if ($products[0].WindowsInstaller -ne 1 -or
+          $products[0].PSChildName -notmatch '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$') {
+          throw 'GitHub CLI is not represented by a validated MSI product record.'
+        }
+
+    - name: Exercise verified MSI cleanup on Windows
+      if: runner.os == 'Windows'
+      id: github-cli-msi-cleanup
+      uses: ./
+      with:
+        cleanup-profile: custom
+        remove-gh-cli: "true"
+
+    - name: Verify the Windows GitHub CLI MSI postcondition
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        FAILED_OPERATIONS: ${{ steps.github-cli-msi-cleanup.outputs.failed-operations }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if ($env:FAILED_OPERATIONS -ne '0') { throw 'GitHub CLI MSI cleanup failed.' }
+        if (Get-Command gh -ErrorAction SilentlyContinue) { throw 'GitHub CLI was not removed.' }
+        $roots = @(
+          'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+        )
+        $remaining = @(
+          foreach ($root in $roots) {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            Get-ChildItem -LiteralPath $root |
+              ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+              Where-Object DisplayName -EQ 'GitHub CLI'
+          }
+        )
+        if ($remaining.Count -ne 0) { throw 'GitHub CLI MSI registration remains.' }
+        & $env:SMOKE_POWERSHELL_RUNTIME -NoLogo -NoProfile -NonInteractive -Command 'exit 0'
+        if ($LASTEXITCODE -ne 0) { throw 'PowerShell did not survive MSI cleanup.' }
+        & $env:SMOKE_NODE_RUNTIME -e 'if (process.version.length === 0) process.exit(1)'
+        if ($LASTEXITCODE -ne 0) { throw 'Node.js did not survive MSI cleanup.' }
+
     - name: Prepare an untrusted Homebrew PATH shim on macOS
       if: runner.os == 'macOS'
       shell: bash
@@ -120,3 +280,219 @@ runs:
           exit 1
         fi
         command -v brew >/dev/null
+
+    - name: Exercise dependency-free Unix runtime smoke tests
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        : "${SMOKE_ROOT:?SMOKE_ROOT was not recorded before cleanup}"
+        : "${SMOKE_BASH_RUNTIME:?SMOKE_BASH_RUNTIME was not recorded before cleanup}"
+        : "${SMOKE_SH_RUNTIME:?SMOKE_SH_RUNTIME was not recorded before cleanup}"
+        : "${SMOKE_NODE_RUNTIME:?SMOKE_NODE_RUNTIME was not recorded before cleanup}"
+        export SMOKE_ROOT
+
+        [[ -x "$SMOKE_BASH_RUNTIME" ]]
+        bash_value="$("$SMOKE_BASH_RUNTIME" --noprofile --norc -c 'printf %s runtime-ok')"
+        [[ "$bash_value" == runtime-ok ]]
+        printf '%s' "$bash_value" >"${SMOKE_ROOT}/bash.txt"
+        [[ "$(<"${SMOKE_ROOT}/bash.txt")" == runtime-ok ]]
+
+        [[ -x "$SMOKE_SH_RUNTIME" ]]
+        sh_value="$("$SMOKE_SH_RUNTIME" -c 'printf %s runtime-ok')"
+        [[ "$sh_value" == runtime-ok ]]
+        printf '%s' "$sh_value" >"${SMOKE_ROOT}/sh.txt"
+
+        if [[ "$SMOKE_PYTHON_PRESENT" == 1 ]]; then
+          : "${SMOKE_PYTHON_RUNTIME:?Image Python disappeared after cleanup}"
+          [[ -x "$SMOKE_PYTHON_RUNTIME" ]]
+          "$SMOKE_PYTHON_RUNTIME" - <<'PYTHON'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        target = Path(os.environ["SMOKE_ROOT"]) / "python.json"
+        payload = {"runtime": "python", "status": "ok"}
+        target.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        if json.loads(target.read_text(encoding="utf-8")) != payload:
+            raise RuntimeError("Python JSON round trip failed")
+        if len(hashlib.sha256(target.read_bytes()).hexdigest()) != 64:
+            raise RuntimeError("Python SHA-256 smoke failed")
+        PYTHON
+        elif [[ "$SMOKE_PYTHON_PRESENT" != 0 ]]; then
+          echo "Invalid pre-cleanup Python state: $SMOKE_PYTHON_PRESENT" >&2
+          exit 1
+        fi
+
+        if [[ "$SMOKE_PERL_PRESENT" == 1 ]]; then
+          : "${SMOKE_PERL_RUNTIME:?Image Perl disappeared after cleanup}"
+          [[ -x "$SMOKE_PERL_RUNTIME" ]]
+          "$SMOKE_PERL_RUNTIME" -e '
+            use strict;
+            use warnings;
+            my $path = "$ENV{SMOKE_ROOT}/perl.txt";
+            open my $out, ">", $path or die "open $path: $!";
+            print {$out} "runtime-ok" or die "write $path: $!";
+            close $out or die "close $path: $!";
+            open my $in, "<", $path or die "open $path: $!";
+            local $/;
+            my $value = <$in>;
+            close $in or die "close $path: $!";
+            die "Perl round trip failed" unless $value eq "runtime-ok";
+          '
+        elif [[ "$SMOKE_PERL_PRESENT" != 0 ]]; then
+          echo "Invalid pre-cleanup Perl state: $SMOKE_PERL_PRESENT" >&2
+          exit 1
+        fi
+
+        [[ -x "$SMOKE_NODE_RUNTIME" ]]
+        "$SMOKE_NODE_RUNTIME" --input-type=module - <<'NODE'
+        import { createHash } from "node:crypto";
+        import { readFileSync, writeFileSync } from "node:fs";
+        import { join } from "node:path";
+
+        const target = join(process.env.SMOKE_ROOT, "node.json");
+        const payload = { runtime: "node", status: "ok" };
+        writeFileSync(target, JSON.stringify(payload));
+        if (JSON.parse(readFileSync(target, "utf8")).status !== "ok") {
+          throw new Error("Node.js JSON round trip failed");
+        }
+        if (createHash("sha256").update(readFileSync(target)).digest("hex").length !== 64) {
+          throw new Error("Node.js SHA-256 smoke failed");
+        }
+        NODE
+
+    - name: Verify dependency-free runtime artifacts on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -f "${SMOKE_ROOT}/bash.txt"
+        [[ "$(<"${SMOKE_ROOT}/bash.txt")" == runtime-ok ]]
+        test -f "${SMOKE_ROOT}/sh.txt"
+        [[ "$(<"${SMOKE_ROOT}/sh.txt")" == runtime-ok ]]
+        test -s "${SMOKE_ROOT}/node.json"
+        if [[ "$SMOKE_PYTHON_PRESENT" == 1 ]]; then
+          test -f "${SMOKE_ROOT}/python.json"
+          test -s "${SMOKE_ROOT}/python.json"
+        else
+          test ! -e "${SMOKE_ROOT}/python.json"
+        fi
+        if [[ "$SMOKE_PERL_PRESENT" == 1 ]]; then
+          test -f "${SMOKE_ROOT}/perl.txt"
+          [[ "$(<"${SMOKE_ROOT}/perl.txt")" == runtime-ok ]]
+        else
+          test ! -e "${SMOKE_ROOT}/perl.txt"
+        fi
+
+    - name: Exercise dependency-free Windows runtime smoke tests
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $smokeRoot = $env:SMOKE_ROOT
+        if ([string]::IsNullOrWhiteSpace($smokeRoot)) { throw 'SMOKE_ROOT was not recorded before cleanup.' }
+        if (-not (Test-Path -LiteralPath $env:SMOKE_POWERSHELL_RUNTIME -PathType Leaf)) {
+          throw 'The image PowerShell runtime disappeared after cleanup.'
+        }
+        if ((Get-Process -Id $PID).Path -ne $env:SMOKE_POWERSHELL_RUNTIME) {
+          throw 'The smoke step is not using the PowerShell runtime recorded before cleanup.'
+        }
+
+        if (-not (Test-Path -LiteralPath $env:SMOKE_CMD_RUNTIME -PathType Leaf)) {
+          throw 'The OS cmd.exe runtime disappeared after cleanup.'
+        }
+        $cmdValue = (& $env:SMOKE_CMD_RUNTIME /d /s /c 'echo runtime-ok').Trim()
+        if ($LASTEXITCODE -ne 0 -or $cmdValue -ne 'runtime-ok') {
+          throw 'cmd.exe smoke failed.'
+        }
+        Set-Content -LiteralPath (Join-Path $smokeRoot 'cmd.txt') -Value $cmdValue -NoNewline -Encoding ascii
+
+        $powershellPath = Join-Path $smokeRoot 'powershell.json'
+        @{ runtime = 'powershell'; status = 'ok' } |
+          ConvertTo-Json -Compress |
+          Set-Content -LiteralPath $powershellPath -Encoding utf8
+        $powershellPayload = Get-Content -LiteralPath $powershellPath -Raw | ConvertFrom-Json
+        if ($powershellPayload.status -ne 'ok') {
+          throw 'PowerShell JSON round trip failed.'
+        }
+        if ((Get-FileHash -LiteralPath $powershellPath -Algorithm SHA256).Hash.Length -ne 64) {
+          throw 'PowerShell SHA-256 smoke failed.'
+        }
+
+        if ($env:SMOKE_PYTHON_PRESENT -eq '1') {
+          $pythonPath = $env:SMOKE_PYTHON_RUNTIME
+          if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+            throw 'The image Python runtime disappeared after cleanup.'
+          }
+          $pythonProgram = @'
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+
+        target = Path(os.environ["SMOKE_ROOT"]) / "python.json"
+        payload = {"runtime": "python", "status": "ok"}
+        target.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        if json.loads(target.read_text(encoding="utf-8")) != payload:
+            raise RuntimeError("Python JSON round trip failed")
+        if len(hashlib.sha256(target.read_bytes()).hexdigest()) != 64:
+            raise RuntimeError("Python SHA-256 smoke failed")
+        '@
+          & $pythonPath -c $pythonProgram
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python smoke failed with exit code $LASTEXITCODE."
+          }
+        } elseif ($env:SMOKE_PYTHON_PRESENT -ne '0') {
+          throw "Invalid pre-cleanup Python state: $env:SMOKE_PYTHON_PRESENT"
+        }
+
+        $nodePath = $env:SMOKE_NODE_RUNTIME
+        if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf)) {
+          throw 'The image Node.js runtime disappeared after cleanup.'
+        }
+        $nodeProgram = @'
+        const crypto = require("node:crypto");
+        const fs = require("node:fs");
+        const path = require("node:path");
+        const target = path.join(process.env.SMOKE_ROOT, "node.json");
+        const payload = { runtime: "node", status: "ok" };
+        fs.writeFileSync(target, JSON.stringify(payload));
+        if (JSON.parse(fs.readFileSync(target, "utf8")).status !== "ok") {
+          throw new Error("Node.js JSON round trip failed");
+        }
+        if (crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex").length !== 64) {
+          throw new Error("Node.js SHA-256 smoke failed");
+        }
+        '@
+        & $nodePath -e $nodeProgram
+        if ($LASTEXITCODE -ne 0) {
+          throw "Node.js smoke failed with exit code $LASTEXITCODE."
+        }
+
+    - name: Verify dependency-free runtime artifacts on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        foreach ($name in @('cmd.txt', 'powershell.json', 'node.json')) {
+          $path = Join-Path $env:SMOKE_ROOT $name
+          if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Runtime artifact was not created: $path"
+          }
+          if ((Get-Item -LiteralPath $path).Length -eq 0) {
+            throw "Runtime artifact is empty: $path"
+          }
+        }
+        $pythonPath = Join-Path $env:SMOKE_ROOT 'python.json'
+        if ($env:SMOKE_PYTHON_PRESENT -eq '1') {
+          if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+            throw "Runtime artifact was not created: $pythonPath"
+          }
+          if ((Get-Item -LiteralPath $pythonPath).Length -eq 0) {
+            throw "Runtime artifact is empty: $pythonPath"
+          }
+        } elseif (Test-Path -LiteralPath $pythonPath) {
+          throw "Unexpected Python runtime artifact exists: $pythonPath"
+        }

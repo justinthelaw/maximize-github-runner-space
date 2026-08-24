@@ -161,6 +161,80 @@ export async function assertSafeExistingTarget(
   assertSafeRemovalTarget(target, allowedParents, context);
 }
 
+export interface RemovalBoundaryEntry {
+  readonly path: string;
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly mode: bigint;
+}
+
+export interface RemovalBoundarySnapshot {
+  readonly targetExists: boolean;
+  readonly entries: readonly RemovalBoundaryEntry[];
+}
+
+export async function captureSafeRemovalBoundary(
+  target: string,
+  allowedParents: readonly string[],
+  context: RuntimeContext,
+): Promise<RemovalBoundarySnapshot> {
+  await assertSafeExistingTarget(target, allowedParents, context);
+  const api = pathApi(context);
+  const normalizedTarget = api.normalize(api.resolve(target));
+  const parsed = api.parse(normalizedTarget);
+  const relativeParts = normalizedTarget
+    .slice(parsed.root.length)
+    .split(api.sep)
+    .filter(Boolean);
+  const entries: RemovalBoundaryEntry[] = [];
+  let prefix = parsed.root;
+  for (const [index, part] of relativeParts.entries()) {
+    prefix = api.join(prefix, part);
+    try {
+      const stat = await lstat(prefix, { bigint: true });
+      const isTarget = index === relativeParts.length - 1;
+      if (!isTarget && stat.isSymbolicLink()) {
+        throw new Error(
+          `Refusing cleanup target with a redirected ancestor: '${target}'.`,
+        );
+      }
+      entries.push({
+        path: prefix,
+        device: stat.dev,
+        inode: stat.ino,
+        mode: stat.mode,
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw error;
+    }
+  }
+  return {
+    targetExists: entries.at(-1)?.path === normalizedTarget,
+    entries,
+  };
+}
+
+export function sameRemovalBoundary(
+  left: RemovalBoundarySnapshot,
+  right: RemovalBoundarySnapshot,
+): boolean {
+  return (
+    left.targetExists === right.targetExists &&
+    left.entries.length === right.entries.length &&
+    left.entries.every((entry, index) => {
+      const other = right.entries[index];
+      return (
+        other !== undefined &&
+        entry.path === other.path &&
+        entry.device === other.device &&
+        entry.inode === other.inode &&
+        entry.mode === other.mode
+      );
+    })
+  );
+}
+
 /** Validate a directory that will be created or reused without following a link. */
 export async function assertSafeDirectoryTarget(
   target: string,

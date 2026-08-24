@@ -43,11 +43,13 @@ pre-commit run --all-files --hook-stage pre-push
   `ImageVersion`, or a workflow-selected path.
 - Never remove a filesystem root, home, temp/workspace/action/runtime tree,
   Homebrew prefix, `WinSxS`, or unchecked `Program Files` subtree.
+- Keep recursive deletion anchored to validated native handles. Never replace
+  it with path-only recursive removal on Unix or Windows.
 - Preserve grouped-component skip promises. If a broad operation owns a
   protected child, it must yield and narrower sibling operations must run.
 - Validate the complete plan before the first mutation. Swap replacement must
-  be atomic and failure-fatal; ordinary absent/image-drift cleanup is
-  best-effort for backward compatibility.
+  be atomic. Every cleanup failure is terminal; only a safely confirmed-absent
+  target may report `not-found` or `unsupported` and continue.
 - Keep configuration or support-policy changes aligned across `action.yml`, the
   relevant tests and workflows, README, `docs/CONFIGURATION.md`, and
   `docs/RUNNER-SUPPORT.md`.
@@ -57,5 +59,5 @@ pre-commit run --all-files --hook-stage pre-push
 - Put planner, path, and adapter-shape coverage in the single Linux quality job.
 - Test each of the seven standard runner environment classes once on PRs;
   avoid a component-by-OS Cartesian product.
-- Keep every-label and preview coverage in the scheduled/manual workflow,
-  cap matrix parallelism, time out every job, and cancel superseded PR runs.
+- Run the exact-label and preview sweep on PRs, weekly, and manually. Cap matrix
+  parallelism, time out every job, and cancel superseded PR runs.

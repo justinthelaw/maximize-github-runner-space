@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createLinuxAdapter } from "../src/platforms/linux.js";
+import {
+  createLinuxAdapter,
+  listLinuxVersionedChildren,
+} from "../src/platforms/linux.js";
 import { contextFor, planFor } from "./helpers.js";
 
 test("Linux rejects workflow overrides that point at broad allowlist parents", async () => {
@@ -91,7 +101,7 @@ test("Linux accepts the official slim container home layouts", async () => {
   }
 });
 
-test("Linux never deletes a workflow PATH executable from an unrelated tree", async () => {
+test("Linux command removals ignore workflow PATH and cover fixed image bins", async () => {
   const root = await mkdtemp(join(tmpdir(), "maximize-space-poisoned-path-"));
   const command = join(root, "azcopy");
   await mkdir(root, { recursive: true });
@@ -101,13 +111,14 @@ test("Linux never deletes a workflow PATH executable from an unrelated tree", as
   process.env.PATH = `${root}:${originalPath ?? ""}`;
   try {
     const adapter = await createLinuxAdapter(contextFor("linux"));
-    const operation = (await adapter.operations(planFor("azcopy"))).find(
-      ({ id }) => id === "binary:azcopy:azcopy",
+    const operations = (await adapter.operations(planFor("azcopy"))).filter(
+      ({ id }) => id.startsWith("binary:azcopy:azcopy:"),
     );
-    assert.ok(operation);
-    const result = await operation.run();
-    assert.equal(result.status, "unsupported");
-    assert.match(result.detail ?? "", /unexpected executable path/);
+    assert.deepEqual(operations.map(({ id }) => id).sort(), [
+      "binary:azcopy:azcopy:usr-bin",
+      "binary:azcopy:azcopy:usr-local-bin",
+    ]);
+    assert.equal(await readFile(command, "utf8"), "#!/bin/sh\nexit 0\n");
   } finally {
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
@@ -122,7 +133,59 @@ test("Linux resolves command removals only for the active plan", async () => {
     false,
   );
   assert.equal(
-    operations.some(({ id }) => id === "binary:azcopy:azcopy"),
+    operations.some(({ id }) => id.startsWith("binary:azcopy:azcopy:")),
     true,
   );
+});
+
+test("Android cleanup preserves the general Gradle user cache", async () => {
+  const adapter = await createLinuxAdapter(contextFor("linux"));
+  const operations = await adapter.operations(planFor("android"));
+  assert.equal(
+    operations.some(({ id }) => id.endsWith(":/home/runner/.gradle")),
+    false,
+  );
+  assert.equal(
+    operations.some(({ id }) => id.endsWith(":/home/runner/.android")),
+    true,
+  );
+});
+
+test("Linux cleanup preserves shared web and container storage unless all owners are selected", async () => {
+  const adapter = await createLinuxAdapter(contextFor("linux"));
+  const apache = await adapter.operations(planFor("apache"));
+  assert.equal(
+    apache.some(({ id }) => id.endsWith(":/var/www")),
+    false,
+  );
+
+  const podman = await adapter.operations(planFor("podman"));
+  assert.equal(
+    podman.some(({ id }) => id.endsWith(":/var/lib/containers")),
+    false,
+  );
+  const allContainerOwners = await adapter.operations(
+    planFor("podman", "buildah"),
+  );
+  assert.equal(
+    allContainerOwners.some(({ id }) => id.endsWith(":/var/lib/containers")),
+    true,
+  );
+});
+
+test("Linux versioned inventories reject rather than truncate excess entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-versions-"));
+  try {
+    await Promise.all(
+      Array.from({ length: 65 }, async (_, index) => {
+        await mkdir(join(root, `version-${index}`));
+      }),
+    );
+    await assert.rejects(
+      async () => await listLinuxVersionedChildren(root, /^version-\d+$/),
+      /exceeded 64 entries/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

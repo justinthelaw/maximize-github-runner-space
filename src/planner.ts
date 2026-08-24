@@ -10,6 +10,9 @@ import type { CleanupPlan, ComponentId } from "./types.js";
 
 export type InputReader = (name: string) => string;
 
+const MAX_SWAPFILE_SIZE_INPUT_LENGTH = 128;
+const MAX_SWAPFILE_SIZE_DIGITS = 64;
+
 function normalizeCsv(value: string): string {
   return value.toLowerCase().replace(/\s/g, "");
 }
@@ -58,6 +61,9 @@ function parseSkipped(raw: string): Set<ComponentId> {
 }
 
 export function parseSwapfileSize(rawValue: string): bigint | undefined {
+  if (rawValue.length > MAX_SWAPFILE_SIZE_INPUT_LENGTH) {
+    throw new Error("swapfile-size is too long.");
+  }
   const raw = rawValue.replace(/\s/g, "");
   if (raw === "") return undefined;
 
@@ -73,6 +79,9 @@ export function parseSwapfileSize(rawValue: string): bigint | undefined {
   const unit = (match[3] ?? "gib").toLowerCase();
   if (whole === undefined) {
     throw new Error(`Invalid swapfile-size '${rawValue}'.`);
+  }
+  if (whole.length + fraction.length > MAX_SWAPFILE_SIZE_DIGITS) {
+    throw new Error("swapfile-size is too long.");
   }
 
   const multipliers: Readonly<Record<string, bigint>> = {
