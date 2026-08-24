@@ -1178,9 +1178,17 @@ test(
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
-    testContext.after(() => {
+    const terminateHolder = (): void => {
+      if (holder.pid !== undefined) {
+        spawnSync(
+          "C:\\Windows\\System32\\taskkill.exe",
+          ["/pid", String(holder.pid), "/t", "/f"],
+          { stdio: "ignore", timeout: 10_000, windowsHide: true },
+        );
+      }
       if (!holder.killed) holder.kill();
-    });
+    };
+    testContext.after(terminateHolder);
     let holderStderr = "";
     holder.stderr.setEncoding("utf8");
     holder.stderr.on("data", (chunk: string) => {
@@ -1227,8 +1235,18 @@ test(
         /lock|sharing violation|used by another process/i,
       );
     } finally {
-      if (!holder.killed) holder.kill();
-      const [holderExit] = await holderExitPromise;
+      terminateHolder();
+      const holderCloseTimeout = new Promise<never>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("Windows lock holder did not terminate")),
+          10_000,
+        );
+        timer.unref();
+      });
+      const [holderExit] = await Promise.race([
+        holderExitPromise,
+        holderCloseTimeout,
+      ]);
       assert.notEqual(holderExit, undefined);
     }
     assert.equal(await readFile(lockedChild, "utf8"), "preserve locked child");
