@@ -4785,8 +4785,4 @@ test("directory recreation rejects a final symlink", async () => {
     async () =>
       await assertSafeDirectoryTarget(target, [allowed], {
         ...contextFor("linux"),
-        temp: join(root, "runner-temp"),
-      }),
-    /non-directory target/,
-  );
-});
+        temp: join(root, "r
