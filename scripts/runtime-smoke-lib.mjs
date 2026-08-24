@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join, win32 } from "node:path";
 
 const TIMEOUT_MS = 10_000;
+export const WINDOWS_POWERSHELL_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const STARTUP_INJECTION_KEYS = [
   "BASH_ENV",
@@ -24,7 +25,13 @@ function runtimeEnvironment() {
   return environment;
 }
 
-export function runRuntime(label, executable, args, spawn = spawnSync) {
+export function runRuntime(
+  label,
+  executable,
+  args,
+  spawn = spawnSync,
+  timeout = TIMEOUT_MS,
+) {
   const result = spawn(executable, args, {
     cwd:
       process.platform === "win32"
@@ -32,7 +39,7 @@ export function runRuntime(label, executable, args, spawn = spawnSync) {
         : "/",
     env: runtimeEnvironment(),
     encoding: "utf8",
-    timeout: TIMEOUT_MS,
+    timeout,
     maxBuffer: MAX_OUTPUT_BYTES,
     windowsHide: true,
   });

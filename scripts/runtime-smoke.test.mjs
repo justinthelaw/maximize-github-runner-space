@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PYTHON_SMOKE_SOURCE,
+  WINDOWS_POWERSHELL_TIMEOUT_MS,
   runFirstWorkingPython,
   runRuntime,
   windowsCandidates,
@@ -126,4 +127,19 @@ test("runtime smoke strips language startup injection variables", () => {
   for (const key of Object.keys(original)) {
     assert.equal(observedEnvironment[key], undefined, key);
   }
+});
+
+test("runtime smoke permits bounded legacy PowerShell startup", () => {
+  let observedTimeout;
+  runRuntime(
+    "Windows PowerShell",
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    [],
+    (_executable, _args, options) => {
+      observedTimeout = options.timeout;
+      return { status: 0, stdout: "", stderr: "" };
+    },
+    WINDOWS_POWERSHELL_TIMEOUT_MS,
+  );
+  assert.equal(observedTimeout, WINDOWS_POWERSHELL_TIMEOUT_MS);
 });

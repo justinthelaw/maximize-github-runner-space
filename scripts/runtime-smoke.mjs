@@ -1,7 +1,9 @@
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   PYTHON_SMOKE_SOURCE,
+  WINDOWS_POWERSHELL_TIMEOUT_MS,
   runFirstWorkingPython,
   runOptional,
   runRuntime,
@@ -31,6 +33,8 @@ if (process.platform === "win32") {
       "-Command",
       '$value = ConvertFrom-Json \'{"status":"ok"}\'; if ($value.status -ne "ok") { exit 1 }',
     ],
+    spawnSync,
+    WINDOWS_POWERSHELL_TIMEOUT_MS,
   );
 
   const pythonCandidates = windowsCandidates(systemRoot, [
