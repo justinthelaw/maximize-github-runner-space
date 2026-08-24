@@ -1298,11 +1298,7 @@ public static class LockedRemovalNative {
         return handle;
     }
 
-    private static SafeFileHandle Open(string path, uint access, uint shareMode) {
-        return OpenCore(path, access, shareMode);
-    }
-
-    private static SafeFileHandle OpenTargetWithTimeout(string path) {
+    private static SafeFileHandle OpenTargetWithTimeout(string path, uint access, uint shareMode) {
         object sync = new object();
         SafeFileHandle opened = null;
         Exception failure = null;
@@ -1310,7 +1306,7 @@ public static class LockedRemovalNative {
         Thread worker = new Thread(() => {
             SafeFileHandle candidate = null;
             try {
-                candidate = OpenCore(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ);
+                candidate = OpenCore(path, access, shareMode);
                 lock (sync) {
                     if (timedOut) {
                         candidate.Dispose();
@@ -1338,6 +1334,14 @@ public static class LockedRemovalNative {
         if (failure != null) throw failure;
         if (opened == null) throw new IOException("Windows cleanup path open returned no handle");
         return opened;
+    }
+
+    private static SafeFileHandle OpenTargetWithTimeout(string path) {
+        return OpenTargetWithTimeout(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ);
+    }
+
+    private static SafeFileHandle Open(string path, uint access, uint shareMode) {
+        return OpenTargetWithTimeout(path, access, shareMode);
     }
 
     private static SafeFileHandle Open(string path, uint access) {
