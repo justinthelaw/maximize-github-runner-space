@@ -1177,7 +1177,34 @@ test(
     testContext.after(() => {
       if (!holder.killed) holder.kill();
     });
-    const [holderReady] = (await once(holder.stdout, "data")) as [Buffer];
+    let holderStderr = "";
+    holder.stderr.setEncoding("utf8");
+    holder.stderr.on("data", (chunk: string) => {
+      holderStderr += chunk;
+    });
+    let readinessTimer: NodeJS.Timeout | undefined;
+    const readinessTimeout = new Promise<never>((_, reject) => {
+      readinessTimer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Windows lock holder did not become ready: ${holderStderr}`,
+            ),
+          ),
+        30_000,
+      );
+      readinessTimer.unref();
+    });
+    const [holderReady] = (await Promise.race([
+      once(holder.stdout, "data"),
+      once(holder, "close").then(([exitCode]) => {
+        throw new Error(
+          `Windows lock holder exited before readiness (${exitCode}): ${holderStderr}`,
+        );
+      }),
+      readinessTimeout,
+    ])) as [Buffer];
+    if (readinessTimer !== undefined) clearTimeout(readinessTimer);
     assert.match(holderReady.toString("utf8"), /LOCKED/);
     const lockedOperation = createRemovePathOperation({
       id: "windows-native-locked-child-preflight",
