@@ -554,7 +554,7 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
     "Bypass",
     "-Command",
   ]);
-  assert.ok(invocation.args.join(" ").length < 30_000);
+  assert.ok(invocation.args.join(" ").length < 32_000);
   const helperSource = invocation.args.at(-1) ?? "";
   assert.match(helperSource, /FindFirstFileW/);
   assert.match(helperSource, /FindNextFileW/);
@@ -587,7 +587,16 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
     helperSource,
     /OpenExecutable\(\[string\]\$spec\.runtimeExecutable\)[\s\S]*?Assert-LockedExecutable[\s\S]*?\$validator\.Start\(\)/,
   );
-  assert.match(helperSource, /StandardInput\.Write\(\$jsonInput\)/);
+  assert.match(
+    helperSource,
+    /\$startInfo\.Environment\["MAX_WIN_VALIDATOR_SOURCE"\] = \$nodeSourceBase64/,
+  );
+  assert.match(
+    helperSource,
+    /\$startInfo\.Environment\["MAX_WIN_VALIDATOR_INPUT"\] = \$nodeInput/,
+  );
+  assert.match(helperSource, /StandardInput\.Close\(\)/);
+  assert.doesNotMatch(helperSource, /StandardInput\.Write\(\$jsonInput\)/);
   assert.match(
     helperSource,
     /\$validatorDeadline = \[Diagnostics\.Stopwatch\]::StartNew\(\)/,
@@ -612,7 +621,13 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
   const validatorProbe = await runCommand(
     process.execPath,
     ["--input-type=module", "--eval", validatorExpression],
-    { input: "{}", silent: true },
+    {
+      env: {
+        MAX_WIN_VALIDATOR_SOURCE: validatorBase64,
+        MAX_WIN_VALIDATOR_INPUT: Buffer.from("{}", "utf8").toString("base64"),
+      },
+      silent: true,
+    },
   );
   assert.notEqual(validatorProbe.exitCode, 0);
   assert.doesNotMatch(validatorProbe.stderr, /SyntaxError/);

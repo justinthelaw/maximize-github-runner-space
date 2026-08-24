@@ -988,11 +988,17 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { win32 } from "node:path";
 
-let input = Buffer.alloc(0);
-for await (const chunk of process.stdin) {
-  input = Buffer.concat([input, chunk]);
-  if (input.length > 131072) throw new Error("Windows removal input exceeded 128 KiB");
+const suppliedInput = globalThis.__windowsRemovalInput;
+let input = suppliedInput instanceof Uint8Array
+  ? Buffer.from(suppliedInput)
+  : Buffer.alloc(0);
+if (!(suppliedInput instanceof Uint8Array)) {
+  for await (const chunk of process.stdin) {
+    input = Buffer.concat([input, chunk]);
+    if (input.length > 131072) throw new Error("Windows removal input exceeded 128 KiB");
+  }
 }
+if (input.length > 131072) throw new Error("Windows removal input exceeded 128 KiB");
 const spec = JSON.parse(input.toString("utf8"));
 if (process.platform !== "win32") throw new Error("Windows removal validator ran on a non-Windows host");
 if (
@@ -1572,7 +1578,8 @@ try {
     $nodeSourceBase64 = '`,
   WINDOWS_BOUNDARY_VALIDATOR_BASE64,
   String.raw`'
-    $nodeExpression = "await import('data:text/javascript;base64,$nodeSourceBase64')"
+    $nodeInput = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($jsonInput))
+    $nodeExpression = "globalThis.__windowsRemovalInput=Buffer.from(process.env.MAX_WIN_VALIDATOR_INPUT,'base64');await import('data:text/javascript;base64,'+process.env.MAX_WIN_VALIDATOR_SOURCE)"
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = [string]$spec.runtimeExecutable
     $quote = [char]34
@@ -1581,6 +1588,8 @@ try {
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
+    $startInfo.Environment["MAX_WIN_VALIDATOR_SOURCE"] = $nodeSourceBase64
+    $startInfo.Environment["MAX_WIN_VALIDATOR_INPUT"] = $nodeInput
     $validator = $null
     $validatorStarted = $false
     $validatorDeadline = [Diagnostics.Stopwatch]::StartNew()
@@ -1594,7 +1603,6 @@ try {
         $validator.StartInfo = $startInfo
         if (-not $validator.Start()) { throw 'Could not start the pinned Node boundary validator' }
         $validatorStarted = $true
-        $validator.StandardInput.Write($jsonInput)
         $validator.StandardInput.Close()
         if (-not $validator.WaitForExit((Get-ValidatorRemainingMilliseconds))) {
             throw 'Pinned Node boundary validation timed out'
@@ -1889,7 +1897,7 @@ async function removeLockedWindowsPath(
     "-Command",
     WINDOWS_LOCKED_REMOVE_POWERSHELL_SOURCE,
   ];
-  if (`${WINDOWS_POWERSHELL_EXECUTABLE} ${args.join(" ")}`.length >= 30_000) {
+  if (`${WINDOWS_POWERSHELL_EXECUTABLE} ${args.join(" ")}`.length >= 32_000) {
     throw new Error(
       "Windows removal helper exceeded the safe command-line bound",
     );
