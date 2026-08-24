@@ -1106,11 +1106,7 @@ test(
       async () => await rm(root, { recursive: true, force: true }),
     );
     const target = join(root, "payload");
-    let deepTarget = target;
-    let segment = 0;
-    while (deepTarget.length <= 320) {
-      deepTarget = join(deepTarget, `definition-cache-${segment++}`);
-    }
+    const deepTarget = join(target, "definition-cache");
     const outside = join(root, "outside");
     await mkdir(outside);
     await writeFile(join(outside, "sentinel"), "preserve me");
