@@ -272,6 +272,7 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.match(workflow, /docker volume inspect "\$DOCKER_PRUNE_NAMED_VOLUME"/);
   assert.match(workflow, /maximize-github-runner-space-docker-config-\*/);
   assert.match(workflow, /--test-reporter=tap/);
+  assert.match(workflow, /--test-timeout=180000/);
   assert.match(workflow, /Exercise same-device bind-mount deletion guard/);
   assert.match(workflow, /RUN_NATIVE_BIND_MOUNT_TEST=1/);
   assert.match(

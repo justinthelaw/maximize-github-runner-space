@@ -452,7 +452,7 @@ jobs:
             throw "Expected Node architecture $env:EXPECTED_ARCHITECTURE, got $architecture."
           }
           $testName = 'Windows hosted smoke removes a target through native locked handles'
-          $testLines = & node --test --test-reporter=tap --test-name-pattern "^$([regex]::Escape($testName))$" build/test/safety.test.js 2>&1
+          $testLines = & node --test --test-timeout=180000 --test-reporter=tap --test-name-pattern "^$([regex]::Escape($testName))$" build/test/safety.test.js 2>&1
           $testExitCode = $LASTEXITCODE
           $testOutput = $testLines -join [Environment]::NewLine
           Write-Output $testOutput
