@@ -70,6 +70,15 @@ export interface Operation {
   readonly fatal?: boolean;
   /** Read-only complete-plan validation, run before any operation mutates state. */
   readonly validate?: () => Promise<void>;
+  /**
+   * Read-only validation that must run after reversible preflight transitions
+   * (such as service stops) but before package or payload mutation.
+   */
+  readonly validateAfterPreflight?: () => Promise<void>;
+  /** Run this post-preflight validator after ordinary post-preflight checks. */
+  readonly validateAfterPreflightLast?: boolean;
+  /** Read-only guard run immediately before this operation can mutate state. */
+  readonly validateBeforeRun?: () => Promise<void>;
   /** Restore reversible preflight state when a later operation fails. */
   readonly rollback?: () => Promise<void>;
   /**

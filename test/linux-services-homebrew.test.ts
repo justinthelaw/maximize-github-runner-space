@@ -336,6 +336,31 @@ test("Linux apt cleanup requires its complete executable inventory before mutati
   assert.equal(mutations, 0);
 });
 
+test("Linux apt cleanup rejects excess selected packages before elevation", async () => {
+  let mutations = 0;
+  const inventory = Array.from(
+    { length: 513 },
+    (_, index) => `openjdk-fixture-${index.toString().padStart(4, "0")}`,
+  ).join("\n");
+  const operation = createLinuxAptBatchOperation(
+    contextFor("linux"),
+    planFor("java"),
+    () => undefined,
+    {
+      inspectExecutable: async () => LINUX_TEST_IDENTITY,
+      runCommand: async () => commandResult(`${inventory}\n`),
+      runElevated: async () => {
+        mutations += 1;
+        return commandResult("");
+      },
+    },
+  );
+  assert.ok(operation.validate);
+
+  await assert.rejects(operation.validate, /exceeded 512 packages/i);
+  assert.equal(mutations, 0);
+});
+
 test("Linux rejects an active masked service before any stop", async () => {
   let stops = 0;
   const systemctl: LinuxSystemctl = {
@@ -659,6 +684,49 @@ test("Linux Docker prune reports an executable removed after validation", async 
   assert.match(result.detail ?? "", /changed after plan validation/);
 });
 
+test("Linux Docker removes isolated config after pre-mutation executable drift", async () => {
+  const dockerIdentity: CommandFileIdentity = {
+    device: 1n,
+    inode: 2n,
+    size: 3n,
+    modifiedNanoseconds: 4n,
+  };
+  let dockerChecks = 0;
+  let dockerCommands = 0;
+  const protectedMutations: string[] = [];
+  const operation = createLinuxDockerPruneOperation(contextFor("linux"), {
+    inspectExecutable: async (path) => {
+      if (path === LINUX_PACKAGE_EXECUTABLES.docker) {
+        dockerChecks += 1;
+        return dockerChecks < 3
+          ? dockerIdentity
+          : { ...dockerIdentity, inode: 99n };
+      }
+      return LINUX_PROTECTED_CONFIG_UTILITY_PATHS.has(path)
+        ? LINUX_PROTECTED_CONFIG_UTILITY_IDENTITY
+        : undefined;
+    },
+    createConfigCandidate: async () => LINUX_DOCKER_CONFIG_DIRECTORY,
+    validateConfigDirectory: async () => dockerIdentity,
+    runCommand: async () => {
+      dockerCommands += 1;
+      return commandResult("");
+    },
+    runElevated: async (_context, executable) => {
+      protectedMutations.push(executable);
+      return commandResult("");
+    },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /changed before daemon inspection/);
+  assert.deepEqual(protectedMutations, ["/usr/bin/mkdir", "/usr/bin/rmdir"]);
+  assert.equal(dockerCommands, 0);
+});
+
 test("Linux Docker prune rejects isolated configuration drift", async () => {
   const executableIdentity: CommandFileIdentity = {
     device: 1n,
@@ -933,6 +1001,134 @@ test("Linux apt cleanup stops if a package executable changes before mutation", 
   assert.equal(elevated, false);
 });
 
+test("Linux systemd inventory has one aggregate deadline", async () => {
+  let now = 0;
+  let stops = 0;
+  let masks = 0;
+  const timeouts: number[] = [];
+  const systemctl: LinuxSystemctl = {
+    now: () => now,
+    show: async (_unit, property, timeoutMs) => {
+      assert.notEqual(timeoutMs, undefined);
+      timeouts.push(timeoutMs!);
+      now += 40_001;
+      return commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "ActiveState"
+            ? "active\n"
+            : "enabled\n",
+      );
+    },
+    stop: async () => {
+      stops += 1;
+      return commandResult("");
+    },
+    start: async () => commandResult(""),
+    mask: async () => {
+      masks += 1;
+      return commandResult("");
+    },
+    unmask: async () => commandResult(""),
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+
+  await assert.rejects(
+    operation.validate,
+    /systemd unit inventory exceeded its two-minute aggregate deadline/i,
+  );
+  assert.equal(stops, 0);
+  assert.equal(masks, 0);
+  assert.deepEqual(timeouts, [120_000, 79_999, 39_998]);
+});
+
+test("Linux systemd rejects a non-monotonic budget clock before commands", async () => {
+  const clock = [10, 9];
+  let commands = 0;
+  const systemctl: LinuxSystemctl = {
+    now: () => clock.shift() ?? 9,
+    show: async () => {
+      commands += 1;
+      return commandResult("loaded\n");
+    },
+    stop: async () => {
+      commands += 1;
+      return commandResult("");
+    },
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+
+  await assert.rejects(operation.validate, /invalid monotonic clock value/i);
+  assert.equal(commands, 0);
+});
+
+test("Linux systemd transition checks its aggregate deadline after each command", async () => {
+  let now = 0;
+  let active = true;
+  let masks = 0;
+  let starts = 0;
+  const stopTimeouts: number[] = [];
+  const systemctl: LinuxSystemctl = {
+    now: () => now,
+    show: async (_unit, property) =>
+      commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "UnitFileState"
+            ? "enabled\n"
+            : active
+              ? "active\n"
+              : "inactive\n",
+      ),
+    stop: async (_unit, timeoutMs) => {
+      assert.notEqual(timeoutMs, undefined);
+      stopTimeouts.push(timeoutMs!);
+      active = false;
+      now += 120_001;
+      return commandResult("");
+    },
+    start: async () => {
+      starts += 1;
+      active = true;
+      return commandResult("");
+    },
+    mask: async () => {
+      masks += 1;
+      return commandResult("");
+    },
+    unmask: async () => commandResult(""),
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+
+  const result = await operation.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(
+    result.detail ?? "",
+    /systemd service coordination exceeded its two-minute aggregate deadline/i,
+  );
+  assert.deepEqual(stopTimeouts, [120_000]);
+  assert.equal(masks, 0);
+  assert.equal(starts, 1, "rollback receives a fresh aggregate budget");
+  assert.equal(active, true);
+});
+
 test("Linux service validation discovers every selected unit before any stop", async () => {
   const calls: string[] = [];
   const stopped = new Set<string>();
@@ -1120,6 +1316,271 @@ test("Linux service cleanup fails if an earlier unit reactivates", async () => {
     calls.filter((call) => call.startsWith("stop:")),
     ["stop:docker.socket", "stop:docker.service", "stop:containerd.service"],
   );
+});
+
+test("Linux runtime-masks selected units before payload cleanup", async () => {
+  let active = true;
+  let masked = false;
+  const calls: string[] = [];
+  const systemctl: LinuxSystemctl = {
+    show: async (_unit, property) =>
+      commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "UnitFileState"
+            ? masked
+              ? "masked-runtime\n"
+              : "enabled\n"
+            : active
+              ? "active\n"
+              : "inactive\n",
+      ),
+    stop: async (unit) => {
+      calls.push(`stop:${unit}`);
+      active = false;
+      return commandResult("");
+    },
+    start: async (unit) => {
+      calls.push(`start:${unit}`);
+      if (masked) return commandResult("", 1, "unit is masked");
+      active = true;
+      return commandResult("");
+    },
+    mask: async (unit) => {
+      calls.push(`mask:${unit}`);
+      masked = true;
+      return commandResult("");
+    },
+    unmask: async (unit) => {
+      calls.push(`unmask:${unit}`);
+      masked = false;
+      return commandResult("");
+    },
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+
+  const result = await operation.run();
+  assert.equal(result.status, "removed");
+  assert.equal(active, false);
+  assert.equal(masked, true);
+  assert.deepEqual(calls, ["stop:nginx.service", "mask:nginx.service"]);
+  assert.equal((await systemctl.start?.("nginx.service"))?.exitCode, 1);
+});
+
+test("Linux service validation inventories every unit-file state before stopping anything", async () => {
+  let stops = 0;
+  let masks = 0;
+  const systemctl: LinuxSystemctl = {
+    show: async (unit, property) => {
+      if (property === "LoadState") return commandResult("loaded\n");
+      if (property === "ActiveState") return commandResult("active\n");
+      if (unit === "docker.service") {
+        return commandResult("", 1, "unit-file state unavailable");
+      }
+      return commandResult("enabled\n");
+    },
+    stop: async () => {
+      stops += 1;
+      return commandResult("");
+    },
+    start: async () => commandResult(""),
+    mask: async () => {
+      masks += 1;
+      return commandResult("");
+    },
+    unmask: async () => commandResult(""),
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("docker-engine"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+
+  await assert.rejects(operation.validate, /unit-file state unavailable/);
+  assert.equal(stops, 0);
+  assert.equal(masks, 0);
+});
+
+test("Linux service rollback re-stops an originally inactive unit activated by unmask", async () => {
+  let active = false;
+  let masked = false;
+  let stops = 0;
+  const systemctl: LinuxSystemctl = {
+    show: async (_unit, property) =>
+      commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "UnitFileState"
+            ? masked
+              ? "masked-runtime\n"
+              : "enabled\n"
+            : active
+              ? "active\n"
+              : "inactive\n",
+      ),
+    stop: async () => {
+      stops += 1;
+      active = false;
+      return commandResult("");
+    },
+    start: async () => {
+      active = true;
+      return commandResult("");
+    },
+    mask: async () => {
+      masked = true;
+      return commandResult("");
+    },
+    unmask: async () => {
+      masked = false;
+      active = true;
+      return commandResult("");
+    },
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+
+  await operation.rollback();
+
+  assert.equal(active, false);
+  assert.equal(masked, false);
+  assert.equal(stops, 2);
+});
+
+test("Linux service rollback removes a runtime mask applied by a failed command", async () => {
+  let active = true;
+  let masked = false;
+  const calls: string[] = [];
+  const systemctl: LinuxSystemctl = {
+    show: async (_unit, property) =>
+      commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "UnitFileState"
+            ? masked
+              ? "masked-runtime\n"
+              : "enabled\n"
+            : active
+              ? "active\n"
+              : "inactive\n",
+      ),
+    stop: async (unit) => {
+      calls.push(`stop:${unit}`);
+      active = false;
+      return commandResult("");
+    },
+    start: async (unit) => {
+      calls.push(`start:${unit}`);
+      if (masked) return commandResult("", 1, "unit remains masked");
+      active = true;
+      return commandResult("");
+    },
+    mask: async (unit) => {
+      calls.push(`mask:${unit}`);
+      masked = true;
+      return commandResult("", 1, "mask failed after changing state");
+    },
+    unmask: async (unit) => {
+      calls.push(`unmask:${unit}`);
+      masked = false;
+      return commandResult("");
+    },
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+
+  const result = await operation.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /mask failed after changing state/);
+  assert.equal(masked, false);
+  assert.equal(active, true);
+  assert.deepEqual(calls, [
+    "stop:nginx.service",
+    "mask:nginx.service",
+    "unmask:nginx.service",
+    "start:nginx.service",
+  ]);
+});
+
+test("Linux service rollback retains failed runtime-mask recovery for retry", async () => {
+  let active = true;
+  let masked = false;
+  let failUnmask = true;
+  let rollbackCalls = 0;
+  const systemctl: LinuxSystemctl = {
+    show: async (_unit, property) =>
+      commandResult(
+        property === "LoadState"
+          ? "loaded\n"
+          : property === "UnitFileState"
+            ? masked
+              ? "masked-runtime\n"
+              : "enabled\n"
+            : active
+              ? "active\n"
+              : "inactive\n",
+      ),
+    stop: async () => {
+      active = false;
+      return commandResult("");
+    },
+    start: async () => {
+      rollbackCalls += 1;
+      if (masked) return commandResult("", 1, "unit remains masked");
+      active = true;
+      return commandResult("");
+    },
+    mask: async () => {
+      masked = true;
+      return commandResult("");
+    },
+    unmask: async () => {
+      rollbackCalls += 1;
+      if (failUnmask) return commandResult("", 1, "unmask failed");
+      masked = false;
+      return commandResult("");
+    },
+  };
+  const operation = createLinuxServiceStopOperation(
+    contextFor("linux"),
+    planFor("nginx"),
+    systemctl,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+
+  await assert.rejects(operation.rollback, /unmask failed|remains masked/);
+  assert.equal(active, false);
+  assert.equal(masked, true);
+  failUnmask = false;
+  await operation.rollback();
+  assert.equal(active, true);
+  assert.equal(masked, false);
+  const callsAfterRecovery = rollbackCalls;
+  await operation.rollback();
+  assert.equal(rollbackCalls, callsAfterRecovery);
 });
 
 test("Linux service cleanup restores earlier active units after a later stop fails", async () => {

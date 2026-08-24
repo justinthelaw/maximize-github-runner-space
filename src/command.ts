@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { access, lstat, open, stat } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { access, lstat, open, realpath, stat } from "node:fs/promises";
+import { delimiter, dirname, isAbsolute, join, parse } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { CommandResult, RuntimeContext } from "./types.js";
 
@@ -30,6 +30,17 @@ export const TRUSTED_WINDOWS_CWD = "C:\\Windows\\System32";
 
 export class UnconfirmedCommandTerminationError extends Error {
   override readonly name = "UnconfirmedCommandTerminationError";
+}
+
+export class UntrustedUnixExecutableError extends Error {
+  override readonly name = "UntrustedUnixExecutableError";
+
+  constructor(
+    readonly executable: string,
+    detail: string,
+  ) {
+    super(`Untrusted elevated executable '${executable}': ${detail}`);
+  }
 }
 
 let unconfirmedTerminationDetail: string | undefined;
@@ -185,6 +196,63 @@ export function sameCommandFileIdentity(
     left.groupId === right.groupId &&
     left.contentSha256 === right.contentSha256
   );
+}
+
+export async function assertTrustedUnixExecutable(
+  executable: string,
+): Promise<string> {
+  try {
+    if (process.platform === "win32") {
+      throw new Error("Unix executable trust validation ran on Windows");
+    }
+    const resolved = await realpath(executable);
+    if (!isAbsolute(resolved)) {
+      throw new Error("resolved path is not absolute");
+    }
+    const before = await inspectExecutable(resolved);
+    if (
+      before === undefined ||
+      before.userId !== 0n ||
+      before.mode === undefined ||
+      (before.mode & 0o170000n) !== 0o100000n ||
+      (before.mode & 0o022n) !== 0n
+    ) {
+      throw new Error(
+        `resolved path must be a root-owned, non-writable regular file: ${resolved}`,
+      );
+    }
+
+    let parent = dirname(resolved);
+    while (true) {
+      const metadata = await lstat(parent, { bigint: true });
+      if (
+        metadata.isSymbolicLink() ||
+        !metadata.isDirectory() ||
+        metadata.uid !== 0n ||
+        (metadata.mode & 0o022n) !== 0n
+      ) {
+        throw new Error(
+          `resolved path has an untrusted or writable parent directory: ${parent}`,
+        );
+      }
+      if (parent === parse(parent).root) break;
+      parent = dirname(parent);
+    }
+
+    const immediate = await inspectExecutable(resolved);
+    if (!sameCommandFileIdentity(before, immediate)) {
+      throw new Error(
+        `resolved path changed immediately before launch: ${resolved}`,
+      );
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof UntrustedUnixExecutableError) throw error;
+    throw new UntrustedUnixExecutableError(
+      executable,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 export async function runCommand(
@@ -597,7 +665,7 @@ export async function runElevated(
     (context.platform === "windows"
       ? process.env
       : trustedUnixCommandEnvironment(context));
-  const invocation = createElevatedInvocation(
+  let invocation = createElevatedInvocation(
     context,
     executable,
     args,
@@ -610,6 +678,30 @@ export async function runElevated(
       stdout: "",
       stderr: "passwordless sudo is unavailable",
     };
+  }
+  if (context.platform !== "windows") {
+    if (invocation.executable === UNIX_SUDO_EXECUTABLE) {
+      const trustedSudo =
+        await assertTrustedUnixExecutable(UNIX_SUDO_EXECUTABLE);
+      const trustedEnv = await assertTrustedUnixExecutable(UNIX_ENV_EXECUTABLE);
+      const trustedPayload = await assertTrustedUnixExecutable(executable);
+      const payloadIndex = invocation.args.length - args.length - 1;
+      if (
+        invocation.args[2] !== UNIX_ENV_EXECUTABLE ||
+        invocation.args[payloadIndex] !== executable
+      ) {
+        throw new Error("Elevated Unix invocation shape is invalid");
+      }
+      const trustedArgs = [...invocation.args];
+      trustedArgs[2] = trustedEnv;
+      trustedArgs[payloadIndex] = trustedPayload;
+      invocation = { executable: trustedSudo, args: trustedArgs };
+    } else {
+      invocation = {
+        executable: await assertTrustedUnixExecutable(executable),
+        args: invocation.args,
+      };
+    }
   }
   return await runCommand(invocation.executable, invocation.args, {
     ...options,

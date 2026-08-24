@@ -5,7 +5,8 @@ import {
   lstat,
   mkdir,
   open,
-  readdir,
+  opendir,
+  readFile,
   realpath,
   statfs,
 } from "node:fs/promises";
@@ -29,6 +30,7 @@ import {
   createRemovePathOperation,
 } from "../operations.js";
 import { assertSafeDirectoryTarget, assertSafeExactTarget } from "../safety.js";
+import { listBoundedVersionedDirectoryEntries } from "../versioned-directories.js";
 import type {
   Adapter,
   CleanupPlan,
@@ -78,6 +80,7 @@ const APT_ISOLATION_ARGUMENTS = Object.freeze([
   "-o",
   `Dir::Bin::dpkg=${LINUX_PACKAGE_EXECUTABLES.dpkg}`,
 ] as const);
+const MAX_SELECTED_APT_PACKAGES = 512;
 
 export interface LinuxCommandDependencies {
   readonly inspectExecutable?: (
@@ -145,7 +148,15 @@ function checkedLinuxDockerConfigDirectory(path: string): string {
 
 const NODE_LINUX_DOCKER_CONFIG_PROBE: LinuxDockerConfigProbe = {
   lstat: async (path) => await lstat(path, { bigint: true }),
-  readdir: async (path) => await readdir(path),
+  readdir: async (path) => {
+    const directory = await opendir(path);
+    try {
+      const entry = await directory.read();
+      return entry === null ? [] : [entry];
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+  },
 };
 
 export async function validateLinuxDockerConfigMetadata(
@@ -211,15 +222,20 @@ interface SystemdUnitTarget {
 interface SystemdUnitSnapshot extends SystemdUnitTarget {
   readonly loadState: string;
   readonly activeState: string;
+  readonly unitFileState?: string;
 }
 
 export interface LinuxSystemctl {
+  readonly now?: () => number;
   show(
     unit: string,
-    property: "LoadState" | "ActiveState",
+    property: "LoadState" | "ActiveState" | "UnitFileState",
+    timeoutMs?: number,
   ): Promise<CommandResult>;
-  stop(unit: string): Promise<CommandResult>;
-  start?(unit: string): Promise<CommandResult>;
+  stop(unit: string, timeoutMs?: number): Promise<CommandResult>;
+  start?(unit: string, timeoutMs?: number): Promise<CommandResult>;
+  mask?(unit: string, timeoutMs?: number): Promise<CommandResult>;
+  unmask?(unit: string, timeoutMs?: number): Promise<CommandResult>;
 }
 
 export function linuxSystemCommandEnvironment(
@@ -250,24 +266,95 @@ export function linuxPackageCommandEnvironment(
 function systemctlFor(context: RuntimeContext): LinuxSystemctl {
   const environment = linuxSystemCommandEnvironment(context);
   return {
-    show: async (unit, property) =>
+    now: () => performance.now(),
+    show: async (unit, property, timeoutMs = 30_000) =>
       await runCommand(
         SYSTEMCTL,
         ["show", unit, `--property=${property}`, "--value"],
-        { env: environment, silent: true, timeoutMs: 30_000 },
+        {
+          env: environment,
+          silent: true,
+          timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
+        },
       ),
-    stop: async (unit) =>
+    stop: async (unit, timeoutMs = 60_000) =>
       await runElevated(context, SYSTEMCTL, ["stop", unit], {
         env: environment,
         silent: true,
-        timeoutMs: 60_000,
+        timeoutMs: Math.max(1, Math.min(60_000, Math.ceil(timeoutMs))),
       }),
-    start: async (unit) =>
+    start: async (unit, timeoutMs = 60_000) =>
       await runElevated(context, SYSTEMCTL, ["start", unit], {
         env: environment,
         silent: true,
-        timeoutMs: 60_000,
+        timeoutMs: Math.max(1, Math.min(60_000, Math.ceil(timeoutMs))),
       }),
+    mask: async (unit, timeoutMs = 60_000) =>
+      await runElevated(context, SYSTEMCTL, ["mask", "--runtime", unit], {
+        env: environment,
+        silent: true,
+        timeoutMs: Math.max(1, Math.min(60_000, Math.ceil(timeoutMs))),
+      }),
+    unmask: async (unit, timeoutMs = 60_000) =>
+      await runElevated(context, SYSTEMCTL, ["unmask", "--runtime", unit], {
+        env: environment,
+        silent: true,
+        timeoutMs: Math.max(1, Math.min(60_000, Math.ceil(timeoutMs))),
+      }),
+  };
+}
+
+const LINUX_SYSTEMD_COORDINATION_TIMEOUT_MS = 2 * 60_000;
+
+interface LinuxSystemdBudget {
+  run<T>(task: (remainingMilliseconds: number) => Promise<T>): Promise<T>;
+}
+
+function createLinuxSystemdBudget(
+  systemctl: LinuxSystemctl,
+  description: string,
+): LinuxSystemdBudget {
+  const now = systemctl.now ?? (() => performance.now());
+  const startedAt = now();
+  if (!Number.isFinite(startedAt)) {
+    throw new Error(`${description} received an invalid monotonic clock value`);
+  }
+  const deadline = startedAt + LINUX_SYSTEMD_COORDINATION_TIMEOUT_MS;
+  if (!Number.isFinite(deadline)) {
+    throw new Error(`${description} received an invalid monotonic clock value`);
+  }
+  let lastObserved = startedAt;
+  const remaining = (): number => {
+    const observed = now();
+    if (!Number.isFinite(observed) || observed < lastObserved) {
+      throw new Error(
+        `${description} received an invalid monotonic clock value`,
+      );
+    }
+    lastObserved = observed;
+    const milliseconds = Math.ceil(deadline - observed);
+    if (milliseconds <= 0) {
+      throw new Error(
+        `${description} exceeded its two-minute aggregate deadline`,
+      );
+    }
+    return milliseconds;
+  };
+  return {
+    run: async <T>(
+      task: (remainingMilliseconds: number) => Promise<T>,
+    ): Promise<T> => {
+      const timeoutMs = remaining();
+      let result: T;
+      try {
+        result = await task(timeoutMs);
+      } catch (error) {
+        remaining();
+        throw error;
+      }
+      remaining();
+      return result;
+    },
   };
 }
 
@@ -288,10 +375,23 @@ function systemdFailure(result: CommandResult, detail: string): Error {
 async function inspectSystemdUnits(
   targets: readonly SystemdUnitTarget[],
   systemctl: LinuxSystemctl,
+  budget: LinuxSystemdBudget = createLinuxSystemdBudget(
+    systemctl,
+    "systemd unit inventory",
+  ),
 ): Promise<readonly SystemdUnitSnapshot[]> {
+  if ((systemctl.mask === undefined) !== (systemctl.unmask === undefined)) {
+    throw new Error(
+      "systemd runtime masking requires both mask and unmask operations",
+    );
+  }
+  const inspectUnitFileState = systemctl.mask !== undefined;
   const present: SystemdUnitSnapshot[] = [];
   for (const target of targets) {
-    const result = await systemctl.show(target.unit, "LoadState");
+    const result = await budget.run(
+      async (timeoutMs) =>
+        await systemctl.show(target.unit, "LoadState", timeoutMs),
+    );
     if (result.exitCode !== 0) {
       throw systemdFailure(
         result,
@@ -307,7 +407,10 @@ async function inspectSystemdUnits(
           : `systemd returned unsafe LoadState '${loadState}' for ${target.unit}`,
       );
     }
-    const active = await systemctl.show(target.unit, "ActiveState");
+    const active = await budget.run(
+      async (timeoutMs) =>
+        await systemctl.show(target.unit, "ActiveState", timeoutMs),
+    );
     if (active.exitCode !== 0) {
       throw systemdFailure(
         active,
@@ -339,7 +442,49 @@ async function inspectSystemdUnits(
         `masked systemd unit ${target.unit} is ${activeState} and cannot be safely restarted`,
       );
     }
-    present.push({ ...target, loadState, activeState });
+    let unitFileState: string | undefined;
+    if (inspectUnitFileState) {
+      const unitFile = await budget.run(
+        async (timeoutMs) =>
+          await systemctl.show(target.unit, "UnitFileState", timeoutMs),
+      );
+      if (unitFile.exitCode !== 0) {
+        throw systemdFailure(
+          unitFile,
+          `could not inspect unit-file state for systemd unit ${target.unit}`,
+        );
+      }
+      unitFileState = unitFile.stdout.trim();
+      const ordinaryStates = new Set([
+        "alias",
+        "disabled",
+        "enabled",
+        "enabled-runtime",
+        "generated",
+        "indirect",
+        "linked",
+        "linked-runtime",
+        "static",
+        "transient",
+      ]);
+      const accepted =
+        loadState === "masked"
+          ? ["masked", "masked-runtime"].includes(unitFileState)
+          : ordinaryStates.has(unitFileState);
+      if (!accepted) {
+        throw new Error(
+          unitFileState === ""
+            ? `systemd returned no UnitFileState for ${target.unit}`
+            : `systemd returned unsafe UnitFileState '${unitFileState}' for ${target.unit}`,
+        );
+      }
+    }
+    present.push({
+      ...target,
+      loadState,
+      activeState,
+      ...(unitFileState === undefined ? {} : { unitFileState }),
+    });
   }
   return present;
 }
@@ -355,7 +500,8 @@ function sameSystemdSnapshot(
         unit.unit === right[index]?.unit &&
         unit.component === right[index]?.component &&
         unit.loadState === right[index]?.loadState &&
-        unit.activeState === right[index]?.activeState,
+        unit.activeState === right[index]?.activeState &&
+        unit.unitFileState === right[index]?.unitFileState,
     )
   );
 }
@@ -480,32 +626,14 @@ export async function listLinuxVersionedChildren(
   parent: string,
   pattern: RegExp,
 ): Promise<readonly string[]> {
-  try {
-    const selected = (await readdir(parent, { withFileTypes: true }))
-      .filter(
-        (entry) =>
-          (entry.isDirectory() || entry.isSymbolicLink()) &&
-          pattern.test(entry.name),
-      )
-      .map((entry) => join(parent, entry.name))
-      .sort((left, right) => left.localeCompare(right));
-    if (selected.length > 64) {
-      throw new Error(
-        `versioned directory inventory under '${parent}' exceeded 64 entries`,
-      );
-    }
-    return selected;
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      ["ENOENT", "ENOTDIR"].includes(
-        (error as NodeJS.ErrnoException).code ?? "",
-      )
-    ) {
-      return [];
-    }
-    throw error;
-  }
+  const description = `versioned directory inventory under '${parent}'`;
+  const entries = await listBoundedVersionedDirectoryEntries(
+    posix.normalize(parent),
+    pattern,
+    "posix",
+    description,
+  );
+  return entries.map(({ name }) => join(parent, name));
 }
 
 interface LinuxAptExecutableState {
@@ -673,8 +801,8 @@ export function createLinuxAptBatchOperation(
   ];
   let validated: LinuxAptExecutableState | undefined;
   let validatedInventory: string | undefined;
-  const selectInstalled = (output: string): string[] =>
-    output
+  const selectInstalled = (output: string): string[] => {
+    const selected = output
       .split(/\r?\n/)
       .filter(Boolean)
       .filter((name) =>
@@ -691,6 +819,13 @@ export function createLinuxAptBatchOperation(
           }
         }),
       );
+    if (selected.length > MAX_SELECTED_APT_PACKAGES) {
+      throw new Error(
+        `selected apt package inventory exceeded ${MAX_SELECTED_APT_PACKAGES} packages`,
+      );
+    }
+    return selected;
+  };
   return createFunctionOperation({
     id: "apt:selected-packages",
     component: "large-packages",
@@ -726,6 +861,7 @@ export function createLinuxAptBatchOperation(
                 : "dpkg database unavailable"),
           );
         }
+        selectInstalled(query.stdout);
         validatedInventory = query.stdout;
       }
     },
@@ -782,7 +918,15 @@ export function createLinuxAptBatchOperation(
           detail: "dpkg package inventory changed after plan validation",
         };
       }
-      const selected = selectInstalled(query.stdout);
+      let selected: string[];
+      try {
+        selected = selectInstalled(query.stdout);
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
       if (selected.length === 0) return { status: "not-found" };
       const beforeMutation = await inspectLinuxAptExecutables(dependencies);
       if (!sameLinuxAptExecutableState(current, beforeMutation)) {
@@ -833,7 +977,15 @@ export function createLinuxAptBatchOperation(
               : "dpkg database unavailable after package purge"),
         };
       }
-      const remaining = selectInstalled(afterQuery.stdout);
+      let remaining: string[];
+      try {
+        remaining = selectInstalled(afterQuery.stdout);
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
       if (remaining.length !== 0) {
         const preview = remaining.slice(0, 8).join(", ");
         return {
@@ -895,6 +1047,9 @@ export function createLinuxDockerPruneOperation(
     description: "Prune unused Docker data",
     phase: "system",
     dedupeKey: "docker:prune",
+    // Engine removal owns the same data roots and stops the daemon first.
+    // Avoid a redundant daemon call that cannot succeed after that latch.
+    coveredBy: ["docker-engine"],
     validate: async () => {
       validated = await commands.inspectExecutable(
         LINUX_PACKAGE_EXECUTABLES.docker,
@@ -959,119 +1114,125 @@ export function createLinuxDockerPruneOperation(
       let outcome: OperationResult | undefined;
       let executionError: unknown;
       try {
-        const beforeProbe = await commands.inspectExecutable(
-          LINUX_PACKAGE_EXECUTABLES.docker,
-        );
-        if (!sameCommandFileIdentity(current, beforeProbe)) {
-          return {
-            status: "failed",
-            detail: "Docker executable changed before daemon inspection",
-          };
-        }
-        let configBeforeProbe: CommandFileIdentity;
-        try {
-          configBeforeProbe = await validateConfigDirectory(configDirectory);
-        } catch (error) {
-          return {
-            status: "failed",
-            detail: `unsafe isolated Docker configuration before inspection: ${error instanceof Error ? error.message : String(error)}`,
-          };
-        }
-        if (!sameCommandFileIdentity(configIdentity, configBeforeProbe)) {
-          return {
-            status: "failed",
-            detail: "isolated Docker configuration changed before inspection",
-          };
-        }
-        const responsive = await commands.runCommand(
-          LINUX_PACKAGE_EXECUTABLES.docker,
-          [
-            "--host",
-            "unix:///var/run/docker.sock",
-            "--config",
-            configDirectory,
-            "info",
-          ],
-          { env: environment, silent: true, timeoutMs: 10_000 },
-        );
-        if (responsive.exitCode !== 0) {
-          const output =
-            `${responsive.stdout}\n${responsive.stderr}`.toLowerCase();
-          const daemonUnavailable =
-            responsive.exitCode === 1 &&
-            responsive.stdoutTruncated !== true &&
-            responsive.stderrTruncated !== true &&
-            (output.includes(
-              "cannot connect to the docker daemon at unix:///var/run/docker.sock",
-            ) ||
-              (output.includes("/var/run/docker.sock") &&
-                output.includes("no such file or directory")));
-          outcome = daemonUnavailable
-            ? {
-                status: "unsupported",
-                detail: "local Docker daemon unavailable",
-              }
-            : {
-                status: "failed",
-                detail:
-                  responsive.stderr.trim() ||
-                  `docker info exited ${responsive.exitCode}`,
-              };
-        } else {
-          const beforeMutation = await commands.inspectExecutable(
+        dockerAttempt: {
+          const beforeProbe = await commands.inspectExecutable(
             LINUX_PACKAGE_EXECUTABLES.docker,
           );
-          if (!sameCommandFileIdentity(current, beforeMutation)) {
+          if (!sameCommandFileIdentity(current, beforeProbe)) {
             outcome = {
               status: "failed",
-              detail: "Docker executable changed before image mutation",
+              detail: "Docker executable changed before daemon inspection",
             };
+            break dockerAttempt;
+          }
+          let configBeforeProbe: CommandFileIdentity;
+          try {
+            configBeforeProbe = await validateConfigDirectory(configDirectory);
+          } catch (error) {
+            outcome = {
+              status: "failed",
+              detail: `unsafe isolated Docker configuration before inspection: ${error instanceof Error ? error.message : String(error)}`,
+            };
+            break dockerAttempt;
+          }
+          if (!sameCommandFileIdentity(configIdentity, configBeforeProbe)) {
+            outcome = {
+              status: "failed",
+              detail: "isolated Docker configuration changed before inspection",
+            };
+            break dockerAttempt;
+          }
+          const responsive = await commands.runCommand(
+            LINUX_PACKAGE_EXECUTABLES.docker,
+            [
+              "--host",
+              "unix:///var/run/docker.sock",
+              "--config",
+              configDirectory,
+              "info",
+            ],
+            { env: environment, silent: true, timeoutMs: 10_000 },
+          );
+          if (responsive.exitCode !== 0) {
+            const output =
+              `${responsive.stdout}\n${responsive.stderr}`.toLowerCase();
+            const daemonUnavailable =
+              responsive.exitCode === 1 &&
+              responsive.stdoutTruncated !== true &&
+              responsive.stderrTruncated !== true &&
+              (output.includes(
+                "cannot connect to the docker daemon at unix:///var/run/docker.sock",
+              ) ||
+                (output.includes("/var/run/docker.sock") &&
+                  output.includes("no such file or directory")));
+            outcome = daemonUnavailable
+              ? {
+                  status: "unsupported",
+                  detail: "local Docker daemon unavailable",
+                }
+              : {
+                  status: "failed",
+                  detail:
+                    responsive.stderr.trim() ||
+                    `docker info exited ${responsive.exitCode}`,
+                };
           } else {
-            let configBeforeMutation: CommandFileIdentity;
-            try {
-              configBeforeMutation =
-                await validateConfigDirectory(configDirectory);
-            } catch (error) {
+            const beforeMutation = await commands.inspectExecutable(
+              LINUX_PACKAGE_EXECUTABLES.docker,
+            );
+            if (!sameCommandFileIdentity(current, beforeMutation)) {
               outcome = {
                 status: "failed",
-                detail: `unsafe isolated Docker configuration before mutation: ${error instanceof Error ? error.message : String(error)}`,
+                detail: "Docker executable changed before image mutation",
               };
-              configBeforeMutation = configIdentity;
-            }
-            if (
-              outcome === undefined &&
-              !sameCommandFileIdentity(configIdentity, configBeforeMutation)
-            ) {
-              outcome = {
-                status: "failed",
-                detail: "isolated Docker configuration changed before mutation",
-              };
-            }
-            if (outcome === undefined) {
-              const result = await commands.runElevated(
-                context,
-                LINUX_PACKAGE_EXECUTABLES.docker,
-                [
-                  "--host",
-                  "unix:///var/run/docker.sock",
-                  "--config",
-                  configDirectory,
-                  "system",
-                  "prune",
-                  "--all",
-                  "--volumes",
-                  "--force",
-                ],
-                {
-                  env: environment,
-                  silent: false,
-                  timeoutMs: 10 * 60_000,
-                },
-              );
-              outcome =
-                result.exitCode === 0
-                  ? { status: "removed" }
-                  : { status: "failed", detail: result.stderr.trim() };
+            } else {
+              let configBeforeMutation: CommandFileIdentity;
+              try {
+                configBeforeMutation =
+                  await validateConfigDirectory(configDirectory);
+              } catch (error) {
+                outcome = {
+                  status: "failed",
+                  detail: `unsafe isolated Docker configuration before mutation: ${error instanceof Error ? error.message : String(error)}`,
+                };
+                configBeforeMutation = configIdentity;
+              }
+              if (
+                outcome === undefined &&
+                !sameCommandFileIdentity(configIdentity, configBeforeMutation)
+              ) {
+                outcome = {
+                  status: "failed",
+                  detail:
+                    "isolated Docker configuration changed before mutation",
+                };
+              }
+              if (outcome === undefined) {
+                const result = await commands.runElevated(
+                  context,
+                  LINUX_PACKAGE_EXECUTABLES.docker,
+                  [
+                    "--host",
+                    "unix:///var/run/docker.sock",
+                    "--config",
+                    configDirectory,
+                    "system",
+                    "prune",
+                    "--all",
+                    "--volumes",
+                    "--force",
+                  ],
+                  {
+                    env: environment,
+                    silent: false,
+                    timeoutMs: 10 * 60_000,
+                  },
+                );
+                outcome =
+                  result.exitCode === 0
+                    ? { status: "removed" }
+                    : { status: "failed", detail: result.stderr.trim() };
+              }
             }
           }
         }
@@ -1138,6 +1299,8 @@ export function createLinuxServiceStopOperation(
 
   let validatedSnapshot: readonly SystemdUnitSnapshot[] | undefined;
   let stoppedByAction: SystemdUnitSnapshot[] = [];
+  let maskedByAction: SystemdUnitSnapshot[] = [];
+  const originalUnitFileStates = new Map<string, string>();
   const validate = async (): Promise<void> => {
     if (context.isContainer) {
       validatedSnapshot = [];
@@ -1147,11 +1310,99 @@ export function createLinuxServiceStopOperation(
   };
 
   const restartStoppedUnits = async (): Promise<readonly string[]> => {
+    const budget = createLinuxSystemdBudget(
+      systemctl,
+      "systemd service rollback",
+    );
     const rollback: string[] = [];
     const stopped = [...stoppedByAction].reverse();
-    stoppedByAction = [];
+    const masked = [...maskedByAction].reverse();
+    const restoredTargets = new Set<SystemdUnitSnapshot>();
+    const unmasked = new Set<SystemdUnitSnapshot>();
+    for (const target of masked) {
+      try {
+        if (systemctl.unmask === undefined) {
+          rollback.push(`${target.unit} could not be unmasked`);
+          continue;
+        }
+        const unmask = systemctl.unmask;
+        const result = await budget.run(
+          async (timeoutMs) => await unmask(target.unit, timeoutMs),
+        );
+        if (result.exitCode !== 0) {
+          rollback.push(
+            result.stderr.trim() || `${target.unit} could not be unmasked`,
+          );
+          continue;
+        }
+        const current = await budget.run(
+          async (timeoutMs) =>
+            await systemctl.show(target.unit, "UnitFileState", timeoutMs),
+        );
+        if (
+          current.exitCode !== 0 ||
+          current.stdout.trim() !== originalUnitFileStates.get(target.unit)
+        ) {
+          rollback.push(
+            current.stderr.trim() ||
+              `${target.unit} did not return to its original unit-file state after unmask`,
+          );
+          continue;
+        }
+        unmasked.add(target);
+      } catch (error) {
+        rollback.push(
+          `${target.unit} unmask failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    maskedByAction = masked.filter((target) => !unmasked.has(target)).reverse();
     for (const target of stopped) {
+      if (maskedByAction.includes(target)) continue;
       if (!["active", "activating", "reloading"].includes(target.activeState)) {
+        try {
+          const current = await budget.run(
+            async (timeoutMs) =>
+              await systemctl.show(target.unit, "ActiveState", timeoutMs),
+          );
+          if (isStoppedSystemdUnit(current)) {
+            restoredTargets.add(target);
+            continue;
+          }
+          if (current.exitCode !== 0) {
+            rollback.push(
+              current.stderr.trim() ||
+                `${target.unit} state query failed while restoring its stopped state`,
+            );
+            continue;
+          }
+          const stopped = await budget.run(
+            async (timeoutMs) => await systemctl.stop(target.unit, timeoutMs),
+          );
+          if (stopped.exitCode !== 0) {
+            rollback.push(
+              stopped.stderr.trim() ||
+                `${target.unit} could not be returned to its stopped state`,
+            );
+            continue;
+          }
+          const verified = await budget.run(
+            async (timeoutMs) =>
+              await systemctl.show(target.unit, "ActiveState", timeoutMs),
+          );
+          if (!isStoppedSystemdUnit(verified)) {
+            rollback.push(
+              verified.stderr.trim() ||
+                `${target.unit} did not return to its original stopped state`,
+            );
+            continue;
+          }
+          restoredTargets.add(target);
+        } catch (error) {
+          rollback.push(
+            `${target.unit} stopped-state restoration failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
         continue;
       }
       if (systemctl.start === undefined) {
@@ -1159,8 +1410,12 @@ export function createLinuxServiceStopOperation(
         continue;
       }
       try {
-        const current = await systemctl.show(target.unit, "ActiveState");
+        const current = await budget.run(
+          async (timeoutMs) =>
+            await systemctl.show(target.unit, "ActiveState", timeoutMs),
+        );
         if (current.exitCode === 0 && current.stdout.trim() === "active") {
+          restoredTargets.add(target);
           continue;
         }
         if (current.exitCode !== 0) {
@@ -1176,7 +1431,10 @@ export function createLinuxServiceStopOperation(
       }
       let started: CommandResult;
       try {
-        started = await systemctl.start(target.unit);
+        const start = systemctl.start;
+        started = await budget.run(
+          async (timeoutMs) => await start(target.unit, timeoutMs),
+        );
       } catch (error) {
         rollback.push(
           `${target.unit} restart failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -1188,19 +1446,27 @@ export function createLinuxServiceStopOperation(
         continue;
       }
       try {
-        const restored = await systemctl.show(target.unit, "ActiveState");
+        const restored = await budget.run(
+          async (timeoutMs) =>
+            await systemctl.show(target.unit, "ActiveState", timeoutMs),
+        );
         if (restored.exitCode !== 0 || restored.stdout.trim() !== "active") {
           rollback.push(
             restored.stderr.trim() ||
               `${target.unit} did not reach active state after restart`,
           );
+          continue;
         }
+        restoredTargets.add(target);
       } catch (error) {
         rollback.push(
           `${target.unit} state verification failed after restart: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
     }
+    stoppedByAction = stopped
+      .filter((target) => !restoredTargets.has(target))
+      .reverse();
     return rollback;
   };
 
@@ -1235,17 +1501,40 @@ export function createLinuxServiceStopOperation(
       }
 
       try {
-        stoppedByAction = [];
-        validatedSnapshot ??= await inspectSystemdUnits(targets, systemctl);
+        const budget = createLinuxSystemdBudget(
+          systemctl,
+          "systemd service coordination",
+        );
+        if (stoppedByAction.length !== 0 || maskedByAction.length !== 0) {
+          return await restoreStoppedUnits(
+            "Linux service rollback state remained before execution",
+          );
+        }
+        originalUnitFileStates.clear();
+        validatedSnapshot ??= await inspectSystemdUnits(
+          targets,
+          systemctl,
+          budget,
+        );
         // Complete-plan validation can precede this phase by several seconds.
         // Re-read every selected unit before the first stop, so a later unit
         // cannot fail discovery after an earlier component was mutated.
-        const immediateSnapshot = await inspectSystemdUnits(targets, systemctl);
+        const immediateSnapshot = await inspectSystemdUnits(
+          targets,
+          systemctl,
+          budget,
+        );
         if (!sameSystemdSnapshot(validatedSnapshot, immediateSnapshot)) {
           return {
             status: "failed",
             detail: "systemd unit inventory changed after plan validation",
           };
+        }
+
+        for (const target of immediateSnapshot) {
+          if (target.loadState !== "loaded") continue;
+          if (target.unitFileState === undefined) continue;
+          originalUnitFileStates.set(target.unit, target.unitFileState);
         }
 
         for (const target of immediateSnapshot) {
@@ -1256,26 +1545,94 @@ export function createLinuxServiceStopOperation(
           // Record the original state before invoking systemctl: a timed-out
           // or otherwise failed stop can still have taken an active unit down.
           stoppedByAction.push(target);
-          const result = await systemctl.stop(unit);
+          const result = await budget.run(
+            async (timeoutMs) => await systemctl.stop(unit, timeoutMs),
+          );
           if (result.exitCode !== 0) {
             return await restoreStoppedUnits(
               result.stderr.trim() || `could not stop ${unit}`,
             );
           }
-          const stoppedState = await systemctl.show(unit, "ActiveState");
+          const stoppedState = await budget.run(
+            async (timeoutMs) =>
+              await systemctl.show(unit, "ActiveState", timeoutMs),
+          );
           if (!isStoppedSystemdUnit(stoppedState)) {
             return await restoreStoppedUnits(
               stoppedState.stderr.trim() ||
                 `${unit} did not reach a terminal stopped state`,
             );
           }
+          if (
+            target.loadState === "loaded" &&
+            systemctl.mask !== undefined &&
+            systemctl.unmask !== undefined
+          ) {
+            const originalState = target.unitFileState;
+            if (originalState === undefined) {
+              return await restoreStoppedUnits(
+                `${unit} had no validated unit-file state before runtime masking`,
+              );
+            }
+            // A failed or timed-out mask command can still have changed the
+            // runtime state. Record rollback intent before invoking it.
+            maskedByAction.push(target);
+            const mask = systemctl.mask;
+            const masked = await budget.run(
+              async (timeoutMs) => await mask(unit, timeoutMs),
+            );
+            if (masked.exitCode !== 0) {
+              return await restoreStoppedUnits(
+                masked.stderr.trim() || `could not runtime-mask ${unit}`,
+              );
+            }
+            const unitFileState = await budget.run(
+              async (timeoutMs) =>
+                await systemctl.show(unit, "UnitFileState", timeoutMs),
+            );
+            if (
+              unitFileState.exitCode !== 0 ||
+              unitFileState.stdout.trim() !== "masked-runtime"
+            ) {
+              return await restoreStoppedUnits(
+                unitFileState.stderr.trim() ||
+                  `${unit} did not become runtime-masked`,
+              );
+            }
+          }
         }
 
         // A socket, timer, dependency, or restart policy can reactivate a unit
         // while the remaining services are being stopped. Confirm the entire
         // coordinated set is still terminal before package/data cleanup begins.
-        for (const { unit } of immediateSnapshot) {
-          const stoppedState = await systemctl.show(unit, "ActiveState");
+        for (const target of immediateSnapshot) {
+          const { unit } = target;
+          if (
+            target.loadState === "masked" ||
+            maskedByAction.some((masked) => masked.unit === unit)
+          ) {
+            const unitFileState = await budget.run(
+              async (timeoutMs) =>
+                await systemctl.show(unit, "UnitFileState", timeoutMs),
+            );
+            if (
+              unitFileState.exitCode !== 0 ||
+              (target.loadState === "masked"
+                ? !["masked", "masked-runtime"].includes(
+                    unitFileState.stdout.trim(),
+                  )
+                : unitFileState.stdout.trim() !== "masked-runtime")
+            ) {
+              return await restoreStoppedUnits(
+                unitFileState.stderr.trim() ||
+                  `${unit} lost its runtime mask before payload cleanup`,
+              );
+            }
+          }
+          const stoppedState = await budget.run(
+            async (timeoutMs) =>
+              await systemctl.show(unit, "ActiveState", timeoutMs),
+          );
           if (!isStoppedSystemdUnit(stoppedState)) {
             return await restoreStoppedUnits(
               stoppedState.stderr.trim() ||
@@ -1549,16 +1906,321 @@ export const LINUX_SWAP_EXECUTABLES = Object.freeze({
   truncate: "/usr/bin/truncate",
 } as const);
 
+// Linux O_PATH is architecture-independent and intentionally is not exposed by
+// Node's fs.constants. It pins inode metadata without requiring read access to
+// a root-owned mode-0600 swap staging file.
+const LINUX_O_PATH = 0o10000000;
+const MAX_LINUX_FDINFO_BYTES = 4096;
+
+export async function openLinuxMetadataHandle(
+  path: string,
+): Promise<Awaited<ReturnType<typeof open>>> {
+  if (process.platform !== "linux") {
+    throw new Error("Linux metadata handles require a Linux host");
+  }
+  return await open(path, LINUX_O_PATH | constants.O_NOFOLLOW);
+}
+
 const MAX_FSTAB_BYTES = 1024 * 1024;
-const FSTAB_EXCHANGE_SCRIPT = String.raw`
+
+async function validateReadableBoundedFstab(path: string): Promise<void> {
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile()) throw new Error(`${path} is not a regular file`);
+    if (before.size > BigInt(MAX_FSTAB_BYTES)) {
+      throw new Error(`${path} exceeded the 1 MiB safety bound`);
+    }
+    const buffer = Buffer.allocUnsafe(MAX_FSTAB_BYTES + 1);
+    let length = 0;
+    while (length <= MAX_FSTAB_BYTES) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        length,
+        buffer.length - length,
+        length,
+      );
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    const [after, current] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+    ]);
+    if (
+      length > MAX_FSTAB_BYTES ||
+      BigInt(length) !== after.size ||
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeNs !== after.mtimeNs ||
+      before.ctimeNs !== after.ctimeNs ||
+      after.dev !== current.dev ||
+      after.ino !== current.ino ||
+      after.size !== current.size ||
+      after.mtimeNs !== current.mtimeNs ||
+      after.ctimeNs !== current.ctimeNs
+    ) {
+      throw new Error(`${path} changed while it was read`);
+    }
+  } catch (error) {
+    throw new Error(
+      `unable to read ${path} before swap mutation: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+export const IDENTITY_BOUND_UNLINK_SCRIPT = String.raw`
 import ctypes
+import errno
+import os
+import stat
+import sys
+
+RENAME_NOREPLACE = 1
+
+def finish(marker, detail, code):
+    print(marker)
+    if detail:
+        print(detail, file=sys.stderr)
+    raise SystemExit(code)
+
+if len(sys.argv) != 16:
+    finish("RETAINED", "invalid identity-bound unlink arguments", 70)
+
+path = os.path.normpath(os.path.abspath(sys.argv[1]))
+expected = tuple(int(value) for value in sys.argv[2:10])
+parent_expected = tuple(int(value) for value in sys.argv[10:15])
+mount_expected = int(sys.argv[15])
+parent_path = os.path.dirname(path)
+name = os.path.basename(path)
+if not name or path == parent_path:
+    finish("RETAINED", "invalid identity-bound unlink path", 70)
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+def same_after_rename(observed, wanted):
+    return observed[:7] == wanted[:7]
+
+def parent_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+def descriptor_mount_id(descriptor):
+    metadata_descriptor = os.open(
+        "/proc/self/fdinfo/" + str(descriptor),
+        os.O_RDONLY | os.O_CLOEXEC,
+    )
+    try:
+        content = os.read(metadata_descriptor, 4097)
+    finally:
+        os.close(metadata_descriptor)
+    if len(content) > 4096:
+        raise RuntimeError("parent mount identity metadata exceeded 4 KiB")
+    matches = [
+        line.split(b":", 1)[1].strip()
+        for line in content.splitlines()
+        if line.startswith(b"mnt_id:")
+    ]
+    if len(matches) != 1 or not matches[0].isdigit():
+        raise RuntimeError("parent mount identity is unavailable")
+    return int(matches[0])
+
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+try:
+    parent_descriptor = os.open(parent_path, directory_flags)
+except Exception as error:
+    finish("RETAINED", "unable to anchor unlink parent: " + str(error), 71)
+
+def validate_parent_boundary():
+    held = os.fstat(parent_descriptor)
+    current_descriptor = os.open(parent_path, directory_flags)
+    try:
+        current = os.fstat(current_descriptor)
+        current_mount = descriptor_mount_id(current_descriptor)
+    finally:
+        os.close(current_descriptor)
+    if (
+        parent_identity(held) != parent_expected
+        or parent_identity(current) != parent_expected
+        or descriptor_mount_id(parent_descriptor) != mount_expected
+        or current_mount != mount_expected
+    ):
+        raise RuntimeError("unlink parent or mount boundary changed")
+
+try:
+    validate_parent_boundary()
+    descriptor = os.open(
+        name,
+        getattr(os, "O_PATH", 0o10000000) | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_descriptor,
+    )
+except FileNotFoundError:
+    finish("ABSENT", "", 0)
+except Exception as error:
+    finish("RETAINED", "unable to pin unlink target: " + str(error), 71)
+
+try:
+    held_before = os.fstat(descriptor)
+    current_before = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(held_before.st_mode)
+        or identity(held_before) != expected
+        or identity(current_before) != expected
+    ):
+        finish("RETAINED", "unlink target identity changed before commit", 71)
+except Exception as error:
+    finish("RETAINED", "unable to validate unlink target: " + str(error), 71)
+
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
+except AttributeError:
+    finish("RETAINED", "libc renameat2 is unavailable", 70)
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+
+def rename_noreplace(source, destination):
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source),
+        parent_descriptor,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+def allocate_quarantine():
+    for _ in range(8):
+        candidate = (
+            ".maximize-github-runner-space.unlink."
+            + str(os.getpid())
+            + "."
+            + os.getrandom(16).hex()
+        )
+        try:
+            rename_noreplace(name, candidate)
+            return candidate
+        except OSError as error:
+            if error.errno == errno.EEXIST:
+                continue
+            raise
+    raise RuntimeError("unable to allocate a unique unlink quarantine")
+
+try:
+    validate_parent_boundary()
+    quarantine_name = allocate_quarantine()
+except Exception as error:
+    finish("RETAINED", "unable to quarantine unlink target: " + str(error), 72)
+
+try:
+    held_after = identity(os.fstat(descriptor))
+    quarantined = identity(
+        os.stat(
+            quarantine_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    )
+    if not same_after_rename(held_after, expected) or held_after != quarantined:
+        try:
+            rename_noreplace(quarantine_name, name)
+            detail = "unlink target changed at the commit point; replacement restored"
+        except Exception as restore_error:
+            detail = (
+                "unlink target changed at the commit point; replacement retained at "
+                + os.path.join(parent_path, quarantine_name)
+                + "; restore failed: "
+                + str(restore_error)
+            )
+        finish("RETAINED", detail, 73)
+except Exception as error:
+    finish(
+        "UNCONFIRMED",
+        "unable to verify quarantined unlink target; retained at "
+        + os.path.join(parent_path, quarantine_name)
+        + ": "
+        + str(error),
+        74,
+    )
+
+try:
+    os.unlink(quarantine_name, dir_fd=parent_descriptor)
+except Exception as error:
+    finish(
+        "UNCONFIRMED",
+        "unable to remove quarantined target at "
+        + os.path.join(parent_path, quarantine_name)
+        + ": "
+        + str(error),
+        74,
+    )
+
+try:
+    os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+    finish(
+        "UNCONFIRMED",
+        "unlink quarantine path was recreated and retained at "
+        + os.path.join(parent_path, quarantine_name),
+        74,
+    )
+except FileNotFoundError:
+    pass
+except Exception as error:
+    finish("UNCONFIRMED", "unable to verify unlink quarantine removal: " + str(error), 74)
+
+try:
+    current = identity(os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False))
+except FileNotFoundError:
+    finish("REMOVED", "", 0)
+except Exception as error:
+    finish("UNCONFIRMED", "unable to inspect unlink path after removal: " + str(error), 74)
+
+finish(
+    "REPLACEMENT_RETAINED",
+    (
+        "captured target was removed but its pathname now contains the same inode"
+        if same_after_rename(current, expected)
+        else "captured target was removed and a concurrent pathname replacement was retained"
+    ),
+    75,
+)
+`;
+
+export const FSTAB_EXCHANGE_SCRIPT = String.raw`
+import ctypes
+import errno
 import hashlib
 import os
 import stat
 import sys
 
 MAX_BYTES = 1024 * 1024
-AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 RENAME_EXCHANGE = 2
 
 def finish(marker, detail, code):
@@ -1567,9 +2229,9 @@ def finish(marker, detail, code):
         print(detail, file=sys.stderr)
     raise SystemExit(code)
 
-def snapshot(path):
+def open_snapshot(parent_descriptor, name, display_path):
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
@@ -1586,24 +2248,34 @@ def snapshot(path):
             length += len(chunk)
         content = b"".join(chunks)
         after = os.fstat(descriptor)
-    finally:
+        current = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        identity = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+            stat.S_IMODE(value.st_mode),
+            value.st_uid,
+            value.st_gid,
+        )
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise RuntimeError("path changed while it was read")
+        if len(content) > MAX_BYTES or len(content) != after.st_size:
+            raise RuntimeError("file changed size while it was read")
+        return descriptor, identity(after) + (hashlib.sha256(content).hexdigest(),)
+    except Exception:
         os.close(descriptor)
-    current = os.lstat(path)
-    identity = lambda value: (
-        value.st_dev,
-        value.st_ino,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-        stat.S_IMODE(value.st_mode),
-        value.st_uid,
-        value.st_gid,
-    )
-    if identity(before) != identity(after) or identity(after) != identity(current):
-        raise RuntimeError("path changed while it was read")
-    if len(content) > MAX_BYTES or len(content) != after.st_size:
-        raise RuntimeError("file changed size while it was read")
-    return identity(after) + (hashlib.sha256(content).hexdigest(),)
+        raise
+
+def snapshot(parent_descriptor, name, display_path):
+    descriptor, observed = open_snapshot(parent_descriptor, name, display_path)
+    os.close(descriptor)
+    return observed
 
 def expected(values):
     return tuple(int(value) for value in values[:8]) + (values[8],)
@@ -1614,15 +2286,84 @@ def same_after_exchange(observed, wanted):
         and observed[5:] == wanted[5:]
     )
 
-if len(sys.argv) != 21:
+if len(sys.argv) != 27:
     finish("NO_EXCHANGE", "invalid exchange arguments", 70)
 
 source_path, target_path = sys.argv[1:3]
 source_expected = expected(sys.argv[3:12])
 target_expected = expected(sys.argv[12:21])
+parent_expected = tuple(int(value) for value in sys.argv[21:26])
+mount_expected = int(sys.argv[26])
+
+source_path = os.path.normpath(os.path.abspath(source_path))
+target_path = os.path.normpath(os.path.abspath(target_path))
+parent_path = os.path.dirname(target_path)
+if os.path.dirname(source_path) != parent_path:
+    finish("NO_EXCHANGE", "fstab exchange paths do not share one parent", 70)
+source_name = os.path.basename(source_path)
+target_name = os.path.basename(target_path)
+if not source_name or not target_name or source_name == target_name:
+    finish("NO_EXCHANGE", "invalid fstab exchange names", 70)
+
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+try:
+    parent_descriptor = os.open(parent_path, directory_flags)
+except Exception as error:
+    finish("NO_EXCHANGE", "unable to anchor fstab parent: " + str(error), 70)
+
+def parent_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+def descriptor_mount_id(descriptor):
+    fdinfo_descriptor = os.open(
+        "/proc/self/fdinfo/" + str(descriptor),
+        os.O_RDONLY | os.O_CLOEXEC,
+    )
+    try:
+        content = os.read(fdinfo_descriptor, 4097)
+    finally:
+        os.close(fdinfo_descriptor)
+    if len(content) > 4096:
+        raise RuntimeError("parent mount identity metadata exceeded 4 KiB")
+    matches = [
+        line.split(b":", 1)[1].strip()
+        for line in content.splitlines()
+        if line.startswith(b"mnt_id:")
+    ]
+    if len(matches) != 1 or not matches[0].isdigit():
+        raise RuntimeError("parent mount identity is unavailable")
+    return int(matches[0])
+
+def validate_parent_boundary():
+    held = os.fstat(parent_descriptor)
+    current_descriptor = os.open(parent_path, directory_flags)
+    try:
+        current = os.fstat(current_descriptor)
+        current_mount = descriptor_mount_id(current_descriptor)
+    finally:
+        os.close(current_descriptor)
+    if (
+        parent_identity(held) != parent_expected
+        or parent_identity(current) != parent_expected
+        or descriptor_mount_id(parent_descriptor) != mount_expected
+        or current_mount != mount_expected
+    ):
+        raise RuntimeError("fstab parent or mount boundary changed")
 
 try:
-    renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    validate_parent_boundary()
+except Exception as error:
+    finish("NO_EXCHANGE", "unable to validate fstab parent boundary: " + str(error), 71)
+
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = libc.renameat2
 except AttributeError:
     finish("NO_EXCHANGE", "libc renameat2 is unavailable", 70)
 renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
@@ -1630,78 +2371,349 @@ renameat2.restype = ctypes.c_int
 
 def exchange():
     result = renameat2(
-        AT_FDCWD,
-        os.fsencode(source_path),
-        AT_FDCWD,
-        os.fsencode(target_path),
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(target_name),
         RENAME_EXCHANGE,
     )
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
-try:
-    if snapshot(source_path) != source_expected:
-        finish("NO_EXCHANGE", "staged fstab identity or content changed", 71)
-except Exception as error:
-    finish("NO_EXCHANGE", "unable to validate staged fstab: " + str(error), 71)
-
-try:
-    exchange()
-except Exception as error:
-    finish("NO_EXCHANGE", "fstab exchange failed: " + str(error), 72)
-
-try:
-    displaced = snapshot(source_path)
-    live = snapshot(target_path)
-    if same_after_exchange(displaced, target_expected) and same_after_exchange(live, source_expected):
-        finish("COMMITTED", "", 0)
-except Exception as error:
-    displaced = None
-    verification_error = str(error)
-else:
-    verification_error = "displaced fstab did not match the expected snapshot"
-
-try:
-    exchange()
-except Exception as error:
-    finish(
-        "UNCONFIRMED",
-        verification_error + "; fstab rollback exchange failed: " + str(error),
-        74,
+def rename_noreplace(source, destination):
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source),
+        parent_descriptor,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
     )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+def remove_captured_recovery(name, expected_device, expected_inode):
+    recovery = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if recovery.st_dev != expected_device or recovery.st_ino != expected_inode:
+        raise RuntimeError("fstab recovery link identity changed before cleanup")
+
+    def allocate_recovery_quarantine():
+        for _ in range(8):
+            candidate = (
+                ".maximize-github-runner-space.fstab-recovery-unlink."
+                + str(os.getpid())
+                + "."
+                + os.getrandom(16).hex()
+            )
+            try:
+                rename_noreplace(name, candidate)
+                return candidate
+            except OSError as error:
+                if error.errno == errno.EEXIST:
+                    continue
+                raise
+        raise RuntimeError("unable to allocate a unique fstab recovery quarantine")
+
+    quarantine_name = allocate_recovery_quarantine()
+    quarantined = os.stat(
+        quarantine_name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if quarantined.st_dev != expected_device or quarantined.st_ino != expected_inode:
+        try:
+            rename_noreplace(quarantine_name, name)
+            detail = "replacement restored"
+        except Exception as restore_error:
+            detail = (
+                "replacement retained at "
+                + os.path.join(parent_path, quarantine_name)
+                + "; restore failed: "
+                + str(restore_error)
+            )
+        raise RuntimeError("fstab recovery link changed at cleanup; " + detail)
+    os.unlink(quarantine_name, dir_fd=parent_descriptor)
+    try:
+        os.stat(quarantine_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        raise RuntimeError(
+            "fstab recovery quarantine was recreated and retained at "
+            + os.path.join(parent_path, quarantine_name)
+        )
+    except FileNotFoundError:
+        pass
+    try:
+        os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        raise RuntimeError(
+            "fstab recovery pathname was recreated and retained at "
+            + os.path.join(parent_path, name)
+        )
+    except FileNotFoundError:
+        pass
+
+def create_recovery(descriptor):
+    for _ in range(8):
+        name = (
+            "."
+            + target_name
+            + ".maximize-github-runner-space.recovery."
+            + str(os.getpid())
+            + "."
+            + os.getrandom(16).hex()
+        )
+        try:
+            os.link(
+                target_name,
+                name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            continue
+        recovery = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        original = os.fstat(descriptor)
+        if recovery.st_dev != original.st_dev or recovery.st_ino != original.st_ino:
+            try:
+                remove_captured_recovery(name, recovery.st_dev, recovery.st_ino)
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    "live fstab changed while its recovery link was created; "
+                    + str(cleanup_error)
+                )
+            raise RuntimeError("live fstab changed while its recovery link was created")
+        return name
+    raise RuntimeError("unable to allocate a unique fstab recovery link")
+
+def cleanup_recovery(name, original_descriptor):
+    original = os.fstat(original_descriptor)
+    remove_captured_recovery(name, original.st_dev, original.st_ino)
+
+def recovery_path(name):
+    return os.path.join(parent_path, name)
 
 try:
-    restored = snapshot(target_path)
-    staged = snapshot(source_path)
-    if (
-        displaced is not None
-        and same_after_exchange(restored, displaced)
-        and same_after_exchange(staged, source_expected)
-    ):
-        finish("ROLLED_BACK", verification_error, 73)
+    source_descriptor, source_observed = open_snapshot(
+        parent_descriptor,
+        source_name,
+        source_path,
+    )
+    target_descriptor, target_observed = open_snapshot(
+        parent_descriptor,
+        target_name,
+        target_path,
+    )
+    if source_observed != source_expected:
+        finish("NO_EXCHANGE", "staged fstab identity or content changed", 71)
+    if target_observed != target_expected:
+        finish("NO_EXCHANGE", "live fstab identity or content changed", 71)
+    recovery_name = create_recovery(target_descriptor)
+except Exception as error:
+    finish("NO_EXCHANGE", "unable to validate fstab exchange inputs: " + str(error), 71)
 
-    # A second writer won between the two exchanges. Put that newest observed
-    # file back at the live path while retaining the earlier writer at source.
-    exchange()
-    latest = snapshot(target_path)
-    retained = snapshot(source_path)
-    if same_after_exchange(latest, staged) and same_after_exchange(retained, restored):
+try:
+    validate_parent_boundary()
+    if snapshot(parent_descriptor, source_name, source_path) != source_expected:
+        raise RuntimeError("staged fstab changed at the commit point")
+    if not same_after_exchange(
+        snapshot(parent_descriptor, target_name, target_path),
+        target_expected,
+    ):
+        raise RuntimeError("live fstab changed at the commit point")
+except Exception as error:
+    try:
+        cleanup_recovery(recovery_name, target_descriptor)
+    except Exception as cleanup_error:
         finish(
             "UNCONFIRMED",
-            verification_error + "; a second concurrent fstab update was preserved",
+            "fstab commit boundary changed and recovery cleanup failed: "
+            + str(error)
+            + "; "
+            + str(cleanup_error)
+            + "; original retained at "
+            + recovery_path(recovery_name),
             74,
         )
-    finish("UNCONFIRMED", verification_error + "; rollback state changed", 74)
+    finish("NO_EXCHANGE", "fstab commit boundary changed: " + str(error), 71)
+
+exchange_error = None
+try:
+    exchange()
+except Exception as error:
+    exchange_error = str(error)
+
+try:
+    displaced = snapshot(parent_descriptor, source_name, source_path)
+    live = snapshot(parent_descriptor, target_name, target_path)
+    if same_after_exchange(displaced, target_expected) and same_after_exchange(live, source_expected):
+        cleanup_recovery(recovery_name, target_descriptor)
+        finish("COMMITTED", "", 0)
 except Exception as error:
     finish(
         "UNCONFIRMED",
-        verification_error + "; unable to verify fstab rollback: " + str(error),
+        "unable to inspect fstab exchange state: "
+        + str(error)
+        + "; original retained at "
+        + recovery_path(recovery_name),
         74,
     )
+
+if same_after_exchange(displaced, source_expected) and same_after_exchange(live, target_expected):
+    try:
+        cleanup_recovery(recovery_name, target_descriptor)
+    except Exception as error:
+        finish(
+            "UNCONFIRMED",
+            "fstab exchange did not occur and recovery cleanup failed: " + str(error),
+            74,
+        )
+    finish(
+        "NO_EXCHANGE",
+        "fstab exchange failed" + ("" if exchange_error is None else ": " + exchange_error),
+        72,
+    )
+
+verification_error = (
+    "fstab exchange postcondition changed"
+    if exchange_error is None
+    else "fstab exchange reported failure after changing state: " + exchange_error
+)
+finish(
+    "UNCONFIRMED",
+    verification_error
+    + "; refusing a second exchange because it could displace a concurrent live writer"
+    + "; original retained at "
+    + recovery_path(recovery_name),
+    74,
+)
+`;
+
+export const SWAP_TRANSITION_SCRIPT = String.raw`
+import ctypes
+import os
+import stat
+import sys
+
+def finish(marker, detail, code):
+    print(marker)
+    if detail:
+        print(detail, file=sys.stderr)
+    raise SystemExit(code)
+
+if len(sys.argv) != 11 or sys.argv[1] not in ("on", "off"):
+    finish("NO_CHANGE", "invalid swap transition arguments", 70)
+
+action = sys.argv[1]
+path = os.path.normpath(os.path.abspath(sys.argv[2]))
+expected = tuple(int(value) for value in sys.argv[3:11])
+parent_path = os.path.dirname(path)
+name = os.path.basename(path)
+if not name:
+    finish("NO_CHANGE", "invalid swap transition path", 70)
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+try:
+    parent_descriptor = os.open(parent_path, directory_flags)
+    descriptor = os.open(name, file_flags, dir_fd=parent_descriptor)
+    before = os.fstat(descriptor)
+    current = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(before.st_mode) or identity(before) != expected or identity(current) != expected:
+        finish("NO_CHANGE", "swapfile identity changed before transition", 71)
+except Exception as error:
+    finish("NO_CHANGE", "unable to pin swapfile identity: " + str(error), 71)
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.swapon.argtypes = [ctypes.c_char_p, ctypes.c_int]
+libc.swapon.restype = ctypes.c_int
+libc.swapoff.argtypes = [ctypes.c_char_p]
+libc.swapoff.restype = ctypes.c_int
+descriptor_path = os.fsencode("/proc/self/fd/" + str(descriptor))
+
+def apply_transition(selected):
+    result = (
+        libc.swapon(descriptor_path, 0)
+        if selected == "on"
+        else libc.swapoff(descriptor_path)
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+try:
+    apply_transition(action)
+except Exception as error:
+    finish("NO_CHANGE", "swap transition failed: " + str(error), 72)
+
+try:
+    held_after = os.fstat(descriptor)
+    path_after = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if identity(held_after) == expected and identity(path_after) == expected:
+        finish("APPLIED", "", 0)
+    verification_error = "swapfile identity changed during transition"
+except Exception as error:
+    verification_error = "unable to verify swapfile after transition: " + str(error)
+
+reverse = "off" if action == "on" else "on"
+try:
+    apply_transition(reverse)
+except Exception as error:
+    finish(
+        "UNCONFIRMED",
+        verification_error + "; rollback transition failed: " + str(error),
+        74,
+    )
+finish("ROLLED_BACK", verification_error, 73)
 `;
 
 type LinuxSwapUtility = keyof typeof LINUX_SWAP_EXECUTABLES;
+
+export interface LinuxSwapPathIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+  readonly size: bigint;
+  readonly mode: bigint;
+  readonly userId: bigint;
+  readonly groupId: bigint;
+  readonly modifiedNanoseconds: bigint;
+  readonly changedNanoseconds: bigint;
+}
+
+export type LinuxSwapTransitionRunner = (
+  action: "on" | "off",
+  path: string,
+  expected?: LinuxSwapPathIdentity,
+) => Promise<CommandResult>;
+
+type SwapPathIdentity = LinuxSwapPathIdentity;
 
 export interface LinuxSwapCommandInvocation {
   readonly elevated: boolean;
@@ -1721,6 +2733,8 @@ export interface LinuxSwapDependencies {
   ) => Promise<CommandFileIdentity | undefined>;
   /** Keeps command-only legacy test doubles isolated from native filesystem checks. */
   readonly nativeFilesystemSemantics?: boolean;
+  readonly validateReadableFstab?: (path: string) => Promise<void>;
+  readonly swapTransition?: LinuxSwapTransitionRunner;
 }
 
 export function linuxSwapCommandEnvironment(): NodeJS.ProcessEnv {
@@ -1737,6 +2751,95 @@ interface SwapDefinitionPaths {
   readonly swapfile: string;
   readonly etcDirectory: string;
   readonly fstab: string;
+}
+
+interface SwapMountBoundaryEntry {
+  readonly path: string;
+  readonly mountId: bigint;
+}
+
+async function linuxDescriptorMountId(
+  handle: Awaited<ReturnType<typeof open>>,
+): Promise<bigint> {
+  const fdinfo = await readFile(`/proc/self/fdinfo/${handle.fd}`);
+  if (fdinfo.length > MAX_LINUX_FDINFO_BYTES) {
+    throw new Error(`mount identity metadata exceeded 4 KiB for ${handle.fd}`);
+  }
+  const matches = [
+    ...fdinfo.toString("utf8").matchAll(/^mnt_id:[ \t]+([0-9]+)[ \t]*$/gm),
+  ];
+  const raw = matches[0]?.[1];
+  if (matches.length !== 1 || raw === undefined) {
+    throw new Error(
+      `unable to verify mount identity for descriptor ${handle.fd}`,
+    );
+  }
+  return BigInt(raw);
+}
+
+async function captureSwapMountBoundaries(
+  paths: SwapDefinitionPaths,
+): Promise<readonly SwapMountBoundaryEntry[]> {
+  if (process.platform !== "linux") {
+    throw new Error("swap mount validation requires a Linux host");
+  }
+  const capture = async (
+    path: string,
+  ): Promise<SwapMountBoundaryEntry | undefined> => {
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      handle = await openLinuxMetadataHandle(path);
+      return { path, mountId: await linuxDescriptorMountId(handle) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  };
+  const [mountDirectory, swapfile, etcDirectory, fstab] = await Promise.all([
+    capture(paths.mountDirectory),
+    capture(paths.swapfile),
+    capture(paths.etcDirectory),
+    capture(paths.fstab),
+  ]);
+  if (
+    mountDirectory === undefined ||
+    etcDirectory === undefined ||
+    fstab === undefined
+  ) {
+    throw new Error("swap mount boundary is incomplete");
+  }
+  if (swapfile !== undefined && swapfile.mountId !== mountDirectory.mountId) {
+    throw new Error(
+      `Refusing swapfile mounted separately from ${paths.mountDirectory}: ${paths.swapfile}`,
+    );
+  }
+  if (fstab.mountId !== etcDirectory.mountId) {
+    throw new Error(
+      `Refusing fstab mounted separately from ${paths.etcDirectory}: ${paths.fstab}`,
+    );
+  }
+  return [
+    mountDirectory,
+    ...(swapfile === undefined ? [] : [swapfile]),
+    etcDirectory,
+    fstab,
+  ];
+}
+
+function sameSwapMountBoundaries(
+  left: readonly SwapMountBoundaryEntry[],
+  right: readonly SwapMountBoundaryEntry[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every(
+      (entry, index) =>
+        entry.path === right[index]?.path &&
+        entry.mountId === right[index]?.mountId,
+    )
+  );
 }
 
 interface SwapParentIdentity {
@@ -1834,6 +2937,7 @@ function sameSwapParentIdentities(
 export async function validateSwapTargets(
   context: RuntimeContext,
   definitionRoot = "/",
+  dependencies: Pick<LinuxSwapDependencies, "validateReadableFstab"> = {},
 ): Promise<void> {
   const paths = swapDefinitionPaths(definitionRoot);
   await assertSafeExactTarget(
@@ -1861,6 +2965,10 @@ export async function validateSwapTargets(
     "regular-file",
   );
   await captureProtectedSwapParents(paths, definitionRoot);
+  await (dependencies.validateReadableFstab ?? validateReadableBoundedFstab)(
+    paths.fstab,
+  );
+  await captureSwapMountBoundaries(paths);
 }
 
 /** The root override keeps exact-path safety tests isolated from the host. */
@@ -1883,12 +2991,23 @@ export function createSwapOperation(
   let validatedExecutablePaths:
     Readonly<Partial<Record<LinuxSwapUtility, string>>> | undefined;
   let validatedSwapParents: readonly SwapParentIdentity[] | undefined;
+  let validatedSwapMounts: readonly SwapMountBoundaryEntry[] | undefined;
+  const creationOnlySwapUtilities = new Set<LinuxSwapUtility>([
+    "dd",
+    "df",
+    "fallocate",
+    "mkswap",
+    "truncate",
+  ]);
   const requiredSwapUtilities = (
     Object.keys(LINUX_SWAP_EXECUTABLES) as LinuxSwapUtility[]
   ).filter(
     (utility) =>
       utility !== "grep" &&
-      (nativeFilesystemSemantics || utility !== "python3"),
+      (requested !== 0n || !creationOnlySwapUtilities.has(utility)) &&
+      (nativeFilesystemSemantics || utility !== "python3") &&
+      (!nativeFilesystemSemantics ||
+        (utility !== "rm" && utility !== "swapoff")),
   );
   const commandRunner: LinuxSwapCommandRunner =
     dependencies.commandRunner ??
@@ -1984,8 +3103,58 @@ export function createSwapOperation(
       options: { ...options, env: environment },
     });
   };
-  const validate = async (): Promise<void> => {
-    await validateSwapTargets(context, definitionRoot);
+  const runSwapTransition: LinuxSwapTransitionRunner =
+    dependencies.swapTransition ??
+    (async (action, path, expected) => {
+      if (!nativeFilesystemSemantics) {
+        return await runSwapUtility(
+          true,
+          action === "on" ? "swapon" : "swapoff",
+          [path],
+          { silent: true },
+        );
+      }
+      if (expected === undefined) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "swapfile identity is unavailable for a pinned transition",
+        };
+      }
+      const result = await runSwapUtility(
+        true,
+        "python3",
+        [
+          "-I",
+          "-S",
+          "-c",
+          SWAP_TRANSITION_SCRIPT,
+          action,
+          path,
+          expected.device.toString(),
+          expected.inode.toString(),
+          expected.size.toString(),
+          expected.mode.toString(),
+          expected.userId.toString(),
+          expected.groupId.toString(),
+          expected.modifiedNanoseconds.toString(),
+          expected.changedNanoseconds.toString(),
+        ],
+        { silent: true },
+      );
+      const marker = result.stdoutTruncated
+        ? "UNCONFIRMED"
+        : result.stdout.trim();
+      return result.exitCode === 0 && marker !== "APPLIED"
+        ? {
+            ...result,
+            exitCode: 74,
+            stderr: `swap transition returned an invalid success marker: ${marker || "empty"}`,
+          }
+        : result;
+    });
+  const validateSwapFilesystemState = async (): Promise<void> => {
+    await validateSwapTargets(context, definitionRoot, dependencies);
     const currentParents = await captureProtectedSwapParents(
       paths,
       definitionRoot,
@@ -1997,6 +3166,17 @@ export function createSwapOperation(
       throw new Error("swap parent identity changed after plan validation");
     }
     validatedSwapParents ??= currentParents;
+    const currentMounts = await captureSwapMountBoundaries(paths);
+    if (
+      validatedSwapMounts !== undefined &&
+      !sameSwapMountBoundaries(validatedSwapMounts, currentMounts)
+    ) {
+      throw new Error("swap mount identity changed after plan validation");
+    }
+    validatedSwapMounts ??= currentMounts;
+  };
+  const validate = async (): Promise<void> => {
+    await validateSwapFilesystemState();
     await validateSwapExecutables();
     if (requested === 0n) return;
     const filesystem = await statfs(paths.mountDirectory, { bigint: true });
@@ -2030,13 +3210,7 @@ export function createSwapOperation(
         };
       }
 
-      interface TrackedSwapTemporaryFile {
-        readonly device: bigint;
-        readonly inode: bigint;
-        readonly mode: bigint;
-        readonly userId: bigint;
-        readonly groupId: bigint;
-      }
+      type TrackedSwapTemporaryFile = SwapPathIdentity;
       interface TemporaryMetadataTransition {
         readonly permissions?: bigint;
         readonly userId?: bigint;
@@ -2055,6 +3229,14 @@ export function createSwapOperation(
           : typeof process.getgid === "function"
             ? BigInt(process.getgid())
             : undefined;
+      const swapFilesystemFailure = async (): Promise<string | undefined> => {
+        try {
+          await validateSwapFilesystemState();
+          return undefined;
+        } catch (error) {
+          return error instanceof Error ? error.message : String(error);
+        }
+      };
       const inspectTemporaryFile = async (
         path: string,
       ): Promise<
@@ -2075,9 +3257,12 @@ export function createSwapOperation(
             identity: {
               device: metadata.dev,
               inode: metadata.ino,
+              size: metadata.size,
               mode: metadata.mode,
               userId: metadata.uid,
               groupId: metadata.gid,
+              modifiedNanoseconds: metadata.mtimeNs,
+              changedNanoseconds: metadata.ctimeNs,
             },
           };
         } catch (error) {
@@ -2094,9 +3279,12 @@ export function createSwapOperation(
       ): boolean =>
         left.device === right.device &&
         left.inode === right.inode &&
+        left.size === right.size &&
         left.mode === right.mode &&
         left.userId === right.userId &&
-        left.groupId === right.groupId;
+        left.groupId === right.groupId &&
+        left.modifiedNanoseconds === right.modifiedNanoseconds &&
+        left.changedNanoseconds === right.changedNanoseconds;
       const sameTemporaryFileEntry = (
         left: TrackedSwapTemporaryFile,
         right: TrackedSwapTemporaryFile,
@@ -2265,9 +3453,87 @@ export function createSwapOperation(
         return { path };
       };
 
+      const identityBoundUnlink = async (
+        path: string,
+        expected: SwapPathIdentity,
+      ): Promise<string | undefined> => {
+        const parentPath = posix.dirname(path);
+        const parent = validatedSwapParents?.find(
+          (entry) => entry.path === parentPath,
+        );
+        const mount = validatedSwapMounts?.find(
+          (entry) => entry.path === parentPath,
+        );
+        if (parent === undefined || mount === undefined) {
+          return `validated unlink parent boundary is unavailable for ${path}; file retained`;
+        }
+        const result = await runSwapUtility(
+          true,
+          "python3",
+          [
+            "-I",
+            "-S",
+            "-c",
+            IDENTITY_BOUND_UNLINK_SCRIPT,
+            path,
+            expected.device.toString(),
+            expected.inode.toString(),
+            expected.size.toString(),
+            expected.mode.toString(),
+            expected.userId.toString(),
+            expected.groupId.toString(),
+            expected.modifiedNanoseconds.toString(),
+            expected.changedNanoseconds.toString(),
+            parent.device.toString(),
+            parent.inode.toString(),
+            parent.mode.toString(),
+            parent.userId.toString(),
+            parent.groupId.toString(),
+            mount.mountId.toString(),
+          ],
+          { silent: true, timeoutMs: 30_000 },
+        );
+        assertCommandTerminationConfirmed();
+        const marker = result.stdoutTruncated
+          ? "UNCONFIRMED"
+          : result.stdout.trim();
+        if (
+          result.exitCode === 0 &&
+          (marker === "REMOVED" || marker === "ABSENT")
+        ) {
+          return undefined;
+        }
+        return [
+          result.stderr.trim(),
+          result.exitCode === 0
+            ? `identity-bound unlink returned an invalid success marker: ${marker || "empty"}`
+            : `identity-bound unlink stopped with ${marker || `exit ${result.exitCode}`}`,
+          "file retained unless the helper explicitly confirmed removal",
+        ]
+          .filter((value) => value.length > 0)
+          .join("; ");
+      };
+
       async function removeTemporaryFile(
         path: string,
+        expectedOverride?: SwapPathIdentity,
       ): Promise<string | undefined> {
+        const expected = expectedOverride ?? trackedTemporaryFiles.get(path);
+        if (nativeFilesystemSemantics) {
+          if (expected === undefined) {
+            try {
+              await lstat(path);
+              return `temporary swap file identity is unavailable: ${path}; file retained`;
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+              return `unable to inspect untracked temporary swap path ${path}; file retained: ${error instanceof Error ? error.message : String(error)}`;
+            }
+          }
+          const removed = await identityBoundUnlink(path, expected);
+          if (removed === undefined) trackedTemporaryFiles.delete(path);
+          return removed;
+        }
         const failures: string[] = [];
         if (trackedTemporaryFiles.has(path)) {
           const unsafe = await validateTrackedTemporaryFile(path);
@@ -2314,8 +3580,9 @@ export function createSwapOperation(
 
       const removeFstabTemporaryFile = async (
         path: string,
+        expected?: SwapPathIdentity,
       ): Promise<string | undefined> => {
-        const failure = await removeTemporaryFile(path);
+        const failure = await removeTemporaryFile(path, expected);
         return failure === undefined
           ? undefined
           : `temporary fstab cleanup failed: ${failure}`;
@@ -2345,6 +3612,37 @@ export function createSwapOperation(
             context,
             "regular-file",
           );
+          const expectedParent = validatedSwapParents?.find(
+            ({ path }) => path === paths.etcDirectory,
+          );
+          const currentParent = (
+            await captureProtectedSwapParents(paths, definitionRoot)
+          ).find(({ path }) => path === paths.etcDirectory);
+          if (
+            expectedParent === undefined ||
+            currentParent === undefined ||
+            !sameSwapParentIdentities([expectedParent], [currentParent])
+          ) {
+            throw new Error(
+              "fstab parent identity changed after plan validation",
+            );
+          }
+          const currentMounts = await captureSwapMountBoundaries(paths);
+          for (const path of [paths.etcDirectory, paths.fstab]) {
+            const expected = validatedSwapMounts?.find(
+              (entry) => entry.path === path,
+            );
+            const current = currentMounts.find((entry) => entry.path === path);
+            if (
+              expected === undefined ||
+              current === undefined ||
+              expected.mountId !== current.mountId
+            ) {
+              throw new Error(
+                "fstab mount identity changed after plan validation",
+              );
+            }
+          }
           return undefined;
         } catch (error) {
           return error instanceof Error ? error.message : String(error);
@@ -2534,6 +3832,29 @@ export function createSwapOperation(
               replacement,
             );
           }
+          const commitBoundary = await validateFstabMutation();
+          if (commitBoundary !== undefined) {
+            return await withFstabTemporaryCleanup(
+              { exitCode: 1, stdout: "", stderr: commitBoundary },
+              replacement,
+            );
+          }
+          const fstabParent = validatedSwapParents?.find(
+            ({ path }) => path === paths.etcDirectory,
+          );
+          const fstabMount = validatedSwapMounts?.find(
+            ({ path }) => path === paths.etcDirectory,
+          );
+          if (fstabParent === undefined || fstabMount === undefined) {
+            return await withFstabTemporaryCleanup(
+              {
+                exitCode: 1,
+                stdout: "",
+                stderr: "validated fstab parent boundary is unavailable",
+              },
+              replacement,
+            );
+          }
           const exchanged = await runSwapUtility(
             true,
             "python3",
@@ -2546,6 +3867,12 @@ export function createSwapOperation(
               paths.fstab,
               ...snapshotArguments(staged.snapshot),
               ...snapshotArguments(expectedCurrent),
+              fstabParent.device.toString(),
+              fstabParent.inode.toString(),
+              fstabParent.mode.toString(),
+              fstabParent.userId.toString(),
+              fstabParent.groupId.toString(),
+              fstabMount.mountId.toString(),
             ],
             { silent: true },
           );
@@ -2585,7 +3912,16 @@ export function createSwapOperation(
                 moveAttempted: true,
               };
             }
-            const cleanupFailure = await removeFstabTemporaryFile(replacement);
+            const cleanupFailure = await removeFstabTemporaryFile(replacement, {
+              device: displaced.snapshot.device,
+              inode: displaced.snapshot.inode,
+              size: displaced.snapshot.size,
+              mode: displaced.snapshot.mode | 0o100000n,
+              userId: displaced.snapshot.userId,
+              groupId: displaced.snapshot.groupId,
+              modifiedNanoseconds: displaced.snapshot.modifiedNanoseconds,
+              changedNanoseconds: displaced.snapshot.changedNanoseconds,
+            });
             if (cleanupFailure !== undefined) {
               return {
                 exitCode: 1,
@@ -2605,13 +3941,11 @@ export function createSwapOperation(
           }
 
           let cleanupFailure: string | undefined;
-          if (marker === "ROLLED_BACK" || marker === "NO_EXCHANGE") {
+          if (marker === "NO_EXCHANGE") {
             const retained = await readBoundedRegularFile(replacement);
             const mayRemove =
               retained.snapshot !== undefined &&
-              (marker === "ROLLED_BACK"
-                ? sameFstabFileAfterExchange(retained.snapshot, staged.snapshot)
-                : sameFstabSnapshot(retained.snapshot, staged.snapshot));
+              sameFstabSnapshot(retained.snapshot, staged.snapshot);
             cleanupFailure = mayRemove
               ? await removeFstabTemporaryFile(replacement)
               : `unconfirmed fstab exchange file retained at ${replacement}`;
@@ -2621,9 +3955,7 @@ export function createSwapOperation(
             exitCode: exchanged.exitCode === 0 ? 1 : exchanged.exitCode,
             stderr: [
               exchanged.stderr.trim() ||
-                (marker === "ROLLED_BACK"
-                  ? `live ${paths.fstab} changed during atomic exchange`
-                  : `atomic fstab exchange was ${marker.toLowerCase()}`),
+                `atomic fstab exchange was ${marker.toLowerCase()}`,
               cleanupFailure,
               marker === "UNCONFIRMED"
                 ? `exchange state retained for recovery at ${replacement}`
@@ -2824,26 +4156,23 @@ export function createSwapOperation(
           : { detail: unsafe };
       };
 
-      const isFstabWhitespace = (value: number | undefined): boolean =>
-        value === 0x09 ||
-        value === 0x0a ||
-        value === 0x0b ||
-        value === 0x0c ||
-        value === 0x0d ||
-        value === 0x20;
+      const isFstabFieldSeparator = (value: number | undefined): boolean =>
+        value === 0x09 || value === 0x20;
 
       const isOwnedFstabLine = (line: Buffer): boolean => {
         const path = Buffer.from(paths.swapfile, "utf8");
+        let offset = 0;
+        while (isFstabFieldSeparator(line[offset])) offset += 1;
         if (
-          line.length <= path.length ||
-          !line.subarray(0, path.length).equals(path)
+          line.length <= offset + path.length ||
+          !line.subarray(offset, offset + path.length).equals(path)
         ) {
           return false;
         }
-        let offset = path.length;
+        offset += path.length;
         const consumeWhitespace = (): boolean => {
           const start = offset;
-          while (isFstabWhitespace(line[offset])) offset += 1;
+          while (isFstabFieldSeparator(line[offset])) offset += 1;
           return offset > start;
         };
         const consumeToken = (token: string): boolean => {
@@ -3089,16 +4418,6 @@ export function createSwapOperation(
         };
       };
 
-      interface SwapPathIdentity {
-        readonly device: bigint;
-        readonly inode: bigint;
-        readonly size: bigint;
-        readonly mode: bigint;
-        readonly userId: bigint;
-        readonly groupId: bigint;
-        readonly modifiedNanoseconds: bigint;
-        readonly changedNanoseconds: bigint;
-      }
       type SwapPathState =
         | { readonly status: "present"; readonly identity: SwapPathIdentity }
         | { readonly status: "absent" }
@@ -3258,10 +4577,7 @@ export function createSwapOperation(
         }
         let sourceHandle: Awaited<ReturnType<typeof open>> | undefined;
         try {
-          sourceHandle = await open(
-            source,
-            constants.O_RDONLY | constants.O_NOFOLLOW,
-          );
+          sourceHandle = await openLinuxMetadataHandle(source);
           const held = await sourceHandle.stat({ bigint: true });
           const heldIdentity: SwapPathIdentity = {
             device: held.dev,
@@ -3324,13 +4640,7 @@ export function createSwapOperation(
           ) {
             if (trackedSource !== undefined) {
               trackedTemporaryFiles.delete(source);
-              trackedTemporaryFiles.set(destination, {
-                device: heldAfterIdentity.device,
-                inode: heldAfterIdentity.inode,
-                mode: heldAfterIdentity.mode,
-                userId: heldAfterIdentity.userId,
-                groupId: heldAfterIdentity.groupId,
-              });
+              trackedTemporaryFiles.set(destination, heldAfterIdentity);
             }
             return {
               command,
@@ -3383,16 +4693,15 @@ export function createSwapOperation(
         return { status: "failed", detail: initialActivity.detail };
       }
       const isActive = initialActivity.active;
-      const restoreOriginalActiveSwap = async (): Promise<
-        string | undefined
-      > => {
+      const restoreOriginalActiveSwap = async (
+        expectedIdentity?: SwapPathIdentity,
+      ): Promise<string | undefined> => {
         if (!isActive) return undefined;
         try {
-          const enabled = await runSwapUtility(
-            true,
-            "swapon",
-            [paths.swapfile],
-            { silent: true },
+          const enabled = await runSwapTransition(
+            "on",
+            paths.swapfile,
+            expectedIdentity,
           );
           const verified = await readSwapActivity();
           if (verified.status === "failed") {
@@ -3454,7 +4763,9 @@ export function createSwapOperation(
               .join("; "),
           };
         }
-        const activityFailure = await restoreOriginalActiveSwap();
+        const activityFailure = await restoreOriginalActiveSwap(
+          restored.observation.identity,
+        );
         const commandFailure =
           restored.command.exitCode === 0
             ? undefined
@@ -3516,7 +4827,8 @@ export function createSwapOperation(
               .join("; "),
           };
         }
-        const activityFailure = await restoreOriginalActiveSwap();
+        const activityFailure =
+          await restoreOriginalActiveSwap(expectedOriginal);
         return {
           backedUp: false,
           detail: [
@@ -3537,9 +4849,11 @@ export function createSwapOperation(
         | { readonly disabled: true }
         | { readonly disabled: false; readonly detail: string }
       > => {
-        const off = await runSwapUtility(true, "swapoff", [paths.swapfile], {
-          silent: true,
-        });
+        const off = await runSwapTransition(
+          "off",
+          paths.swapfile,
+          originalSwapIdentity,
+        );
         const observed = await readSwapActivity();
         if (
           off.exitCode === 0 &&
@@ -3550,7 +4864,8 @@ export function createSwapOperation(
         }
         let rollbackDetail: string | undefined;
         if (observed.status === "failed" || !observed.active) {
-          rollbackDetail = await restoreOriginalActiveSwap();
+          rollbackDetail =
+            await restoreOriginalActiveSwap(originalSwapIdentity);
         }
         return {
           disabled: false,
@@ -3572,6 +4887,15 @@ export function createSwapOperation(
         backup: string,
         expectedBackup?: SwapPathIdentity,
       ): Promise<string | undefined> => {
+        if (nativeFilesystemSemantics) {
+          if (expectedBackup === undefined) {
+            return `backup identity is unavailable before removal at ${backup}; file retained`;
+          }
+          const failure = await identityBoundUnlink(backup, expectedBackup);
+          return failure === undefined
+            ? undefined
+            : `backup cleanup failed at ${backup}: ${failure}`;
+        }
         let lastFailure = "";
         for (let attempt = 0; attempt < 2; attempt += 1) {
           if (expectedBackup !== undefined) {
@@ -3657,6 +4981,24 @@ export function createSwapOperation(
             return { status: "failed", detail: temporary.detail };
           }
           backup = temporary.path;
+        }
+        const unsafeFilesystem = await swapFilesystemFailure();
+        if (unsafeFilesystem !== undefined) {
+          const backupCleanup =
+            backup === undefined
+              ? undefined
+              : await removeTemporaryFile(backup);
+          return {
+            status: "failed",
+            detail: [
+              unsafeFilesystem,
+              backupCleanup === undefined
+                ? undefined
+                : `temporary backup cleanup failed: ${backupCleanup}`,
+            ]
+              .filter((value): value is string => value !== undefined)
+              .join("; "),
+          };
         }
         if (isActive) {
           const disabled = await disableOriginalSwap();
@@ -3866,17 +5208,29 @@ export function createSwapOperation(
         backup = previous.path;
       }
 
+      const unsafeFilesystem = await swapFilesystemFailure();
+      if (unsafeFilesystem !== undefined) {
+        const details = [
+          unsafeFilesystem,
+          await detailWithTemporaryCleanup("", replacement),
+          backup === undefined
+            ? undefined
+            : await detailWithTemporaryCleanup("", backup),
+        ].filter((value): value is string => Boolean(value));
+        return { status: "failed", detail: details.join("; ") };
+      }
+
+      let installedReplacementIdentity: SwapPathIdentity | undefined;
       const rollbackReplacement = async (
         replacementIsActive: boolean,
       ): Promise<string> => {
         const details: string[] = [];
         let replacementCanBeRemoved = true;
         if (replacementIsActive) {
-          const disabled = await runSwapUtility(
-            true,
-            "swapoff",
-            [paths.swapfile],
-            { silent: true },
+          const disabled = await runSwapTransition(
+            "off",
+            paths.swapfile,
+            installedReplacementIdentity,
           );
           const observed = await readSwapActivity();
           if (observed.status === "known" && !observed.active) {
@@ -3982,9 +5336,12 @@ export function createSwapOperation(
           detail: [moveFailure, rollbackDetail].filter(Boolean).join("; "),
         };
       }
-      const enabled = await runSwapUtility(true, "swapon", [paths.swapfile], {
-        silent: true,
-      });
+      installedReplacementIdentity = moved.observation.identity;
+      const enabled = await runSwapTransition(
+        "on",
+        paths.swapfile,
+        installedReplacementIdentity,
+      );
       const replacementActivity = await readSwapActivity();
       if (
         enabled.exitCode !== 0 ||
@@ -4066,8 +5423,13 @@ export function createSwapOperation(
   });
 }
 
+export interface LinuxAdapterDependencies {
+  readonly listVersionedChildren?: typeof listLinuxVersionedChildren;
+}
+
 export async function createLinuxAdapter(
   context: RuntimeContext,
+  dependencies: LinuxAdapterDependencies = {},
 ): Promise<Adapter> {
   const normalizedHome = posix.normalize(context.home);
   const trustedHome =
@@ -4084,6 +5446,8 @@ export async function createLinuxAdapter(
     supportedComponents: SUPPORTED,
     operations: async (plan: CleanupPlan): Promise<readonly Operation[]> => {
       const operations: Operation[] = [];
+      const listVersionedChildren =
+        dependencies.listVersionedChildren ?? listLinuxVersionedChildren;
       const add = (operation: Operation | undefined): void => {
         if (operation !== undefined) operations.push(operation);
       };
@@ -4562,75 +5926,49 @@ export async function createLinuxAdapter(
         }
       }
 
-      for (const path of await listLinuxVersionedChildren(
-        "/usr/local",
-        /^julia\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
-      )) {
-        add(
-          removeOperation(
-            context,
-            "julia",
-            path,
-            ["/usr/local"],
-            "Remove Julia installation",
-          ),
-        );
+      if (plan.enabled.has("julia")) {
+        for (const path of await listVersionedChildren(
+          "/usr/local",
+          /^julia\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
+        )) {
+          add(
+            removeOperation(
+              context,
+              "julia",
+              path,
+              ["/usr/local"],
+              "Remove Julia installation",
+            ),
+          );
+        }
       }
-      for (const path of await listLinuxVersionedChildren(
-        "/usr/local",
-        /^apache-maven-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
-      )) {
-        add(
-          removeOperation(
-            context,
-            "maven",
-            path,
-            ["/usr/local"],
-            "Remove Maven installation",
-          ),
-        );
+      if (plan.enabled.has("maven")) {
+        for (const [parent, description] of [
+          ["/usr/local", "Remove Maven installation"],
+          ["/usr/share", "Remove versioned Maven installation"],
+        ] as const) {
+          for (const path of await listVersionedChildren(
+            parent,
+            /^apache-maven-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
+          )) {
+            add(removeOperation(context, "maven", path, [parent], description));
+          }
+        }
       }
-      for (const path of await listLinuxVersionedChildren(
-        "/usr/local",
-        /^gradle-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
-      )) {
-        add(
-          removeOperation(
-            context,
-            "gradle",
-            path,
-            ["/usr/local"],
-            "Remove Gradle installation",
-          ),
-        );
-      }
-      for (const path of await listLinuxVersionedChildren(
-        "/usr/share",
-        /^apache-maven-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
-      )) {
-        add(
-          removeOperation(
-            context,
-            "maven",
-            path,
-            ["/usr/share"],
-            "Remove versioned Maven installation",
-          ),
-        );
-      }
-      for (const path of await listLinuxVersionedChildren(
-        "/usr/share",
-        /^gradle-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
-      )) {
-        add(
-          removeOperation(
-            context,
-            "gradle",
-            path,
-            ["/usr/share"],
-            "Remove versioned Gradle installation",
-          ),
-        );
+      if (plan.enabled.has("gradle")) {
+        for (const [parent, description] of [
+          ["/usr/local", "Remove Gradle installation"],
+          ["/usr/share", "Remove versioned Gradle installation"],
+        ] as const) {
+          for (const path of await listVersionedChildren(
+            parent,
+            /^gradle-\d+(?:\.\d+)+(?:[-+][A-Za-z0-9._-]+)?$/,
+          )) {
+            add(
+              removeOperation(context, "gradle", path, [parent], description),
+            );
+          }
+        }
       }
 
       const driverTargets: readonly [ComponentId, string, string][] = [

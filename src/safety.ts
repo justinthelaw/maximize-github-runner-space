@@ -166,6 +166,10 @@ export interface RemovalBoundaryEntry {
   readonly device: bigint;
   readonly inode: bigint;
   readonly mode: bigint;
+  readonly userId?: bigint;
+  readonly groupId?: bigint;
+  readonly birthtimeNanoseconds?: bigint;
+  readonly changedNanoseconds?: bigint;
 }
 
 export interface RemovalBoundarySnapshot {
@@ -203,6 +207,10 @@ export async function captureSafeRemovalBoundary(
         device: stat.dev,
         inode: stat.ino,
         mode: stat.mode,
+        userId: stat.uid,
+        groupId: stat.gid,
+        birthtimeNanoseconds: stat.birthtimeNs,
+        changedNanoseconds: stat.ctimeNs,
       });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
@@ -229,10 +237,47 @@ export function sameRemovalBoundary(
         entry.path === other.path &&
         entry.device === other.device &&
         entry.inode === other.inode &&
-        entry.mode === other.mode
+        entry.mode === other.mode &&
+        entry.userId === other.userId &&
+        entry.groupId === other.groupId &&
+        entry.birthtimeNanoseconds === other.birthtimeNanoseconds
       );
     })
   );
+}
+
+/**
+ * Compare an immediate boundary snapshot, including mutable metadata inside
+ * the most specific owned parent. Broader ancestors such as /tmp can change
+ * when unrelated entries are created without changing the owned path.
+ */
+export function sameRemovalBoundaryExact(
+  left: RemovalBoundarySnapshot,
+  right: RemovalBoundarySnapshot,
+  allowedParents: readonly string[],
+  context: RuntimeContext,
+): boolean {
+  if (!sameRemovalBoundary(left, right)) return false;
+  const api = pathApi(context);
+  const target = left.entries.at(-1)?.path;
+  if (target === undefined) return false;
+  const candidate = canonicalLexical(target, api);
+  const ownedParent = allowedParents
+    .map((parent) => canonicalLexical(parent, api))
+    .filter((parent) => isWithin(candidate, parent, api))
+    .sort((first, second) => second.length - first.length)[0];
+  if (ownedParent === undefined) return false;
+  const ownedIndex = left.entries.findIndex(
+    (entry) => canonicalLexical(entry.path, api) === ownedParent,
+  );
+  if (ownedIndex < 0) return false;
+  return left.entries
+    .slice(ownedIndex)
+    .every(
+      (entry, index) =>
+        entry.changedNanoseconds ===
+        right.entries[ownedIndex + index]?.changedNanoseconds,
+    );
 }
 
 /** Validate a directory that will be created or reused without following a link. */

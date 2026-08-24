@@ -72,6 +72,14 @@ test("the public outputs are stable and documented", async () => {
   ]);
 });
 
+test("merge-queue commits receive the compatibility sweep", async () => {
+  const workflow = await readFile(
+    ".github/workflows/compatibility.yml",
+    "utf8",
+  );
+  assert.match(workflow, /merge_group:\n\s+types:\s*\[checks_requested\]/);
+});
+
 test("runtime discovery does not silently invent a hosted-runner home", async () => {
   const runtime = await readFile("src/runtime.ts", "utf8");
   assert.doesNotMatch(runtime, /\/home\/runner(?:\/|\b)/);
@@ -133,7 +141,7 @@ test("compiled test discovery fails closed when no tests exist", async () => {
     ) as { scripts?: Record<string, string> };
     assert.equal(
       packageDocument.scripts?.test,
-      "npm run clean && tsc --project tsconfig.json && node scripts/run-tests.mjs build/test",
+      "npm run test:runtime && npm run clean && tsc --project tsconfig.json && node scripts/run-tests.mjs build/test",
     );
   } finally {
     await rm(emptyDirectory, { force: true, recursive: true });
@@ -156,6 +164,32 @@ test("pre-commit hooks use only repository-locked system tools", async () => {
   assert.match(configuration, /args: \["--maxkb=1024", "--enforce-all"\]/);
   assert.match(configuration, /entry: node_modules\/\.bin\/markdownlint-cli2/);
   assert.match(configuration, /entry: node_modules\/\.bin\/actionlint/);
+});
+
+test("the local test suite runs a dependency-free runtime smoke", async () => {
+  const packageDocument = JSON.parse(
+    await readFile("package.json", "utf8"),
+  ) as { scripts?: Record<string, string> };
+  assert.match(packageDocument.scripts?.test ?? "", /npm run test:runtime/);
+  assert.equal(
+    packageDocument.scripts?.["test:runtime"],
+    "node --test scripts/runtime-smoke.test.mjs && node scripts/runtime-smoke.mjs",
+  );
+  const smoke = [
+    await readFile("scripts/runtime-smoke.mjs", "utf8"),
+    await readFile("scripts/runtime-smoke-lib.mjs", "utf8"),
+    await readFile("scripts/runtime-smoke.test.mjs", "utf8"),
+  ].join("\n");
+  assert.match(smoke, /\/bin\/bash/);
+  assert.match(smoke, /\/bin\/sh/);
+  assert.match(smoke, /\/usr\/bin\/python3/);
+  assert.match(smoke, /\/usr\/bin\/perl/);
+  assert.match(smoke, /awk/);
+  assert.match(smoke, /WindowsPowerShell/);
+  assert.match(smoke, /cmd\.exe/);
+  assert.match(smoke, /py\.exe/);
+  assert.match(smoke, /present-but-broken candidates/);
+  assert.doesNotMatch(smoke, /\b(?:apt|brew|choco|dnf|pip|npm)\b/);
 });
 
 test("platform smoke covers dependency-free image runtimes", async () => {
@@ -183,13 +217,28 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.match(action, /raise RuntimeError\("Python JSON round trip failed"\)/);
   assert.match(action, /bash_runtime=\/bin\/bash/);
   assert.match(action, /sh_runtime=\/bin\/sh/);
-  assert.match(
-    action,
-    /for candidate_path in \/usr\/bin\/python3 \/usr\/bin\/python/,
+  const unixRuntimeSection = action.slice(
+    unixRuntimeIndex,
+    windowsRuntimeIndex,
   );
+  const windowsRuntimeSection = action.slice(windowsRuntimeIndex, cleanupIndex);
+  assert.match(unixRuntimeSection, /python_runtime=\/usr\/bin\/python3/);
+  assert.match(unixRuntimeSection, /"\$python_runtime" -I -S -c/);
+  assert.match(unixRuntimeSection, /SMOKE_PYTHON_PRESENT=1/);
+  assert.match(unixRuntimeSection, /SMOKE_PYTHON_PRESENT=0/);
   assert.match(action, /perl_runtime=\/usr\/bin\/perl/);
+  assert.match(action, /awk_runtime=\/usr\/bin\/awk/);
   assert.match(action, /SMOKE_PYTHON_RUNTIME/);
+  assert.match(action, /SMOKE_PYTHON_LAUNCHER/);
+  assert.match(action, /pythonCandidateFound/);
+  assert.match(action, /present but broken/);
+  assert.match(
+    windowsRuntimeSection,
+    /Get-Command \$candidate -CommandType Application -All/,
+  );
   assert.match(action, /SMOKE_PERL_RUNTIME/);
+  assert.match(action, /SMOKE_AWK_RUNTIME/);
+  assert.match(action, /SMOKE_AWK_PRESENT/);
   assert.match(action, /SMOKE_NODE_RUNTIME/);
   assert.match(action, /SMOKE_CMD_RUNTIME/);
   assert.match(action, /System32\\cmd\.exe/);
@@ -198,6 +247,7 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.match(action, /test -f "\$\{SMOKE_ROOT\}\/sh\.txt"/);
   assert.match(action, /test -f "\$\{SMOKE_ROOT\}\/python\.json"/);
   assert.match(action, /test -f "\$\{SMOKE_ROOT\}\/perl\.txt"/);
+  assert.match(action, /test -f "\$\{SMOKE_ROOT\}\/awk\.txt"/);
   assert.match(action, /Test-Path -LiteralPath \$pythonPath -PathType Leaf/);
   assert.match(action, /@\('cmd\.txt', 'powershell\.json', 'node\.json'\)/);
   assert.match(action, /Exercise verified MSI cleanup on Windows/);
@@ -218,12 +268,20 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.match(workflow, /RUN_NATIVE_BIND_MOUNT_TEST=1/);
   assert.match(
     workflow,
-    /Linux hosted smoke rejects a same-device bind mount in both removal helpers/,
+    /Linux hosted smoke rejects a same-device bind mount in every Unix removal helper/,
   );
   assert.match(workflow, /grep -Fx '# pass 1'/);
   assert.match(workflow, /grep -Fx '# fail 0'/);
   assert.match(workflow, /\^# pass 1\\r\?\$/);
   assert.match(workflow, /\$executedTests\.Count -ne 1/);
+  assert.doesNotMatch(workflow, /^  windows-locked-removal:$/m);
+  assert.match(workflow, /Exercise native locked-handle deletion on Windows/);
+  assert.match(workflow, /Exercise native dir-fd deletion on macOS/);
+  assert.match(workflow, /timeout-minutes: 20/);
+  assert.match(
+    workflow,
+    /macOS native privileged removal deletes a root-owned tree without following links/,
+  );
   const recordMaxRuntimes = workflow.indexOf(
     "Record dependency-free OS runtimes before no-input max",
   );
@@ -235,9 +293,46 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.ok(verifyMaxRuntimes > noInputMax);
   assert.match(workflow, /MAX_BASH_RUNTIME=\/bin\/bash/);
   assert.match(workflow, /MAX_SH_RUNTIME=\/bin\/sh/);
-  assert.match(workflow, /MAX_PYTHON_RUNTIME/);
+  assert.match(workflow, /MAX_PYTHON_RUNTIME=\/usr\/bin\/python3/);
+  assert.match(workflow, /"\$MAX_PYTHON_RUNTIME" -I -S -c/);
   assert.match(workflow, /MAX_PERL_RUNTIME/);
   assert.match(workflow, /Python max-profile JSON round trip failed/);
+});
+
+test("deep smoke exercises max without adding long destructive PR jobs", async () => {
+  const workflow = await readFile(".github/workflows/deep-smoke.yml", "utf8");
+  assert.doesNotMatch(workflow, /^\s*pull_request:/m);
+  assert.match(workflow, /^\s*workflow_dispatch:/m);
+  assert.match(workflow, /^\s*schedule:/m);
+  assert.match(workflow, /runs-on: windows-2025/);
+  assert.match(workflow, /runs-on: macos-15/);
+  assert.equal((workflow.match(/cleanup-profile: max/g) ?? []).length, 2);
+  assert.match(workflow, /shell: cmd/);
+  assert.match(
+    workflow,
+    /WindowsPowerShell\\v1\.0\\powershell\.exe -NoLogo -NoProfile/,
+  );
+  assert.match(workflow, /\/usr\/bin\/python3 -I -S -c/);
+  assert.match(workflow, /xcode-select --print-path/);
+  assert.doesNotMatch(
+    workflow,
+    /(?:apt(?:-get)?|brew|choco|dnf|pip|npm) install|actions\/(?:setup-node|setup-python)/i,
+  );
+});
+
+test("public result semantics distinguish absence from unsupported cleanup", async () => {
+  for (const file of [
+    "README.md",
+    "docs/CONFIGURATION.md",
+    "docs/RUNNER-SUPPORT.md",
+  ]) {
+    const document = await readFile(file, "utf8");
+    assert.match(document, /`not-found` means .*safely\s+confirmed\s+absent/is);
+    assert.match(
+      document,
+      /`unsupported` means .*cannot\s+safely\s+perform.*target\s+can\s+remain/is,
+    );
+  }
 });
 
 test("lint bootstrap dependencies are exact and hash locked", async () => {
@@ -250,7 +345,13 @@ test("lint bootstrap dependencies are exact and hash locked", async () => {
   assert.match(workflow, /--require-hashes/);
   assert.match(workflow, /npm ci --ignore-scripts/);
   assert.match(requirements, /^--only-binary=:all:$/m);
-  assert.doesNotMatch(requirements, /^[A-Za-z0-9_.-]+(?:>=|~=|>|<)/m);
+  const dependencyLines = requirements
+    .split(/\r?\n/)
+    .filter((line) => /^[A-Za-z0-9]/.test(line));
+  assert.ok(
+    dependencyLines.every((line) => line.includes("==")),
+    "every lint dependency must use an exact version pin",
+  );
   const pins = [...requirements.matchAll(/^([A-Za-z0-9_.-]+)==([^\s\\]+)/gm)];
   const hashes = [...requirements.matchAll(/--hash=sha256:[a-f0-9]{64}/g)];
   assert.deepEqual(pins.map((match) => match[1]?.toLowerCase()).sort(), [
@@ -278,6 +379,37 @@ test("lint bootstrap dependencies are exact and hash locked", async () => {
       requirements.slice(start, end),
       /--hash=sha256:[a-f0-9]{64}/,
       `${pin[1]} is missing a wheel hash`,
+    );
+  }
+  const pyyamlStart = requirements.indexOf("PyYAML==6.0.3");
+  const pyyamlEnd = requirements.indexOf("\nruamel.yaml==", pyyamlStart);
+  assert.notEqual(pyyamlStart, -1);
+  assert.notEqual(pyyamlEnd, -1);
+  const pyyamlBlock = requirements.slice(pyyamlStart, pyyamlEnd);
+  const pyyamlHashes = new Set(
+    [...pyyamlBlock.matchAll(/--hash=sha256:([a-f0-9]{64})/g)].map(
+      (match) => match[1],
+    ),
+  );
+  assert.equal(
+    pyyamlHashes.size,
+    28,
+    "PyYAML must retain every published CPython 3.12, 3.14, and 3.14t wheel hash",
+  );
+  for (const portableWheelHash of [
+    "7f047e29dcae44602496db43be01ad42fc6f1cc0d8cd6c83d342306c32270196",
+    "fc09d0aa354569bc501d4e787133afc08552722d3ab34836a80547331bb5d4a0",
+    "9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28",
+    "41715c910c881bc081f1e8872880d3c650acf13dfa8214bad49ed4cede7c34ea",
+    "5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b",
+    "64386e5e707d03a7e172c0701abfb7e10f0fb753ee1d773128192742712a98fd",
+    "00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c",
+    "ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b",
+  ]) {
+    assert.equal(
+      pyyamlHashes.has(portableWheelHash),
+      true,
+      `missing portable PyYAML wheel hash ${portableWheelHash}`,
     );
   }
 

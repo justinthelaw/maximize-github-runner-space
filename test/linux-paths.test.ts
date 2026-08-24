@@ -138,6 +138,41 @@ test("Linux resolves command removals only for the active plan", async () => {
   );
 });
 
+test("Linux inventories versioned installations only for enabled components", async () => {
+  const inventories: string[] = [];
+  const createAdapterWithDependencies = createLinuxAdapter as unknown as (
+    context: ReturnType<typeof contextFor>,
+    dependencies: {
+      readonly listVersionedChildren: (
+        parent: string,
+        pattern: RegExp,
+      ) => Promise<readonly string[]>;
+    },
+  ) => ReturnType<typeof createLinuxAdapter>;
+  const adapter = await createAdapterWithDependencies(contextFor("linux"), {
+    listVersionedChildren: async (parent, pattern) => {
+      inventories.push(`${parent}:${pattern.source}`);
+      throw new Error("disabled inventory was inspected");
+    },
+  });
+
+  const operations = await adapter.operations(planFor("azcopy"));
+
+  assert.deepEqual(inventories, []);
+  assert.equal(
+    operations.some(({ id }) => id.startsWith("binary:azcopy:azcopy:")),
+    true,
+  );
+
+  await assert.rejects(
+    async () => await adapter.operations(planFor("julia")),
+    /disabled inventory was inspected/,
+  );
+  assert.deepEqual(inventories, [
+    "/usr/local:^julia\\d+(?:\\.\\d+)+(?:[-+][A-Za-z0-9._-]+)?$",
+  ]);
+});
+
 test("Android cleanup preserves the general Gradle user cache", async () => {
   const adapter = await createLinuxAdapter(contextFor("linux"));
   const operations = await adapter.operations(planFor("android"));
@@ -184,6 +219,23 @@ test("Linux versioned inventories reject rather than truncate excess entries", a
     await assert.rejects(
       async () => await listLinuxVersionedChildren(root, /^version-\d+$/),
       /exceeded 64 entries/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux versioned inventories bound all inspected entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-inventory-bound-"));
+  try {
+    await Promise.all(
+      Array.from({ length: 257 }, async (_, index) => {
+        await mkdir(join(root, `unrelated-${index}`));
+      }),
+    );
+    await assert.rejects(
+      async () => await listLinuxVersionedChildren(root, /^version-\d+$/),
+      /inventory.*exceeded 256 inspected entries/i,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

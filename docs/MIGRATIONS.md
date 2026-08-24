@@ -6,6 +6,19 @@ Use these notes when moving between action releases. See the [configuration refe
 
 The next release changes failure handling and several cleanup boundaries:
 
+Before upgrading:
+
+- Start with `custom`; enable only components the job does not need.
+- If a later step needs Docker, keep `docker-engine`. In `max`, also keep
+  `docker-images` to preserve existing Docker data. In `custom`, selecting
+  Engine cleanup deletes the whole runner Docker data root.
+- On Windows, keep `powershell`, `windows-sdk`, or `visual-studio` when later
+  steps need them. Installer restart codes now fail the cleanup step.
+- Run cleanup before checkout and test the exact commit SHA on every runner
+  family your workflow uses.
+
+Key changes:
+
 - Incomplete or changed package, service, and installer inventories fail closed.
 - Any cleanup failure now fails the step and stops later cleanup. A
   preflight-only failure restarts safely stopped services. Once payload cleanup
@@ -23,6 +36,9 @@ The next release changes failure handling and several cleanup boundaries:
   Linux.
   Windows recursive deletion locks the validated path and removes entries by
   native handle, including reparse points.
+- Each recursive traversal is capped at 2,000,000 entries, depth 256, and 10
+  minutes of traversal work.
+  Versioned-directory discovery inspects at most 256 entries for 10 seconds.
 - Recreated broad hosted-toolcache directories must be writable.
 
 Windows changes:
@@ -30,8 +46,8 @@ Windows changes:
 - `windows-sdk` also removes registered standalone SDK/WDK bundles. Preserve
   that component when a later step needs either standalone or Visual Studio
   SDK payloads.
-- Installer exit `3010` remains successful only after the removal check passes.
-- Installer exit `1641` stops all later cleanup because restart has begun.
+- Installer exit `3010` or `1641` stops all later cleanup. The action never
+  continues after an installer requests or starts a restart.
 - Executable uninstallers verify their exact residual installation root.
 - Selected Chocolatey cleanup fails preflight when its fixed executable or
   inventory cannot be verified.
@@ -43,6 +59,16 @@ Windows changes:
   runner-user tool, state, and cache roots under `C:\Users\runneradmin`.
 - Windows Docker cleanup removes non-service payloads first, unregisters and
   verifies the exact stopped service, then removes its service executable.
+- Selected Windows services are disabled before they are stopped. Pre-payload
+  rollback restores original start modes before restarting services that were
+  running. Later service-owned operations recheck the disabled, stopped state.
+- Apache, Nginx, and PostgreSQL service registrations may disappear through
+  their verified uninstallers. Cleanup accepts absence, finalizes it, and
+  rejects any later recreation.
+- Locked descendant checks run after reversible service stops and before any
+  package or filesystem payload is removed.
+- Selected toolcache cleanup requires the standard
+  `C:\hostedtoolcache\windows` runner context.
 - Visual Studio and SDK checks keep using the same verified `vswhere.exe`.
 
 macOS changes:
@@ -60,21 +86,28 @@ macOS changes:
 Linux and Docker changes:
 
 - Apt cleanup no longer runs global `autoremove`. It removes selected packages
-  and clears downloaded archives, which may reclaim less space.
+  and clears downloaded archives, which may reclaim less space. A selection
+  above 512 packages now fails before elevation.
 - Linuxbrew cleanup no longer runs `brew` or removes installed packages. It
   removes only the exact `~/.cache/Homebrew` cache and preserves the prefix.
 - Android cleanup preserves the general `~/.gradle` cache.
 - Apache cleanup preserves the shared `/var/www` document root.
 - Shared Podman/Buildah storage is removed only when both components are
   selected.
+- Selected systemd units are stopped and runtime-masked before payload cleanup.
+  Pre-payload rollback removes the masks and restores originally active units.
 - Docker image pruning removes anonymous volumes but keeps named volumes.
 - Docker Engine removal still deletes the runner Docker data root.
+- If Engine and image cleanup are both selected, Engine removal covers the data
+  root and the separate prune is skipped.
 
 Swap changes:
 
 - Kernel state is checked after every `swapon` and `swapoff` attempt.
 - `/mnt` and `/etc` must have stable, trusted, non-writable ownership. Every
   private mode-`0600` staging file is identity-checked before mutation.
+- The atomic `fstab` helper rechecks the pinned `/etc` identity and mount ID at
+  the final commit point.
 - Exact `fstab` content is staged and atomically exchanged with the live file
   for both additions and removals.
 - The new live file and displaced original are verified after the exchange,
@@ -83,6 +116,9 @@ Swap changes:
 - Swapfile backup, installation, and restoration moves are accepted only when
   the destination has the exact captured file identity. Ambiguous `fstab`
   commits are classified by exact file identity and content.
+- Private swap and `fstab` cleanup quarantines the captured inode before
+  unlinking it. Under the protected-parent boundary, a replacement detected at
+  that commit point is retained and fails safely.
 - Failed commits restore and verify the captured original before backing files
   are removed. If recovery cannot be proven, needed files are retained and the
   action stops.

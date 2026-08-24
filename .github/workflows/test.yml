@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test_name='Linux hosted smoke rejects a same-device bind mount in both removal helpers'
+          test_name='Linux hosted smoke rejects a same-device bind mount in every Unix removal helper'
           node_runtime="$(command -v node)"
           set +e
           output="$(sudo env RUN_NATIVE_BIND_MOUNT_TEST=1 "$node_runtime" \
@@ -66,66 +66,6 @@ jobs:
 
       - name: Verify committed action bundle
         run: npm run check-dist
-
-  windows-locked-removal:
-    name: Windows locked removal (${{ matrix.architecture }})
-    needs: static-validation
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: windows-latest
-            architecture: x64
-          - runner: windows-11-arm
-            architecture: arm64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Use the minimum supported Node.js version
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.0.0"
-          package-manager-cache: false
-
-      - name: Install locked test dependencies
-        run: npm ci --ignore-scripts
-
-      - name: Compile tests
-        run: .\node_modules\.bin\tsc.cmd --project tsconfig.json
-
-      - name: Exercise native locked-handle deletion
-        shell: pwsh
-        env:
-          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
-        run: |
-          $architecture = node -p "process.arch"
-          if ($architecture -ne $env:EXPECTED_ARCHITECTURE) {
-            throw "Expected Node architecture $env:EXPECTED_ARCHITECTURE, got $architecture."
-          }
-          $testName = 'Windows hosted smoke removes a target through native locked handles'
-          $testLines = & node --test --test-reporter=tap --test-name-pattern "^$([regex]::Escape($testName))$" build/test/safety.test.js 2>&1
-          $testExitCode = $LASTEXITCODE
-          $testOutput = $testLines -join [Environment]::NewLine
-          Write-Output $testOutput
-          if ($testExitCode -ne 0) {
-            throw "Native locked-handle test exited $testExitCode."
-          }
-          $executedPattern = "(?m)^ok \d+ - $([regex]::Escape($testName))\r?$"
-          $executedTests = [regex]::Matches($testOutput, $executedPattern)
-          if ($executedTests.Count -ne 1) {
-            throw "Expected exactly one native locked-handle test, found $($executedTests.Count)."
-          }
-          if ($testOutput -notmatch '(?m)^# pass 1\r?$') {
-            throw 'Native locked-handle test did not report exactly one pass.'
-          }
-          if ($testOutput -notmatch '(?m)^# fail 0\r?$') {
-            throw 'Native locked-handle test reported a failure.'
-          }
 
   ubuntu-x64:
     name: Ubuntu x64 compatibility
@@ -174,7 +114,7 @@ jobs:
           [[ "$FAILED_OPERATIONS" == 0 ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Reject an unsafe oversized replacement
         id: oversized
@@ -193,7 +133,7 @@ jobs:
           [[ "$OUTCOME" == failure ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Assert protected and removable fixtures exist
         shell: bash
@@ -249,7 +189,7 @@ jobs:
           command -v google-chrome >/dev/null
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Prepare disposable Docker prune fixtures
         shell: bash
@@ -345,7 +285,7 @@ jobs:
           fi
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
 
       - name: Record dependency-free OS runtimes before no-input max
         shell: bash
@@ -355,13 +295,8 @@ jobs:
           mkdir -p "$runtime_root"
           test -x /bin/bash
           test -x /bin/sh
-          python_runtime=""
-          for candidate in /usr/bin/python3 /usr/bin/python; do
-            if [[ -x "$candidate" ]]; then
-              python_runtime="$candidate"
-              break
-            fi
-          done
+          test -x /usr/bin/python3
+          /usr/bin/python3 -I -S -c 'import json; assert json.loads(json.dumps({"status": "ok"}))["status"] == "ok"'
           perl_runtime=""
           if [[ -x /usr/bin/perl ]]; then
             perl_runtime=/usr/bin/perl
@@ -370,7 +305,7 @@ jobs:
             echo "MAX_RUNTIME_ROOT=$runtime_root"
             echo "MAX_BASH_RUNTIME=/bin/bash"
             echo "MAX_SH_RUNTIME=/bin/sh"
-            echo "MAX_PYTHON_RUNTIME=$python_runtime"
+            echo "MAX_PYTHON_RUNTIME=/usr/bin/python3"
             echo "MAX_PERL_RUNTIME=$perl_runtime"
           } >>"$GITHUB_ENV"
 
@@ -386,11 +321,9 @@ jobs:
           "$MAX_SH_RUNTIME" -c 'printf "%s\n" sh-max' >"${MAX_RUNTIME_ROOT}/sh.txt"
           grep -Fx bash-max "${MAX_RUNTIME_ROOT}/bash.txt"
           grep -Fx sh-max "${MAX_RUNTIME_ROOT}/sh.txt"
-          if [[ -n "$MAX_PYTHON_RUNTIME" ]]; then
-            if ! "$MAX_PYTHON_RUNTIME" -c 'import json; value = {"profile": "max", "runtime": "python"}; raise SystemExit(0 if json.loads(json.dumps(value)) == value else 1)'; then
-              echo "Python max-profile JSON round trip failed." >&2
-              exit 1
-            fi
+          if ! "$MAX_PYTHON_RUNTIME" -I -S -c 'import json; value = {"profile": "max", "runtime": "python"}; raise SystemExit(0 if json.loads(json.dumps(value)) == value else 1)'; then
+            echo "Python max-profile JSON round trip failed." >&2
+            exit 1
           fi
           if [[ -n "$MAX_PERL_RUNTIME" ]]; then
             "$MAX_PERL_RUNTIME" -e 'print "perl-max\n"' >"${MAX_RUNTIME_ROOT}/perl.txt"
@@ -417,7 +350,7 @@ jobs:
           [[ "$ARCHITECTURE" == x64 ]]
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
+          grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
           test ! -e /usr/share/dotnet
           test -x /home/linuxbrew/.linuxbrew/bin/brew
 
@@ -436,7 +369,7 @@ jobs:
             echo "/mnt/swapfile is still active" >&2
             exit 1
           fi
-          if grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
+          if grep -Eq '^[[:blank:]]*/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab; then
             echo "/mnt/swapfile still has an fstab entry" >&2
             exit 1
           fi
@@ -474,12 +407,89 @@ jobs:
             platform: macos
             architecture: x64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Use the minimum supported Node.js version for native removal tests
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.0.0"
+          package-manager-cache: false
+
+      # cmd resolves setup-node's npm.cmd before the runner's stale global
+      # PowerShell npm.ps1 shim on both Windows architectures.
+      - name: Install locked test dependencies on Windows
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: call npm.cmd ci --ignore-scripts
+
+      - name: Compile native removal tests on Windows
+        if: matrix.platform == 'windows'
+        shell: cmd
+        run: call .\node_modules\.bin\tsc.cmd --project tsconfig.json
+
+      - name: Install and compile native removal tests on macOS
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts
+          ./node_modules/.bin/tsc --project tsconfig.json
+
+      - name: Exercise native locked-handle deletion on Windows
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          $architecture = node -p "process.arch"
+          if ($architecture -ne $env:EXPECTED_ARCHITECTURE) {
+            throw "Expected Node architecture $env:EXPECTED_ARCHITECTURE, got $architecture."
+          }
+          $testName = 'Windows hosted smoke removes a target through native locked handles'
+          $testLines = & node --test --test-reporter=tap --test-name-pattern "^$([regex]::Escape($testName))$" build/test/safety.test.js 2>&1
+          $testExitCode = $LASTEXITCODE
+          $testOutput = $testLines -join [Environment]::NewLine
+          Write-Output $testOutput
+          if ($testExitCode -ne 0) {
+            throw "Native locked-handle test exited $testExitCode."
+          }
+          $executedPattern = "(?m)^ok \d+ - $([regex]::Escape($testName))\r?$"
+          $executedTests = [regex]::Matches($testOutput, $executedPattern)
+          if ($executedTests.Count -ne 1) {
+            throw "Expected exactly one native locked-handle test, found $($executedTests.Count)."
+          }
+          if ($testOutput -notmatch '(?m)^# pass 1\r?$') {
+            throw 'Native locked-handle test did not report exactly one pass.'
+          }
+          if ($testOutput -notmatch '(?m)^# fail 0\r?$') {
+            throw 'Native locked-handle test reported a failure.'
+          }
+
+      - name: Exercise native dir-fd deletion on macOS
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_name='macOS native privileged removal deletes a root-owned tree without following links'
+          set +e
+          output="$(node \
+            --test \
+            --test-reporter=tap \
+            --test-name-pattern "^${test_name}$" \
+            build/test/safety.test.js 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          (( status == 0 ))
+          grep -Eq "^ok [0-9]+ - ${test_name}$" <<<"$output"
+          grep -Fx '# pass 1' <<<"$output"
+          grep -Fx '# fail 0' <<<"$output"
 
       - name: Assert Windows PostgreSQL fixture and service exist
         if: matrix.platform == 'windows' && matrix.architecture == 'x64'
@@ -521,12 +531,11 @@ jobs:
           if ($env:FAILED_OPERATIONS -ne '0') {
             throw 'A PostgreSQL cleanup operation failed.'
           }
-          $running = @(
-            Get-Service -Name 'postgresql-*' -ErrorAction SilentlyContinue |
-              Where-Object Status -ne 'Stopped'
+          $remainingServices = @(
+            Get-Service -Name 'postgresql-*' -ErrorAction SilentlyContinue
           )
-          if ($running.Count -ne 0) {
-            throw "PostgreSQL service is still running: $($running.Name -join ', ')"
+          if ($remainingServices.Count -ne 0) {
+            throw "PostgreSQL service registrations remain: $($remainingServices.Name -join ', ')"
           }
           if (Test-Path -LiteralPath $env:POSTGRES_DATA_ROOT) {
             throw "PostgreSQL data root still exists: $env:POSTGRES_DATA_ROOT"

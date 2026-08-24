@@ -168,7 +168,7 @@ inputs:
 
   # Containers, build tools, and languages
   remove-docker-engine:
-    description: "Stops and removes Docker Engine packages, helpers, data, and its exact Windows service registration where installed"
+    description: "Stops and removes Docker Engine, helpers, and its exact Windows service; custom also removes runner data. In max, skip docker-images to keep that data"
     required: false
     default: "false"
   remove-buildah:
@@ -202,7 +202,7 @@ inputs:
 
   # Services and databases
   remove-postgresql:
-    description: "Removes PostgreSQL packages and runner data where installed"
+    description: "Removes PostgreSQL packages, runner data, and exact Windows service registrations where installed"
     required: false
     default: "false"
   remove-mysql:
@@ -210,17 +210,17 @@ inputs:
     required: false
     default: "false"
   remove-apache:
-    description: "Removes Apache HTTP Server where installed"
+    description: "Removes Apache HTTP Server and its exact Windows service registration where installed"
     required: false
     default: "false"
   remove-nginx:
-    description: "Removes Nginx where installed"
+    description: "Removes Nginx and its exact Windows service registration where installed"
     required: false
     default: "false"
 
   # Broad and platform-specific cleanup
   remove-docker-images:
-    description: "Removes unused Docker containers, images, build cache, networks, and anonymous volumes; retains named volumes"
+    description: "Prunes unused Docker data when the engine is kept; named volumes stay. Engine removal covers this when both are selected"
     required: false
     default: "false"
   remove-large-packages:

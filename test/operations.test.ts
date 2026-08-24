@@ -237,6 +237,125 @@ test("a preflight failure rolls back earlier reversible preflight state", async 
   assert.deepEqual(executionOrder, ["stop", "preflight", "restart"]);
 });
 
+test("post-preflight validation rolls back services before payload mutation", async () => {
+  const events: string[] = [];
+  const service = createFunctionOperation({
+    id: "service-stop-before-lock-probe",
+    component: "postgresql",
+    description: "stop PostgreSQL",
+    phase: "preflight",
+    rollback: async () => {
+      events.push("service-restarted");
+    },
+    run: async () => {
+      events.push("service-stopped");
+      return { status: "removed" };
+    },
+  });
+  const payload = createFunctionOperation({
+    id: "payload-after-lock-probe",
+    component: "postgresql",
+    description: "remove PostgreSQL payload",
+    phase: "filesystem",
+    validateAfterPreflight: async () => {
+      events.push("lock-probe");
+      throw new Error("locked descendant remains");
+    },
+    run: async () => {
+      events.push("payload-removed");
+      return { status: "removed" };
+    },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([service, payload]),
+    /locked descendant remains/,
+  );
+  assert.deepEqual(events, [
+    "service-stopped",
+    "lock-probe",
+    "service-restarted",
+  ]);
+});
+
+test("final post-preflight barriers run after ordinary lock probes", async () => {
+  const events: string[] = [];
+  const preflight = createFunctionOperation({
+    id: "preflight",
+    component: "postgresql",
+    description: "preflight",
+    phase: "preflight",
+    run: async () => ({ status: "removed" }),
+  });
+  const finalBarrier = createFunctionOperation({
+    id: "final-service-barrier",
+    component: "postgresql",
+    description: "final service barrier",
+    phase: "system",
+    validateAfterPreflightLast: true,
+    validateAfterPreflight: async () => {
+      events.push("service-barrier");
+    },
+    run: async () => ({ status: "not-found" }),
+  });
+  const lockProbe = createFunctionOperation({
+    id: "ordinary-lock-probe",
+    component: "postgresql",
+    description: "ordinary lock probe",
+    phase: "filesystem",
+    validateAfterPreflight: async () => {
+      events.push("lock-probe");
+    },
+    run: async () => ({ status: "not-found" }),
+  });
+
+  await executeOperations([preflight, finalBarrier, lockProbe]);
+
+  assert.deepEqual(events, ["lock-probe", "service-barrier"]);
+});
+
+test("immediate validation failure rolls back before payload mutation", async () => {
+  const events: string[] = [];
+  const service = createFunctionOperation({
+    id: "service-stop",
+    component: "postgresql",
+    description: "stop service",
+    phase: "preflight",
+    rollback: async () => {
+      events.push("service-restarted");
+    },
+    run: async () => {
+      events.push("service-stopped");
+      return { status: "removed" };
+    },
+  });
+  const payload = createFunctionOperation({
+    id: "guarded-payload",
+    component: "postgresql",
+    description: "guarded payload",
+    phase: "package",
+    validateBeforeRun: async () => {
+      events.push("immediate-check");
+      throw new Error("service reactivated");
+    },
+    run: async () => {
+      events.push("payload-removed");
+      return { status: "removed" };
+    },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([service, payload]),
+    /service reactivated/,
+  );
+
+  assert.deepEqual(events, [
+    "service-stopped",
+    "immediate-check",
+    "service-restarted",
+  ]);
+});
+
 test("safe housekeeping may roll back after payload cleanup starts", async () => {
   const executionOrder: string[] = [];
   const housekeeping = createFunctionOperation({

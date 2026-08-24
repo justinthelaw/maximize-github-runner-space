@@ -89,9 +89,10 @@ remove or preserve.
 
 Supported: standard ephemeral GitHub-hosted Ubuntu, Windows, and macOS runners,
 plus `ubuntu-slim`. Self-hosted runners, larger runners, and arbitrary job
-containers are not supported. A safely confirmed-absent cleanup target reports
-`not-found` or `unsupported`. A missing required cleanup utility or incomplete
-inventory fails closed.
+containers are not supported. `not-found` means a cleanup target was safely
+confirmed absent. `unsupported` means the recognized runner cannot safely
+perform that operation, so its target can remain. A missing required cleanup
+utility or incomplete inventory fails closed.
 
 Before cleanup, the action checks fixed runner-image metadata and validates the
 complete plan. Destructive commands use fixed executable paths, restricted

@@ -5,6 +5,7 @@ import {
   open,
   opendir,
   readFile,
+  realpath,
   rm,
   rmdir,
   unlink,
@@ -18,6 +19,7 @@ import {
   runElevated,
   sameCommandFileIdentity,
   UnconfirmedCommandTerminationError,
+  UntrustedUnixExecutableError,
   type CommandFileIdentity,
   type CommandOptions,
 } from "./command.js";
@@ -27,6 +29,7 @@ import {
   captureSafeRemovalBoundary,
   inspectTarget,
   sameRemovalBoundary,
+  sameRemovalBoundaryExact,
   type RemovalBoundarySnapshot,
 } from "./safety.js";
 import type {
@@ -46,6 +49,7 @@ export interface RemovePathOptions {
   readonly target: string;
   readonly allowedParents: readonly string[];
   readonly context: RuntimeContext;
+  readonly phase?: OperationPhase;
   readonly blockedBy?: readonly ComponentId[];
   readonly coveredBy?: readonly ComponentId[];
 }
@@ -64,6 +68,9 @@ export interface RemovePathDependencies {
     context: RuntimeContext,
   ) => Promise<void>;
   readonly inspectExecutable?: typeof inspectExecutable;
+  readonly resolveExecutable?: ResolveExecutable;
+  readonly expectedPrivilegedPythonRuntime?: PrivilegedPythonRuntime;
+  readonly expectedWindowsRemovalRuntime?: WindowsRemovalRuntime;
   readonly commandRunner?: (
     executable: string,
     args: readonly string[],
@@ -75,6 +82,53 @@ export interface RemovePathDependencies {
   readonly remove?: typeof rm;
   readonly unlink?: typeof unlink;
   readonly elevate?: typeof runElevated;
+  readonly traversalLimits?: RemovalTraversalLimits;
+}
+
+export interface RemovalTraversalLimits {
+  readonly maxEntries?: number;
+  readonly maxDepth?: number;
+  readonly timeoutMs?: number;
+  /** Test-only monotonic clock override for in-process removal. */
+  readonly now?: () => number;
+}
+
+const MAX_REMOVAL_ENTRIES = 2_000_000;
+const MAX_REMOVAL_DEPTH = 256;
+const MAX_REMOVAL_TIMEOUT_MS = 10 * 60_000;
+
+class RemovalTraversalLimitError extends Error {
+  override readonly name = "RemovalTraversalLimitError";
+}
+
+interface NormalizedRemovalTraversalLimits {
+  readonly maxEntries: number;
+  readonly maxDepth: number;
+  readonly timeoutMs: number;
+  readonly now: () => number;
+}
+
+function normalizedRemovalTraversalLimits(
+  limits: RemovalTraversalLimits = {},
+): NormalizedRemovalTraversalLimits {
+  const normalized = {
+    maxEntries: limits.maxEntries ?? MAX_REMOVAL_ENTRIES,
+    maxDepth: limits.maxDepth ?? MAX_REMOVAL_DEPTH,
+    timeoutMs: limits.timeoutMs ?? MAX_REMOVAL_TIMEOUT_MS,
+    now: limits.now ?? (() => performance.now()),
+  };
+  for (const [label, value, maximum] of [
+    ["entry", normalized.maxEntries, MAX_REMOVAL_ENTRIES],
+    ["depth", normalized.maxDepth, MAX_REMOVAL_DEPTH],
+    ["timeout", normalized.timeoutMs, MAX_REMOVAL_TIMEOUT_MS],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+      throw new Error(
+        `anchored removal ${label} limit must be an integer from 1 to ${maximum}`,
+      );
+    }
+  }
+  return normalized;
 }
 
 const PRIVILEGED_ANCHORED_REMOVE_SOURCE = String.raw`
@@ -88,11 +142,52 @@ for await (const chunk of process.stdin) {
   if (input.length > 131072) throw new Error("anchored removal input exceeded 128 KiB");
 }
 const spec = JSON.parse(input.toString("utf8"));
+if (
+  !Array.isArray(spec.entries) ||
+  spec.entries.length === 0 ||
+  spec.entries.length > 512
+) throw new Error("anchored removal boundary is malformed");
+const boundedInteger = (value, maximum, label) => {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    throw new Error("anchored removal has an invalid " + label + " limit");
+  }
+  return value;
+};
+const limits = {
+  maxEntries: boundedInteger(spec.limits?.maxEntries, 2000000, "entry"),
+  maxDepth: boundedInteger(spec.limits?.maxDepth, 256, "depth"),
+  timeoutMs: boundedInteger(spec.limits?.timeoutMs, 600000, "timeout"),
+};
+const traversalStarted = performance.now();
+let traversedEntries = 0;
+const checkTraversal = (depth, countEntry = false) => {
+  if (depth > limits.maxDepth) {
+    throw new Error("anchored removal traversal exceeded depth " + limits.maxDepth);
+  }
+  if (countEntry) traversedEntries += 1;
+  if (traversedEntries > limits.maxEntries) {
+    throw new Error("anchored removal traversal exceeded " + limits.maxEntries + " entries");
+  }
+  if (performance.now() - traversalStarted >= limits.timeoutMs) {
+    throw new Error("anchored removal traversal exceeded its time limit");
+  }
+};
+const optionalBigInt = (value, label) => {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) {
+    throw new Error("anchored removal boundary has an invalid " + label);
+  }
+  return BigInt(value);
+};
 const expected = new Map(
   spec.entries.map((entry) => [entry.path, {
     device: BigInt(entry.device),
     inode: BigInt(entry.inode),
     mode: BigInt(entry.mode),
+    userId: optionalBigInt(entry.userId, "owner"),
+    groupId: optionalBigInt(entry.groupId, "group"),
+    birthtimeNanoseconds: optionalBigInt(entry.birthtimeNanoseconds, "birth time"),
+    changedNanoseconds: optionalBigInt(entry.changedNanoseconds, "change time"),
   }]),
 );
 const descriptorPath = (fd) =>
@@ -103,7 +198,15 @@ const expectedAt = (path) => {
   return entry;
 };
 const same = (entry, stat) =>
-  entry.device === stat.dev && entry.inode === stat.ino && entry.mode === stat.mode;
+  entry.device === stat.dev &&
+  entry.inode === stat.ino &&
+  entry.mode === stat.mode &&
+  (entry.userId === undefined || entry.userId === stat.uid) &&
+  (entry.groupId === undefined || entry.groupId === stat.gid) &&
+  (entry.birthtimeNanoseconds === undefined ||
+    entry.birthtimeNanoseconds === stat.birthtimeNs) &&
+  (entry.changedNanoseconds === undefined ||
+    entry.changedNanoseconds === stat.ctimeNs);
 const assertSameFilesystem = (expectedDevice, actualDevice, path) => {
   if (expectedDevice !== actualDevice) {
     throw new Error("refusing cleanup path that crosses a mounted filesystem at '" + path + "'");
@@ -149,15 +252,72 @@ const openDirectory = async (path, displayPath) => {
     throw error;
   }
 };
+const assertDirectoryAttached = async (
+  directory,
+  parent,
+  name,
+  expectedDirectory,
+  displayDirectory,
+) => {
+  const path = posix.join(descriptorPath(parent.fd), name);
+  let current;
+  try {
+    current = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR", "ELOOP"].includes(error?.code ?? "")) {
+      throw new Error(
+        "cleanup directory moved outside its anchored parent at '" +
+          displayDirectory +
+          "'",
+      );
+    }
+    throw error;
+  }
+  const opened = await directory.stat({ bigint: true });
+  if (
+    current.dev !== expectedDirectory.device ||
+    current.ino !== expectedDirectory.inode ||
+    current.mode !== expectedDirectory.mode ||
+    opened.dev !== expectedDirectory.device ||
+    opened.ino !== expectedDirectory.inode ||
+    opened.mode !== expectedDirectory.mode
+  ) {
+    throw new Error(
+      "cleanup directory moved outside its anchored parent at '" +
+        displayDirectory +
+        "'",
+    );
+  }
+};
 const removeContents = async (
   directory,
   expectedDevice,
   expectedMountId,
   displayDirectory,
+  parent,
+  name,
+  expectedDirectory,
+  depth,
 ) => {
+  checkTraversal(depth);
+  await assertDirectoryAttached(
+    directory,
+    parent,
+    name,
+    expectedDirectory,
+    displayDirectory,
+  );
   const root = descriptorPath(directory.fd);
   const entries = await opendir(root);
   for await (const entry of entries) {
+    checkTraversal(depth, true);
+    await assertDirectoryAttached(
+      directory,
+      parent,
+      name,
+      expectedDirectory,
+      displayDirectory,
+    );
     if (entry.name === "." || entry.name === ".." || entry.name.includes("/")) {
       throw new Error("directory returned an unsafe entry name");
     }
@@ -186,15 +346,50 @@ const removeContents = async (
           expectedDevice,
           expectedMountId,
           displayChild,
+          directory,
+          entry.name,
+          { device: opened.dev, inode: opened.ino, mode: opened.mode },
+          depth + 1,
         );
+        await assertDirectoryAttached(
+          directory,
+          parent,
+          name,
+          expectedDirectory,
+          displayDirectory,
+        );
+        checkTraversal(depth);
+        await rmdir(child);
       } finally {
         await childHandle?.close().catch(() => undefined);
       }
-      await rmdir(child);
     } else {
+      const immediate = await lstat(child, { bigint: true });
+      if (
+        before.dev !== immediate.dev ||
+        before.ino !== immediate.ino ||
+        before.mode !== immediate.mode
+      ) {
+        throw new Error("directory entry changed before removal: '" + displayChild + "'");
+      }
+      await assertDirectoryAttached(
+        directory,
+        parent,
+        name,
+        expectedDirectory,
+        displayDirectory,
+      );
+      checkTraversal(depth);
       await unlink(child);
     }
   }
+  await assertDirectoryAttached(
+    directory,
+    parent,
+    name,
+    expectedDirectory,
+    displayDirectory,
+  );
 };
 
 const target = posix.normalize(posix.resolve(spec.target));
@@ -242,12 +437,23 @@ try {
         targetMountId,
         target,
       );
-      await removeContents(targetHandle, opened.dev, targetMountId, target);
+      await removeContents(
+        targetHandle,
+        opened.dev,
+        targetMountId,
+        target,
+        parent,
+        name,
+        { device: opened.dev, inode: opened.ino, mode: opened.mode },
+        0,
+      );
+      checkTraversal(0);
+      await rmdir(anchoredTarget);
     } finally {
       await targetHandle?.close().catch(() => undefined);
     }
-    await rmdir(anchoredTarget);
   } else {
+    checkTraversal(0);
     await unlink(anchoredTarget);
   }
 } finally {
@@ -255,11 +461,419 @@ try {
 }
 `;
 
+const PRIVILEGED_PYTHON_ANCHORED_REMOVE_SOURCE = String.raw`
+import ctypes
+import errno
+import json
+import os
+import posixpath
+import re
+import stat
+import sys
+import time
+
+MAX_INPUT_BYTES = 131072
+
+payload = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+if len(payload) > MAX_INPUT_BYTES:
+    raise RuntimeError("anchored removal input exceeded 128 KiB")
+spec = json.loads(payload.decode("utf-8"))
+if not isinstance(spec, dict) or not isinstance(spec.get("target"), str):
+    raise RuntimeError("anchored removal input is malformed")
+if not isinstance(spec.get("entries"), list) or not 1 <= len(spec["entries"]) <= 512:
+    raise RuntimeError("anchored removal boundary is malformed")
+
+def bounded_integer(value, maximum, label):
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise RuntimeError("anchored removal has an invalid " + label + " limit")
+    return value
+
+limits = spec.get("limits")
+if not isinstance(limits, dict):
+    raise RuntimeError("anchored removal traversal limits are malformed")
+max_entries = bounded_integer(limits.get("maxEntries"), 2000000, "entry")
+max_depth = bounded_integer(limits.get("maxDepth"), 256, "depth")
+timeout_ms = bounded_integer(limits.get("timeoutMs"), 600000, "timeout")
+traversal_started = time.monotonic()
+traversed_entries = 0
+
+def check_traversal(depth, count_entry=False):
+    global traversed_entries
+    if depth > max_depth:
+        raise RuntimeError("anchored removal traversal exceeded depth " + str(max_depth))
+    if count_entry:
+        traversed_entries += 1
+    if traversed_entries > max_entries:
+        raise RuntimeError("anchored removal traversal exceeded " + str(max_entries) + " entries")
+    if (time.monotonic() - traversal_started) * 1000 >= timeout_ms:
+        raise RuntimeError("anchored removal traversal exceeded its time limit")
+
+def decimal(value, label):
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]+", value) is None:
+        raise RuntimeError("anchored removal boundary has an invalid " + label)
+    return int(value)
+
+expected = {}
+for entry in spec["entries"]:
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        raise RuntimeError("anchored removal boundary entry is malformed")
+    path = entry["path"]
+    if path in expected:
+        raise RuntimeError("anchored removal boundary contains a duplicate path")
+    expected[path] = {
+        "device": decimal(entry.get("device"), "device"),
+        "inode": decimal(entry.get("inode"), "inode"),
+        "mode": decimal(entry.get("mode"), "mode"),
+        "user_id": None if entry.get("userId") is None else decimal(entry.get("userId"), "owner"),
+        "group_id": None if entry.get("groupId") is None else decimal(entry.get("groupId"), "group"),
+        "birthtime_ns": None if entry.get("birthtimeNanoseconds") is None else decimal(entry.get("birthtimeNanoseconds"), "birth time"),
+        "changed_ns": None if entry.get("changedNanoseconds") is None else decimal(entry.get("changedNanoseconds"), "change time"),
+    }
+
+def expected_at(path):
+    entry = expected.get(path)
+    if entry is None:
+        raise RuntimeError("cleanup target boundary changed at '" + path + "'")
+    return entry
+
+def stable_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+
+def assert_same(expected_identity, metadata, path):
+    actual_birthtime_ns = getattr(metadata, "st_birthtime_ns", None)
+    if actual_birthtime_ns is None and hasattr(metadata, "st_birthtime"):
+        actual_birthtime_ns = int(metadata.st_birthtime * 1000000000)
+    if (
+        expected_identity["device"] != metadata.st_dev
+        or expected_identity["inode"] != metadata.st_ino
+        or expected_identity["mode"] != metadata.st_mode
+        or (
+            expected_identity["user_id"] is not None
+            and expected_identity["user_id"] != metadata.st_uid
+        )
+        or (
+            expected_identity["group_id"] is not None
+            and expected_identity["group_id"] != metadata.st_gid
+        )
+        or (
+            expected_identity["birthtime_ns"] is not None
+            and expected_identity["birthtime_ns"] != actual_birthtime_ns
+        )
+        or (
+            expected_identity["changed_ns"] is not None
+            and expected_identity["changed_ns"] != metadata.st_ctime_ns
+        )
+    ):
+        raise RuntimeError(
+            "cleanup target boundary changed before anchored removal at '" + path + "'"
+        )
+
+class DarwinFsid(ctypes.Structure):
+    _fields_ = [("values", ctypes.c_int32 * 2)]
+
+class DarwinStatfs(ctypes.Structure):
+    _fields_ = [
+        ("f_bsize", ctypes.c_uint32),
+        ("f_iosize", ctypes.c_int32),
+        ("f_blocks", ctypes.c_uint64),
+        ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64),
+        ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64),
+        ("f_fsid", DarwinFsid),
+        ("f_owner", ctypes.c_uint32),
+        ("f_type", ctypes.c_uint32),
+        ("f_flags", ctypes.c_uint32),
+        ("f_fssubtype", ctypes.c_uint32),
+        ("f_fstypename", ctypes.c_char * 16),
+        ("f_mntonname", ctypes.c_char * 1024),
+        ("f_mntfromname", ctypes.c_char * 1024),
+        ("f_flags_ext", ctypes.c_uint32),
+        ("f_reserved", ctypes.c_uint32 * 7),
+    ]
+
+def descriptor_mount_id(descriptor):
+    if sys.platform == "linux":
+        with open("/proc/self/fdinfo/" + str(descriptor), "r", encoding="utf-8") as stream:
+            data = stream.read(4097)
+        if len(data.encode("utf-8")) > 4096:
+            raise RuntimeError(
+                "mount identity metadata exceeded 4 KiB for descriptor " + str(descriptor)
+            )
+        matches = re.findall(r"^mnt_id:[ \t]+([0-9]+)[ \t]*$", data, re.MULTILINE)
+        if len(matches) != 1:
+            raise RuntimeError("unable to verify mount identity for descriptor " + str(descriptor))
+        return ("linux", int(matches[0]))
+    if sys.platform == "darwin":
+        metadata = DarwinStatfs()
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(DarwinStatfs)]
+        libc.fstatfs.restype = ctypes.c_int
+        if libc.fstatfs(descriptor, ctypes.byref(metadata)) != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number))
+        mount_point = bytes(metadata.f_mntonname).split(b"\0", 1)[0]
+        return (
+            "darwin",
+            int(metadata.f_fsid.values[0]),
+            int(metadata.f_fsid.values[1]),
+            mount_point,
+        )
+    raise RuntimeError("unsupported platform for mount identity verification")
+
+def assert_same_mount(expected_device, metadata, expected_mount_id, actual_mount_id, path):
+    if expected_device != metadata.st_dev:
+        raise RuntimeError(
+            "refusing cleanup path that crosses a mounted filesystem at '" + path + "'"
+        )
+    if expected_mount_id != actual_mount_id:
+        raise RuntimeError(
+            "refusing cleanup path that crosses a mounted filesystem at '" + path + "'"
+        )
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+def open_directory(name, parent_descriptor, display_path):
+    try:
+        return os.open(name, directory_flags, dir_fd=parent_descriptor)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise RuntimeError(
+                "cleanup target boundary changed before anchored removal at '"
+                + display_path
+                + "'"
+            ) from error
+        raise
+
+def assert_directory_attached(
+    directory_descriptor,
+    parent_descriptor,
+    name,
+    expected_directory,
+    display_directory,
+):
+    try:
+        current = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise RuntimeError(
+                "cleanup directory moved outside its anchored parent at '"
+                + display_directory
+                + "'"
+            ) from error
+        raise
+    opened = os.fstat(directory_descriptor)
+    if (
+        stable_identity(current) != expected_directory
+        or stable_identity(opened) != expected_directory
+    ):
+        raise RuntimeError(
+            "cleanup directory moved outside its anchored parent at '"
+            + display_directory
+            + "'"
+        )
+
+def remove_contents(
+    directory_descriptor,
+    expected_device,
+    expected_mount_id,
+    display_directory,
+    parent_descriptor,
+    directory_name,
+    expected_directory,
+    depth,
+):
+    check_traversal(depth)
+    while True:
+        assert_directory_attached(
+            directory_descriptor,
+            parent_descriptor,
+            directory_name,
+            expected_directory,
+            display_directory,
+        )
+        found_entry = False
+        with os.scandir(directory_descriptor) as entries:
+            for entry in entries:
+                check_traversal(depth, True)
+                assert_directory_attached(
+                    directory_descriptor,
+                    parent_descriptor,
+                    directory_name,
+                    expected_directory,
+                    display_directory,
+                )
+                found_entry = True
+                name = entry.name
+                if not isinstance(name, str) or name in (".", "..") or "/" in name:
+                    raise RuntimeError("directory returned an unsafe entry name")
+                display_child = posixpath.join(display_directory, name)
+                before = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if before.st_dev != expected_device:
+                    raise RuntimeError(
+                        "refusing cleanup path that crosses a mounted filesystem at '"
+                        + display_child
+                        + "'"
+                    )
+                if stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(before.st_mode):
+                    child_descriptor = open_directory(
+                        name,
+                        directory_descriptor,
+                        display_child,
+                    )
+                    try:
+                        opened = os.fstat(child_descriptor)
+                        if stable_identity(before) != stable_identity(opened):
+                            raise RuntimeError(
+                                "directory entry changed before removal: '" + display_child + "'"
+                            )
+                        child_mount_id = descriptor_mount_id(child_descriptor)
+                        assert_same_mount(
+                            expected_device,
+                            opened,
+                            expected_mount_id,
+                            child_mount_id,
+                            display_child,
+                        )
+                        remove_contents(
+                            child_descriptor,
+                            expected_device,
+                            expected_mount_id,
+                            display_child,
+                            directory_descriptor,
+                            name,
+                            stable_identity(opened),
+                            depth + 1,
+                        )
+                        assert_directory_attached(
+                            directory_descriptor,
+                            parent_descriptor,
+                            directory_name,
+                            expected_directory,
+                            display_directory,
+                        )
+                        check_traversal(depth)
+                        os.rmdir(name, dir_fd=directory_descriptor)
+                    finally:
+                        os.close(child_descriptor)
+                else:
+                    immediate = os.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stable_identity(before) != stable_identity(immediate):
+                        raise RuntimeError(
+                            "directory entry changed before removal: '"
+                            + display_child
+                            + "'"
+                        )
+                    assert_directory_attached(
+                        directory_descriptor,
+                        parent_descriptor,
+                        directory_name,
+                        expected_directory,
+                        display_directory,
+                    )
+                    check_traversal(depth)
+                    os.unlink(name, dir_fd=directory_descriptor)
+        if not found_entry:
+            assert_directory_attached(
+                directory_descriptor,
+                parent_descriptor,
+                directory_name,
+                expected_directory,
+                display_directory,
+            )
+            return
+
+target = posixpath.normpath(posixpath.abspath(spec["target"]))
+parts = [part for part in target.split("/") if part]
+if not parts:
+    raise RuntimeError("refusing to remove the filesystem root")
+
+handles = []
+try:
+    parent_descriptor = os.open("/", directory_flags)
+    handles.append(parent_descriptor)
+    prefix = ""
+    for part in parts[:-1]:
+        prefix = posixpath.join("/", prefix, part)
+        opened_descriptor = open_directory(part, parent_descriptor, prefix)
+        handles.append(opened_descriptor)
+        assert_same(expected_at(prefix), os.fstat(opened_descriptor), prefix)
+        parent_descriptor = opened_descriptor
+
+    name = parts[-1]
+    before = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    parent_metadata = os.fstat(parent_descriptor)
+    if parent_metadata.st_dev != before.st_dev:
+        raise RuntimeError(
+            "refusing cleanup path that crosses a mounted filesystem at '" + target + "'"
+        )
+    target_expected = expected_at(target)
+    assert_same(target_expected, before, target)
+    if stat.S_ISDIR(before.st_mode) and not stat.S_ISLNK(before.st_mode):
+        target_descriptor = open_directory(name, parent_descriptor, target)
+        try:
+            opened = os.fstat(target_descriptor)
+            assert_same(target_expected, opened, target)
+            parent_mount_id = descriptor_mount_id(parent_descriptor)
+            target_mount_id = descriptor_mount_id(target_descriptor)
+            assert_same_mount(
+                parent_metadata.st_dev,
+                opened,
+                parent_mount_id,
+                target_mount_id,
+                target,
+            )
+            remove_contents(
+                target_descriptor,
+                opened.st_dev,
+                target_mount_id,
+                target,
+                parent_descriptor,
+                name,
+                stable_identity(opened),
+                0,
+            )
+            check_traversal(0)
+            os.rmdir(name, dir_fd=parent_descriptor)
+        finally:
+            os.close(target_descriptor)
+    else:
+        check_traversal(0)
+        os.unlink(name, dir_fd=parent_descriptor)
+finally:
+    for descriptor in reversed(handles):
+        os.close(descriptor)
+`;
+
+const UNIX_PYTHON_EXECUTABLE = "/usr/bin/python3";
+const PRIVILEGED_REMOVAL_INPUT_LIMIT_BYTES = 128 * 1024;
+const PRIVILEGED_REMOVAL_ENTRY_LIMIT = 512;
+
+interface PrivilegedPythonRuntime {
+  readonly executable: string;
+  readonly identity: CommandFileIdentity;
+}
+
+type ResolveExecutable = (path: string) => Promise<string>;
+
 const WINDOWS_POWERSHELL_EXECUTABLE =
   "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const WINDOWS_SYSTEM32 = "C:\\Windows\\System32";
 const WINDOWS_REMOVAL_INPUT_LIMIT_BYTES = 128 * 1024;
-const WINDOWS_REMOVAL_TIMEOUT_MS = 10 * 60_000;
+const WINDOWS_BOUNDARY_VALIDATOR_TIMEOUT_MS = 60_000;
+const WINDOWS_REMOVAL_HELPER_GRACE_MS = 60_000;
 
 const WINDOWS_BOUNDARY_VALIDATOR_SOURCE = String.raw`
 import { createHash } from "node:crypto";
@@ -277,9 +891,18 @@ if (process.platform !== "win32") throw new Error("Windows removal validator ran
 if (
   typeof spec.target !== "string" ||
   typeof spec.runtimeExecutable !== "string" ||
-  typeof spec.powershellExecutable !== "string"
+  typeof spec.powershellExecutable !== "string" ||
+  !["structure", "locks", "remove"].includes(spec.mode)
 ) {
   throw new Error("Windows removal input is malformed");
+}
+for (const [name, maximum] of [
+  ["maxEntries", 2000000], ["maxDepth", 256], ["timeoutMs", 600000],
+]) {
+  const value = spec.limits?.[name];
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new Error("Windows removal limit is invalid: " + name);
+  }
 }
 if (!Array.isArray(spec.entries) || spec.entries.length === 0 || spec.entries.length > 512) {
   throw new Error("Windows removal boundary is malformed");
@@ -383,6 +1006,10 @@ for (const [index, entry] of spec.entries.entries()) {
     actual.ino !== decimal(entry.inode, "inode") ||
     actual.mode !== decimal(entry.mode, "mode")
   ) throw new Error("Windows removal boundary changed at '" + path + "'");
+  assertField(actual.uid, entry.userId, "boundary owner");
+  assertField(actual.gid, entry.groupId, "boundary group");
+  assertField(actual.birthtimeNs, entry.birthtimeNanoseconds, "boundary birth time");
+  assertField(actual.ctimeNs, entry.changedNanoseconds, "boundary change time");
   previous = path;
 }
 `;
@@ -407,17 +1034,50 @@ if ($entries.Count -lt 1 -or $entries.Count -gt 512) { throw 'Windows removal bo
 if ([string]::IsNullOrWhiteSpace([string]$spec.target)) { throw 'Windows removal target is missing' }
 if ([string]::IsNullOrWhiteSpace([string]$spec.runtimeExecutable)) { throw 'Windows removal runtime is missing' }
 if ([string]::IsNullOrWhiteSpace([string]$spec.powershellExecutable)) { throw 'Windows PowerShell runtime is missing' }
+if (@('structure', 'locks', 'remove') -notcontains [string]$spec.mode) { throw 'Windows removal mode is invalid' }
+
+function Get-Bound {
+ param($Value,[long]$Maximum)
+ [long]$number=$Value
+ if ($number -lt 1 -or $number -gt $Maximum) { throw 'Invalid Windows removal limit' }
+ $number
+}
+
+$script:TraversalLimits = @{
+    MaxEntries = Get-Bound $spec.limits.maxEntries 2000000
+    MaxDepth = Get-Bound $spec.limits.maxDepth 256
+    TimeoutMs = Get-Bound $spec.limits.timeoutMs 600000
+}
+$script:TraversalEntries = 0L
+$script:TraversalClock = $null
+
+function Reset-Traversal {
+ $script:TraversalEntries=0L
+ $script:TraversalClock=[Diagnostics.Stopwatch]::StartNew()
+}
+
+function Assert-Traversal {
+ param([int]$Depth,[switch]$CountEntry)
+ if ($Depth -gt $script:TraversalLimits.MaxDepth) { throw "Windows removal traversal exceeded depth $($script:TraversalLimits.MaxDepth)" }
+ if ($CountEntry) { $script:TraversalEntries++; if ($script:TraversalEntries -gt $script:TraversalLimits.MaxEntries) { throw "Windows removal traversal exceeded $($script:TraversalLimits.MaxEntries) entries" } }
+ if ($null -eq $script:TraversalClock -or $script:TraversalClock.ElapsedMilliseconds -ge $script:TraversalLimits.TimeoutMs) { throw "Windows removal traversal exceeded $($script:TraversalLimits.TimeoutMs) ms" }
+}
 
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
 
 public static class LockedRemovalNative {
     private const uint DELETE = 0x00010000;
     private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+    private const uint GENERIC_READ = 0x80000000;
     private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
@@ -431,6 +1091,7 @@ public static class LockedRemovalNative {
     private const uint FILE_DISPOSITION_FLAG_DELETE = 0x00000001;
     private const uint FILE_DISPOSITION_FLAG_POSIX_SEMANTICS = 0x00000002;
     private const uint FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x00000010;
+    private const uint DUPLICATE_SAME_ACCESS = 0x00000002;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct FileAttributeTagInfo {
@@ -493,15 +1154,25 @@ public static class LockedRemovalNative {
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool FindClose(IntPtr findFile);
 
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateHandle(
+        IntPtr sourceProcess, SafeFileHandle sourceHandle, IntPtr targetProcess,
+        out SafeFileHandle targetHandle, uint desiredAccess, bool inheritHandle,
+        uint options);
+
     private static string Extended(string path) {
         if (path.StartsWith(@"\\?\", StringComparison.Ordinal)) return path;
         if (path.StartsWith(@"\\", StringComparison.Ordinal)) return @"\\?\UNC\" + path.Substring(2);
         return @"\\?\" + path;
     }
 
-    private static SafeFileHandle Open(string path, uint access) {
+    private static SafeFileHandle Open(string path, uint access, uint shareMode) {
         SafeFileHandle handle = CreateFileW(
-            Extended(path), access, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING,
+            Extended(path), access, shareMode, IntPtr.Zero, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
         if (handle.IsInvalid) {
             int error = Marshal.GetLastWin32Error();
@@ -511,12 +1182,38 @@ public static class LockedRemovalNative {
         return handle;
     }
 
+    private static SafeFileHandle Open(string path, uint access) {
+        return Open(path, access, FILE_SHARE_READ);
+    }
+
     public static SafeFileHandle OpenAnchor(string path) {
-        return Open(path, FILE_READ_ATTRIBUTES);
+        SafeFileHandle handle = Open(path, FILE_READ_ATTRIBUTES);
+        try {
+            uint attributes = Attributes(handle);
+            if (!IsDirectory(attributes) || IsReparsePoint(attributes)) {
+                throw new InvalidOperationException(
+                    "Windows cleanup ancestor is not a direct directory: '" + path + "'");
+            }
+            return handle;
+        } catch {
+            handle.Dispose();
+            throw;
+        }
+    }
+
+    public static SafeFileHandle OpenExecutable(string path) {
+        return Open(path, GENERIC_READ | FILE_READ_ATTRIBUTES);
     }
 
     public static SafeFileHandle OpenTarget(string path) {
         return Open(path, FILE_READ_ATTRIBUTES | DELETE);
+    }
+
+    public static SafeFileHandle OpenSharedTarget(string path) {
+        return Open(
+            path,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     }
 
     public static uint Attributes(SafeFileHandle handle) {
@@ -535,6 +1232,31 @@ public static class LockedRemovalNative {
 
     public static bool IsReparsePoint(uint attributes) {
         return (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    public static void AssertExecutable(SafeFileHandle handle, string label) {
+        uint attributes = Attributes(handle);
+        if (IsDirectory(attributes) || IsReparsePoint(attributes)) {
+            throw new InvalidOperationException(label + " is not a regular file");
+        }
+    }
+
+    public static string ComputeHash(SafeFileHandle handle, string label) {
+        AssertExecutable(handle, label);
+        SafeFileHandle duplicate;
+        IntPtr process = GetCurrentProcess();
+        if (!DuplicateHandle(
+            process, handle, process, out duplicate, 0, false,
+            DUPLICATE_SAME_ACCESS)) {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                "Could not duplicate locked " + label + " handle");
+        }
+        using (FileStream stream = new FileStream(duplicate, FileAccess.Read))
+        using (SHA256 sha256 = SHA256.Create()) {
+            return BitConverter.ToString(sha256.ComputeHash(stream))
+                .Replace("-", "").ToLowerInvariant();
+        }
     }
 
     public static string FirstChild(string path) {
@@ -562,6 +1284,63 @@ public static class LockedRemovalNative {
         } finally {
             FindClose(find);
         }
+    }
+
+    public sealed class ChildCursor : IDisposable {
+        private readonly string path;
+        private IntPtr find;
+        private FindData current;
+        private bool hasCurrent;
+
+        internal ChildCursor(string selectedPath) {
+            path = selectedPath;
+            string extended = Extended(path).TrimEnd('\\') + "\\*";
+            find = FindFirstFileW(extended, out current);
+            if (find == new IntPtr(-1)) {
+                int error = Marshal.GetLastWin32Error();
+                find = IntPtr.Zero;
+                if (error != ERROR_FILE_NOT_FOUND) {
+                    throw new Win32Exception(
+                        error,
+                        "Could not enumerate locked Windows cleanup path '" + path + "'");
+                }
+                return;
+            }
+            hasCurrent = true;
+        }
+
+        public string Next() {
+            while (find != IntPtr.Zero) {
+                if (!hasCurrent) {
+                    if (!FindNextFileW(find, out current)) {
+                        int error = Marshal.GetLastWin32Error();
+                        Dispose();
+                        if (error == ERROR_NO_MORE_FILES) return null;
+                        throw new Win32Exception(
+                            error,
+                            "Could not continue enumerating locked Windows cleanup path '" +
+                                path + "'");
+                    }
+                }
+                hasCurrent = false;
+                string name = current.FileName;
+                if (name == "." || name == "..") continue;
+                return path.EndsWith("\\", StringComparison.Ordinal)
+                    ? path + name
+                    : path + "\\" + name;
+            }
+            return null;
+        }
+
+        public void Dispose() {
+            if (find == IntPtr.Zero) return;
+            FindClose(find);
+            find = IntPtr.Zero;
+        }
+    }
+
+    public static ChildCursor OpenChildren(string path) {
+        return new ChildCursor(path);
     }
 
     public static void MarkDelete(SafeFileHandle handle) {
@@ -592,24 +1371,75 @@ public static class LockedRemovalNative {
 function Remove-LockedEntry {
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle] $Handle
+        [Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle] $Handle,
+        [int] $Depth = 0
     )
+    Assert-Traversal -Depth $Depth
     $attributes = [LockedRemovalNative]::Attributes($Handle)
     if ([LockedRemovalNative]::IsDirectory($attributes) -and
         -not [LockedRemovalNative]::IsReparsePoint($attributes)) {
         while ($true) {
             $childPath = [LockedRemovalNative]::FirstChild($Path)
             if ($null -eq $childPath) { break }
+            Assert-Traversal -Depth $Depth -CountEntry
             $childHandle = [LockedRemovalNative]::OpenTarget($childPath)
             try {
-                Remove-LockedEntry -Path $childPath -Handle $childHandle
+                Remove-LockedEntry -Path $childPath -Handle $childHandle -Depth ($Depth + 1)
             } finally {
                 $childHandle.Dispose()
             }
             [LockedRemovalNative]::AssertAbsent($childPath)
         }
     }
+    Assert-Traversal -Depth $Depth
     [LockedRemovalNative]::MarkDelete($Handle)
+}
+
+function Test-LockedEntry {
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle] $Handle,
+        [int] $Depth = 0
+    )
+    Assert-Traversal -Depth $Depth
+    $attributes = [LockedRemovalNative]::Attributes($Handle)
+    if ([LockedRemovalNative]::IsDirectory($attributes) -and
+        -not [LockedRemovalNative]::IsReparsePoint($attributes)) {
+        $cursor = [LockedRemovalNative]::OpenChildren($Path)
+        try {
+            while ($true) {
+                $childPath = $cursor.Next()
+                if ($null -eq $childPath) { break }
+                Assert-Traversal -Depth $Depth -CountEntry
+                $childHandle = [LockedRemovalNative]::OpenTarget($childPath)
+                try {
+                    Test-LockedEntry -Path $childPath -Handle $childHandle -Depth ($Depth + 1)
+                } finally {
+                    $childHandle.Dispose()
+                }
+            }
+        } finally {
+            $cursor.Dispose()
+        }
+    }
+}
+
+function Assert-LockedExecutable {
+    param(
+        [Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle] $Handle,
+        [Parameter(Mandatory = $true)] $Expected,
+        [Parameter(Mandatory = $true)][string] $Label
+    )
+    $expectedHash = [string]$Expected.contentSha256
+    if ($expectedHash -notmatch '^[a-f0-9]{64}$') {
+        throw "$Label expected identity is malformed"
+    }
+    $actualHash = [LockedRemovalNative]::ComputeHash($Handle, $Label)
+    if (-not [string]::Equals(
+        $actualHash, $expectedHash,
+        [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label content changed before launch"
+    }
 }
 
 $anchors = New-Object System.Collections.ArrayList
@@ -620,14 +1450,20 @@ try {
     for ($index = 0; $index -lt $entries.Count - 1; $index++) {
         [void]$anchors.Add([LockedRemovalNative]::OpenAnchor([string]$entries[$index].path))
     }
-    $runtimeHandle = [LockedRemovalNative]::OpenAnchor([string]$spec.runtimeExecutable)
-    $powershellHandle = [LockedRemovalNative]::OpenAnchor([string]$spec.powershellExecutable)
-    $targetHandle = [LockedRemovalNative]::OpenTarget([string]$spec.target)
+    $runtimeHandle = [LockedRemovalNative]::OpenExecutable([string]$spec.runtimeExecutable)
+    $powershellHandle = [LockedRemovalNative]::OpenExecutable([string]$spec.powershellExecutable)
+    if ([string]$spec.mode -eq 'structure') {
+        $targetHandle = [LockedRemovalNative]::OpenSharedTarget([string]$spec.target)
+    } else {
+        $targetHandle = [LockedRemovalNative]::OpenTarget([string]$spec.target)
+    }
+    Assert-LockedExecutable -Handle $runtimeHandle -Expected $spec.runtime -Label 'Node executable'
+    Assert-LockedExecutable -Handle $powershellHandle -Expected $spec.powershell -Label 'PowerShell executable'
 
     $nodeSourceBase64 = '`,
   WINDOWS_BOUNDARY_VALIDATOR_BASE64,
   String.raw`'
-    $nodeExpression = "eval(Buffer.from('$nodeSourceBase64','base64').toString('utf8'))"
+    $nodeExpression = "await import('data:text/javascript;base64,$nodeSourceBase64')"
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = [string]$spec.runtimeExecutable
     $quote = [char]34
@@ -636,25 +1472,61 @@ try {
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
-    $validator = New-Object System.Diagnostics.Process
-    $validator.StartInfo = $startInfo
-    if (-not $validator.Start()) { throw 'Could not start the pinned Node boundary validator' }
-    $validator.StandardInput.Write($jsonInput)
-    $validator.StandardInput.Close()
-    if (-not $validator.WaitForExit(60000)) {
-        $validator.Kill()
-        $validator.WaitForExit()
-        throw 'Pinned Node boundary validation timed out'
+    $validator = $null
+    $validatorStarted = $false
+    $validatorDeadline = [Diagnostics.Stopwatch]::StartNew()
+    function Get-ValidatorRemainingMilliseconds {
+        $remaining = 60000 - [int]$validatorDeadline.ElapsedMilliseconds
+        if ($remaining -le 0) { throw 'Pinned Node boundary validation timed out' }
+        return $remaining
     }
-    if ($validator.ExitCode -ne 0) {
-        throw "Pinned Node boundary validation exited $($validator.ExitCode)"
+    try {
+        $validator = New-Object System.Diagnostics.Process
+        $validator.StartInfo = $startInfo
+        if (-not $validator.Start()) { throw 'Could not start the pinned Node boundary validator' }
+        $validatorStarted = $true
+        $write = $validator.StandardInput.WriteAsync($jsonInput)
+        if (-not $write.Wait((Get-ValidatorRemainingMilliseconds))) {
+            throw 'Pinned Node boundary validation timed out while writing input'
+        }
+        $flush = $validator.StandardInput.FlushAsync()
+        if (-not $flush.Wait((Get-ValidatorRemainingMilliseconds))) {
+            throw 'Pinned Node boundary validation timed out while flushing input'
+        }
+        $validator.StandardInput.Close()
+        if (-not $validator.WaitForExit((Get-ValidatorRemainingMilliseconds))) {
+            throw 'Pinned Node boundary validation timed out'
+        }
+        if ($validator.ExitCode -ne 0) {
+            throw "Pinned Node boundary validation exited $($validator.ExitCode)"
+        }
+    } finally {
+        if ($null -ne $validator) {
+            try {
+                if ($validatorStarted -and -not $validator.HasExited) {
+                    $validator.Kill()
+                    if (-not $validator.WaitForExit(5000)) {
+                        throw 'Pinned Node boundary validator termination is unconfirmed'
+                    }
+                }
+            } finally {
+                $validator.Dispose()
+            }
+        }
     }
-    $validator.Dispose()
 
-    Remove-LockedEntry -Path ([string]$spec.target) -Handle $targetHandle
-    $targetHandle.Dispose()
-    $targetHandle = $null
-    [LockedRemovalNative]::AssertAbsent([string]$spec.target)
+    if ([string]$spec.mode -eq 'locks') {
+        Reset-Traversal
+        Test-LockedEntry -Path ([string]$spec.target) -Handle $targetHandle
+    } elseif ([string]$spec.mode -eq 'remove') {
+        Reset-Traversal
+        Test-LockedEntry -Path ([string]$spec.target) -Handle $targetHandle
+        Reset-Traversal
+        Remove-LockedEntry -Path ([string]$spec.target) -Handle $targetHandle
+        $targetHandle.Dispose()
+        $targetHandle = $null
+        [LockedRemovalNative]::AssertAbsent([string]$spec.target)
+    }
 } finally {
     if ($null -ne $targetHandle) { $targetHandle.Dispose() }
     if ($null -ne $powershellHandle) { $powershellHandle.Dispose() }
@@ -701,6 +1573,28 @@ function serializedCommandIdentity(identity: CommandFileIdentity): object {
   };
 }
 
+function serializedBoundaryIdentity(
+  entry: RemovalBoundarySnapshot["entries"][number],
+  includeChangedNanoseconds: boolean,
+  includeBirthtimeNanoseconds = true,
+): object {
+  return {
+    device: entry.device.toString(),
+    inode: entry.inode.toString(),
+    mode: entry.mode.toString(),
+    ...(entry.userId === undefined ? {} : { userId: entry.userId.toString() }),
+    ...(entry.groupId === undefined
+      ? {}
+      : { groupId: entry.groupId.toString() }),
+    ...(!includeBirthtimeNanoseconds || entry.birthtimeNanoseconds === undefined
+      ? {}
+      : { birthtimeNanoseconds: entry.birthtimeNanoseconds.toString() }),
+    ...(!includeChangedNanoseconds || entry.changedNanoseconds === undefined
+      ? {}
+      : { changedNanoseconds: entry.changedNanoseconds.toString() }),
+  };
+}
+
 function assertCompleteWindowsBoundary(
   target: string,
   boundary: RemovalBoundarySnapshot,
@@ -730,18 +1624,20 @@ function assertCompleteWindowsBoundary(
   }
 }
 
-async function removeLockedWindowsPath(
-  target: string,
-  expectedBoundary: RemovalBoundarySnapshot,
+export interface WindowsRemovalRuntime {
+  readonly runtimeExecutable: string;
+  readonly runtimeIdentity: CommandFileIdentity;
+  readonly powershellExecutable: string;
+  readonly powershellIdentity: CommandFileIdentity;
+}
+
+async function captureWindowsRemovalRuntime(
   context: RuntimeContext,
   dependencies: Pick<
     RemovePathDependencies,
-    | "inspectExecutable"
-    | "commandRunner"
-    | "hostPlatform"
-    | "currentRuntimeExecutable"
+    "inspectExecutable" | "hostPlatform" | "currentRuntimeExecutable"
   >,
-): Promise<void> {
+): Promise<WindowsRemovalRuntime> {
   const hostPlatform = dependencies.hostPlatform ?? process.platform;
   const currentRuntimeExecutable =
     dependencies.currentRuntimeExecutable ?? process.execPath;
@@ -756,35 +1652,116 @@ async function removeLockedWindowsPath(
       "Windows removal runtime does not match the current Node executable",
     );
   }
+  const inspect = dependencies.inspectExecutable ?? inspectExecutable;
+  const [powershellIdentity, runtimeIdentity] = await Promise.all([
+    inspect(WINDOWS_POWERSHELL_EXECUTABLE),
+    inspect(context.runtimeExecutable),
+  ]);
+  if (powershellIdentity?.contentSha256 === undefined) {
+    throw new Error(
+      "fixed Windows PowerShell executable identity is unavailable",
+    );
+  }
+  if (runtimeIdentity?.contentSha256 === undefined) {
+    throw new Error("current Node executable identity is unavailable");
+  }
+  return {
+    runtimeExecutable: win32.normalize(context.runtimeExecutable),
+    runtimeIdentity,
+    powershellExecutable: WINDOWS_POWERSHELL_EXECUTABLE,
+    powershellIdentity,
+  };
+}
+
+function sameWindowsRemovalRuntime(
+  left: WindowsRemovalRuntime,
+  right: WindowsRemovalRuntime,
+): boolean {
+  return (
+    left.runtimeExecutable.toLowerCase() ===
+      right.runtimeExecutable.toLowerCase() &&
+    left.powershellExecutable.toLowerCase() ===
+      right.powershellExecutable.toLowerCase() &&
+    sameCommandFileIdentity(left.runtimeIdentity, right.runtimeIdentity) &&
+    sameCommandFileIdentity(left.powershellIdentity, right.powershellIdentity)
+  );
+}
+
+async function removeLockedWindowsPath(
+  target: string,
+  expectedBoundary: RemovalBoundarySnapshot,
+  context: RuntimeContext,
+  dependencies: Pick<
+    RemovePathDependencies,
+    | "inspectExecutable"
+    | "commandRunner"
+    | "hostPlatform"
+    | "currentRuntimeExecutable"
+    | "expectedWindowsRemovalRuntime"
+    | "traversalLimits"
+  >,
+  mode: "structure" | "locks" | "remove" = "remove",
+): Promise<void> {
   if (!expectedBoundary.targetExists || expectedBoundary.entries.length === 0) {
     throw new Error(
       "Windows removal boundary does not contain an existing target",
     );
   }
-  const inspect = dependencies.inspectExecutable ?? inspectExecutable;
+  const expectedRuntime =
+    dependencies.expectedWindowsRemovalRuntime ??
+    (await captureWindowsRemovalRuntime(context, dependencies));
+  const immediateRuntime = await captureWindowsRemovalRuntime(
+    context,
+    dependencies,
+  );
+  if (
+    expectedRuntime.powershellExecutable.toLowerCase() !==
+      immediateRuntime.powershellExecutable.toLowerCase() ||
+    !sameCommandFileIdentity(
+      expectedRuntime.powershellIdentity,
+      immediateRuntime.powershellIdentity,
+    )
+  ) {
+    throw new Error(
+      "fixed Windows PowerShell executable changed before launch",
+    );
+  }
+  if (
+    expectedRuntime.runtimeExecutable.toLowerCase() !==
+      immediateRuntime.runtimeExecutable.toLowerCase() ||
+    !sameCommandFileIdentity(
+      expectedRuntime.runtimeIdentity,
+      immediateRuntime.runtimeIdentity,
+    )
+  ) {
+    throw new Error("current Node executable changed before Windows removal");
+  }
   const run = dependencies.commandRunner ?? runCommand;
-  const [powershellIdentity, runtimeIdentity] = await Promise.all([
-    inspect(WINDOWS_POWERSHELL_EXECUTABLE),
-    inspect(context.runtimeExecutable),
-  ]);
-  if (powershellIdentity === undefined) {
-    throw new Error("fixed Windows PowerShell executable is unavailable");
-  }
-  if (runtimeIdentity?.contentSha256 === undefined) {
-    throw new Error("current Node executable identity is unavailable");
-  }
+  const limits = normalizedRemovalTraversalLimits(dependencies.traversalLimits);
+  const traversalPasses = mode === "remove" ? 2 : mode === "locks" ? 1 : 0;
+  const helperTimeoutMs =
+    WINDOWS_BOUNDARY_VALIDATOR_TIMEOUT_MS +
+    traversalPasses * limits.timeoutMs +
+    WINDOWS_REMOVAL_HELPER_GRACE_MS;
 
   const serialized = JSON.stringify({
     target: win32.normalize(target),
-    runtimeExecutable: win32.normalize(context.runtimeExecutable),
-    runtime: serializedCommandIdentity(runtimeIdentity),
-    powershellExecutable: WINDOWS_POWERSHELL_EXECUTABLE,
-    powershell: serializedCommandIdentity(powershellIdentity),
-    entries: expectedBoundary.entries.map((entry) => ({
+    runtimeExecutable: expectedRuntime.runtimeExecutable,
+    runtime: serializedCommandIdentity(expectedRuntime.runtimeIdentity),
+    powershellExecutable: expectedRuntime.powershellExecutable,
+    powershell: serializedCommandIdentity(expectedRuntime.powershellIdentity),
+    mode,
+    limits: {
+      maxEntries: limits.maxEntries,
+      maxDepth: limits.maxDepth,
+      timeoutMs: limits.timeoutMs,
+    },
+    entries: expectedBoundary.entries.map((entry, index) => ({
       path: win32.normalize(entry.path),
-      device: entry.device.toString(),
-      inode: entry.inode.toString(),
-      mode: entry.mode.toString(),
+      ...serializedBoundaryIdentity(
+        entry,
+        index === expectedBoundary.entries.length - 1,
+      ),
     })),
   });
   if (
@@ -793,22 +1770,6 @@ async function removeLockedWindowsPath(
     throw new Error("Windows removal boundary exceeded 128 KiB");
   }
   assertCompleteWindowsBoundary(target, expectedBoundary);
-
-  const [powershellImmediatelyBefore, runtimeImmediatelyBefore] =
-    await Promise.all([
-      inspect(WINDOWS_POWERSHELL_EXECUTABLE),
-      inspect(context.runtimeExecutable),
-    ]);
-  if (
-    !sameCommandFileIdentity(powershellIdentity, powershellImmediatelyBefore)
-  ) {
-    throw new Error(
-      "fixed Windows PowerShell executable changed before launch",
-    );
-  }
-  if (!sameCommandFileIdentity(runtimeIdentity, runtimeImmediatelyBefore)) {
-    throw new Error("current Node executable changed before Windows removal");
-  }
 
   const args = [
     "-NoLogo",
@@ -829,7 +1790,7 @@ async function removeLockedWindowsPath(
     cwd: WINDOWS_SYSTEM32,
     env: trustedWindowsRemovalEnvironment(),
     input: Buffer.from(serialized, "utf8").toString("base64"),
-    timeoutMs: WINDOWS_REMOVAL_TIMEOUT_MS,
+    timeoutMs: helperTimeoutMs,
     silent: true,
   });
   if (result.terminationUnconfirmed === true) {
@@ -845,19 +1806,263 @@ async function removeLockedWindowsPath(
   }
 }
 
+const WINDOWS_HELPER_PREFLIGHTS = new Map<string, Promise<void>>();
+
+async function preflightWindowsRemovalHelper(
+  target: string,
+  boundary: RemovalBoundarySnapshot,
+  context: RuntimeContext,
+  dependencies: RemovePathDependencies,
+  runtime: WindowsRemovalRuntime,
+): Promise<void> {
+  const run = async (): Promise<void> =>
+    await removeLockedWindowsPath(
+      target,
+      boundary,
+      context,
+      { ...dependencies, expectedWindowsRemovalRuntime: runtime },
+      "structure",
+    );
+  const cacheable =
+    process.platform === "win32" &&
+    dependencies.commandRunner === undefined &&
+    dependencies.inspectExecutable === undefined &&
+    dependencies.hostPlatform === undefined &&
+    dependencies.currentRuntimeExecutable === undefined;
+  if (!cacheable) {
+    await run();
+    return;
+  }
+  const key = [
+    runtime.runtimeExecutable.toLowerCase(),
+    runtime.runtimeIdentity.contentSha256,
+    runtime.powershellExecutable.toLowerCase(),
+    runtime.powershellIdentity.contentSha256,
+    win32.normalize(target).toLowerCase(),
+    JSON.stringify(
+      boundary.entries.map((entry, index) => ({
+        path: win32.normalize(entry.path).toLowerCase(),
+        ...serializedBoundaryIdentity(
+          entry,
+          index === boundary.entries.length - 1,
+        ),
+      })),
+    ),
+  ].join("\0");
+  let preflight = WINDOWS_HELPER_PREFLIGHTS.get(key);
+  if (preflight === undefined) {
+    preflight = run();
+    WINDOWS_HELPER_PREFLIGHTS.set(key, preflight);
+  }
+  try {
+    await preflight;
+  } catch (error) {
+    if (WINDOWS_HELPER_PREFLIGHTS.get(key) === preflight) {
+      WINDOWS_HELPER_PREFLIGHTS.delete(key);
+    }
+    throw error;
+  }
+}
+
+async function preflightWindowsRemovalLocks(
+  target: string,
+  boundary: RemovalBoundarySnapshot,
+  context: RuntimeContext,
+  dependencies: RemovePathDependencies,
+  runtime: WindowsRemovalRuntime,
+): Promise<void> {
+  await removeLockedWindowsPath(
+    target,
+    boundary,
+    context,
+    { ...dependencies, expectedWindowsRemovalRuntime: runtime },
+    "locks",
+  );
+}
+
 function serializedRemovalBoundary(
   target: string,
   boundary: RemovalBoundarySnapshot,
+  traversalLimits: RemovalTraversalLimits = {},
 ): string {
-  return JSON.stringify({
+  if (
+    boundary.entries.length === 0 ||
+    boundary.entries.length > PRIVILEGED_REMOVAL_ENTRY_LIMIT
+  ) {
+    throw new Error(
+      `privileged removal boundary must contain 1 to ${PRIVILEGED_REMOVAL_ENTRY_LIMIT} entries`,
+    );
+  }
+  const limits = normalizedRemovalTraversalLimits(traversalLimits);
+  const serialized = JSON.stringify({
     target,
-    entries: boundary.entries.map((entry) => ({
+    limits: {
+      maxEntries: limits.maxEntries,
+      maxDepth: limits.maxDepth,
+      timeoutMs: limits.timeoutMs,
+    },
+    entries: boundary.entries.map((entry, index) => ({
       path: entry.path,
-      device: entry.device.toString(),
-      inode: entry.inode.toString(),
-      mode: entry.mode.toString(),
+      ...serializedBoundaryIdentity(
+        entry,
+        index === boundary.entries.length - 1,
+        false,
+      ),
     })),
   });
+  if (
+    Buffer.byteLength(serialized, "utf8") > PRIVILEGED_REMOVAL_INPUT_LIMIT_BYTES
+  ) {
+    throw new Error("privileged removal boundary exceeded 128 KiB");
+  }
+  return serialized;
+}
+
+async function assertTrustedPrivilegedPython(
+  executable: string,
+  identity: CommandFileIdentity,
+): Promise<void> {
+  if (
+    identity.userId !== 0n ||
+    identity.mode === undefined ||
+    (identity.mode & 0o170000n) !== 0o100000n ||
+    (identity.mode & 0o022n) !== 0n
+  ) {
+    throw new Error(
+      "OS Python executable must be a root-owned, non-writable regular file",
+    );
+  }
+  for (const directory of ["/usr", "/usr/bin"]) {
+    const metadata = await lstat(directory, { bigint: true });
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      metadata.uid !== 0n ||
+      (metadata.mode & 0o022n) !== 0n
+    ) {
+      throw new Error(
+        `OS Python executable has an untrusted parent directory: ${directory}`,
+      );
+    }
+  }
+  if (posix.dirname(executable) !== "/usr/bin") {
+    throw new Error("OS Python executable is outside its trusted directory");
+  }
+}
+
+async function capturePrivilegedPythonRuntime(
+  inspect: typeof inspectExecutable,
+  resolve: ResolveExecutable,
+): Promise<PrivilegedPythonRuntime> {
+  let pythonExecutable: string;
+  try {
+    pythonExecutable = await resolve(UNIX_PYTHON_EXECUTABLE);
+  } catch (error) {
+    throw new Error(
+      `OS Python is unavailable for anchored removal: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (!/^\/usr\/bin\/python3(?:\.[0-9]+)*$/.test(pythonExecutable)) {
+    throw new Error(
+      `OS Python resolved outside the trusted executable path: ${pythonExecutable}`,
+    );
+  }
+  const expectedPython = await inspect(pythonExecutable);
+  if (expectedPython?.contentSha256 === undefined) {
+    throw new Error("OS Python executable identity is unavailable");
+  }
+  await assertTrustedPrivilegedPython(pythonExecutable, expectedPython);
+  return { executable: pythonExecutable, identity: expectedPython };
+}
+
+async function runPrivilegedPythonAnchoredRemoval(
+  target: string,
+  boundary: RemovalBoundarySnapshot,
+  context: RuntimeContext,
+  elevate: typeof runElevated,
+  inspect: typeof inspectExecutable,
+  resolve: ResolveExecutable,
+  expectedRuntime?: PrivilegedPythonRuntime,
+  traversalLimits: RemovalTraversalLimits = {},
+): Promise<CommandResult> {
+  const runtime =
+    expectedRuntime ?? (await capturePrivilegedPythonRuntime(inspect, resolve));
+  const immediatePython = await inspect(runtime.executable);
+  if (!sameCommandFileIdentity(runtime.identity, immediatePython)) {
+    throw new Error("OS Python executable changed before anchored removal");
+  }
+  assertCommandTerminationConfirmed();
+  const result = await elevate(
+    context,
+    runtime.executable,
+    ["-I", "-S", "-c", PRIVILEGED_PYTHON_ANCHORED_REMOVE_SOURCE],
+    {
+      input: serializedRemovalBoundary(target, boundary, traversalLimits),
+      silent: true,
+      timeoutMs:
+        normalizedRemovalTraversalLimits(traversalLimits).timeoutMs + 60_000,
+    },
+  );
+  if (result.terminationUnconfirmed === true) {
+    throw new UnconfirmedCommandTerminationError(
+      "Python anchored removal helper termination is unconfirmed",
+    );
+  }
+  return result;
+}
+
+async function runLocalNodeAnchoredRemoval(
+  target: string,
+  boundary: RemovalBoundarySnapshot,
+  dependencies: RemovePathDependencies,
+): Promise<void> {
+  const limits = normalizedRemovalTraversalLimits(dependencies.traversalLimits);
+  // This child is unprivileged. Launch the already-running action runtime by
+  // its concrete executable path; elevation performs the stricter trust check
+  // separately before crossing a privilege boundary.
+  const runtime = process.execPath;
+  const run = dependencies.commandRunner ?? runCommand;
+  assertCommandTerminationConfirmed();
+  const result = await run(
+    runtime,
+    ["--input-type=module", "--eval", PRIVILEGED_ANCHORED_REMOVE_SOURCE],
+    {
+      input: serializedRemovalBoundary(
+        target,
+        boundary,
+        dependencies.traversalLimits,
+      ),
+      silent: true,
+      timeoutMs: limits.timeoutMs + 60_000,
+    },
+  );
+  if (result.terminationUnconfirmed === true) {
+    throw new UnconfirmedCommandTerminationError(
+      "local anchored removal helper termination is unconfirmed",
+    );
+  }
+  if (result.exitCode === 0) return;
+  const detail =
+    result.stderr.trim() ||
+    `local anchored removal helper exited ${result.exitCode}`;
+  if (/anchored removal traversal exceeded/i.test(detail)) {
+    throw new RemovalTraversalLimitError(detail);
+  }
+  throw new Error(detail);
+}
+
+function procRuntimeLaunchWasDenied(
+  result: CommandResult,
+  runtime: string,
+): boolean {
+  return (
+    result.stderr.includes(runtime) &&
+    ((result.exitCode === 126 && /permission denied/i.test(result.stderr)) ||
+      (result.exitCode === 127 &&
+        /no such file|not found/i.test(result.stderr)))
+  );
 }
 
 function privilegedRemovalRuntime(context: RuntimeContext): string {
@@ -874,12 +2079,28 @@ function unixDescriptorPath(descriptor: number): string {
 
 function sameBoundaryEntry(
   expected: RemovalBoundarySnapshot["entries"][number],
-  actual: Awaited<ReturnType<FileHandle["stat"]>>,
+  actual: {
+    readonly dev: bigint;
+    readonly ino: bigint;
+    readonly mode: bigint;
+    readonly uid: bigint;
+    readonly gid: bigint;
+    readonly birthtimeNs: bigint;
+    readonly ctimeNs: bigint;
+  },
+  includeChangedNanoseconds = false,
 ): boolean {
   return (
     expected.device === actual.dev &&
     expected.inode === actual.ino &&
-    expected.mode === actual.mode
+    expected.mode === actual.mode &&
+    (expected.userId === undefined || expected.userId === actual.uid) &&
+    (expected.groupId === undefined || expected.groupId === actual.gid) &&
+    (expected.birthtimeNanoseconds === undefined ||
+      expected.birthtimeNanoseconds === actual.birthtimeNs) &&
+    (!includeChangedNanoseconds ||
+      expected.changedNanoseconds === undefined ||
+      expected.changedNanoseconds === actual.ctimeNs)
   );
 }
 
@@ -968,15 +2189,95 @@ async function openBoundaryDirectory(
   }
 }
 
+function checkRemovalTraversal(
+  traversal: {
+    readonly limits: NormalizedRemovalTraversalLimits;
+    readonly startedAt: number;
+    entries: number;
+  },
+  depth: number,
+  countEntry = false,
+): void {
+  if (depth > traversal.limits.maxDepth) {
+    throw new RemovalTraversalLimitError(
+      `anchored removal traversal exceeded depth ${traversal.limits.maxDepth}`,
+    );
+  }
+  if (countEntry) traversal.entries += 1;
+  if (traversal.entries > traversal.limits.maxEntries) {
+    throw new RemovalTraversalLimitError(
+      `anchored removal traversal exceeded ${traversal.limits.maxEntries} entries`,
+    );
+  }
+  if (
+    traversal.limits.now() - traversal.startedAt >=
+    traversal.limits.timeoutMs
+  ) {
+    throw new RemovalTraversalLimitError(
+      "anchored removal traversal exceeded its time limit",
+    );
+  }
+}
+
 async function removeAnchoredDirectoryContents(
   directory: FileHandle,
   expectedDevice: bigint,
   expectedMountId: bigint | undefined,
   displayDirectory: string,
+  parent: FileHandle,
+  name: string,
+  expectedDirectory: {
+    readonly device: bigint;
+    readonly inode: bigint;
+    readonly mode: bigint;
+  },
+  traversal: {
+    readonly limits: NormalizedRemovalTraversalLimits;
+    readonly startedAt: number;
+    entries: number;
+  },
+  depth: number,
 ): Promise<void> {
+  checkRemovalTraversal(traversal, depth);
+  const assertAttached = async (): Promise<void> => {
+    const path = posix.join(unixDescriptorPath(parent.fd), name);
+    let current: Awaited<ReturnType<typeof lstat>>;
+    try {
+      current = await lstat(path, { bigint: true });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        ["ENOENT", "ENOTDIR", "ELOOP"].includes(
+          (error as NodeJS.ErrnoException).code ?? "",
+        )
+      ) {
+        throw new Error(
+          `cleanup directory moved outside its anchored parent at '${displayDirectory}'`,
+        );
+      }
+      throw error;
+    }
+    const opened = await directory.stat({ bigint: true });
+    if (
+      current.dev !== expectedDirectory.device ||
+      current.ino !== expectedDirectory.inode ||
+      current.mode !== expectedDirectory.mode ||
+      opened.dev !== expectedDirectory.device ||
+      opened.ino !== expectedDirectory.inode ||
+      opened.mode !== expectedDirectory.mode
+    ) {
+      throw new Error(
+        `cleanup directory moved outside its anchored parent at '${displayDirectory}'`,
+      );
+    }
+  };
+
+  await assertAttached();
   const root = unixDescriptorPath(directory.fd);
   const entries = await opendir(root);
   for await (const entry of entries) {
+    checkRemovalTraversal(traversal, depth, true);
+    await assertAttached();
     if (entry.name === "." || entry.name === ".." || entry.name.includes("/")) {
       throw new Error("directory returned an unsafe entry name");
     }
@@ -1011,15 +2312,39 @@ async function removeAnchoredDirectoryContents(
           expectedDevice,
           expectedMountId,
           displayChild,
+          directory,
+          entry.name,
+          {
+            device: opened.dev,
+            inode: opened.ino,
+            mode: opened.mode,
+          },
+          traversal,
+          depth + 1,
         );
+        await assertAttached();
+        checkRemovalTraversal(traversal, depth);
+        await rmdir(child);
       } finally {
         await childHandle?.close().catch(() => undefined);
       }
-      await rmdir(child);
     } else {
+      const immediate = await lstat(child, { bigint: true });
+      if (
+        before.dev !== immediate.dev ||
+        before.ino !== immediate.ino ||
+        before.mode !== immediate.mode
+      ) {
+        throw new Error(
+          `directory entry changed before removal: '${displayChild}'`,
+        );
+      }
+      await assertAttached();
+      checkRemovalTraversal(traversal, depth);
       await unlink(child);
     }
   }
+  await assertAttached();
 }
 
 /**
@@ -1033,7 +2358,14 @@ async function removeAnchoredDirectoryContents(
 export async function removeAnchoredUnixPath(
   target: string,
   expectedBoundary: RemovalBoundarySnapshot,
+  traversalLimits: RemovalTraversalLimits = {},
 ): Promise<void> {
+  const limits = normalizedRemovalTraversalLimits(traversalLimits);
+  const traversal = {
+    limits,
+    startedAt: limits.now(),
+    entries: 0,
+  };
   if (!expectedBoundary.targetExists) {
     throw new Error("cleanup target disappeared before anchored removal");
   }
@@ -1076,11 +2408,7 @@ export async function removeAnchoredUnixPath(
     const parentStat = await parent.stat({ bigint: true });
     assertSameRemovalFilesystem(parentStat.dev, before.dev, targetPath);
     const expected = boundaryEntryFor(expectedBoundary, targetPath);
-    if (
-      expected.device !== before.dev ||
-      expected.inode !== before.ino ||
-      expected.mode !== before.mode
-    ) {
+    if (!sameBoundaryEntry(expected, before, true)) {
       throw new Error(
         `cleanup target boundary changed before anchored removal at '${targetPath}'`,
       );
@@ -1091,7 +2419,7 @@ export async function removeAnchoredUnixPath(
       try {
         targetHandle = await openBoundaryDirectory(anchoredTarget, targetPath);
         const opened = await targetHandle.stat({ bigint: true });
-        if (!sameBoundaryEntry(expected, opened)) {
+        if (!sameBoundaryEntry(expected, opened, true)) {
           throw new Error(
             `cleanup target boundary changed before anchored removal at '${targetPath}'`,
           );
@@ -1110,12 +2438,23 @@ export async function removeAnchoredUnixPath(
           opened.dev,
           targetMountId,
           targetPath,
+          parent,
+          name,
+          {
+            device: opened.dev,
+            inode: opened.ino,
+            mode: opened.mode,
+          },
+          traversal,
+          0,
         );
+        checkRemovalTraversal(traversal, 0);
+        await rmdir(anchoredTarget);
       } finally {
         await targetHandle?.close().catch(() => undefined);
       }
-      await rmdir(anchoredTarget);
     } else {
+      checkRemovalTraversal(traversal, 0);
       await unlink(anchoredTarget);
     }
   } finally {
@@ -1208,6 +2547,13 @@ export async function removePathTarget(
         detail: "cleanup target disappeared during boundary validation",
       };
     }
+    if (context.platform !== "windows") {
+      serializedRemovalBoundary(
+        target,
+        validatedBoundary,
+        dependencies.traversalLimits,
+      );
+    }
   } catch (error) {
     return {
       status: "failed",
@@ -1215,8 +2561,9 @@ export async function removePathTarget(
     };
   }
 
+  let immediateBoundary: RemovalBoundarySnapshot;
   try {
-    const immediateBoundary = await boundary(target, allowedParents, context);
+    immediateBoundary = await boundary(target, allowedParents, context);
     if (!sameRemovalBoundary(validatedBoundary, immediateBoundary)) {
       return {
         status: "failed",
@@ -1230,14 +2577,53 @@ export async function removePathTarget(
     };
   }
 
+  let privilegedAttempted = false;
   try {
     if (context.platform === "windows") {
-      await windowsLockedRemove(target, validatedBoundary, context);
+      await windowsLockedRemove(target, immediateBoundary, context);
+    } else if (
+      context.platform === "macos" &&
+      dependencies.anchoredRemove === undefined &&
+      dependencies.remove === undefined &&
+      dependencies.unlink === undefined
+    ) {
+      privilegedAttempted = true;
+      const result = await runPrivilegedPythonAnchoredRemoval(
+        target,
+        immediateBoundary,
+        context,
+        elevate,
+        dependencies.inspectExecutable ?? inspectExecutable,
+        dependencies.resolveExecutable ?? realpath,
+        dependencies.expectedPrivilegedPythonRuntime,
+        dependencies.traversalLimits,
+      );
+      if (result.exitCode !== 0) {
+        throw new Error(
+          result.stderr.trim() ||
+            `Python anchored removal helper exited ${result.exitCode}`,
+        );
+      }
     } else if (
       dependencies.remove === undefined &&
       dependencies.unlink === undefined
     ) {
-      await anchoredRemove(target, validatedBoundary);
+      if (
+        context.platform === "linux" &&
+        dependencies.anchoredRemove === undefined
+      ) {
+        await runLocalNodeAnchoredRemoval(
+          target,
+          immediateBoundary,
+          dependencies,
+        );
+      } else {
+        await anchoredRemove(
+          target,
+          immediateBoundary,
+          dependencies.traversalLimits,
+        );
+      }
     } else if (inspected.isLink) {
       // Unlink the directory symlink/junction itself. Never give a recursive
       // remover a final link that could be swapped or followed differently.
@@ -1260,9 +2646,21 @@ export async function removePathTarget(
     if (context.platform === "windows") {
       return { status: "failed", detail: (nodeError as Error).message };
     }
+    if (privilegedAttempted) {
+      return { status: "failed", detail: (nodeError as Error).message };
+    }
+    if (nodeError instanceof RemovalTraversalLimitError) {
+      return { status: "failed", detail: nodeError.message };
+    }
 
     const beforeElevation = await inspect(target);
-    if (!beforeElevation.exists) return { status: "removed" };
+    if (!beforeElevation.exists) {
+      return {
+        status: "failed",
+        detail:
+          nodeError instanceof Error ? nodeError.message : String(nodeError),
+      };
+    }
     let fallbackBoundary: RemovalBoundarySnapshot;
     try {
       fallbackBoundary = await boundary(target, allowedParents, context);
@@ -1278,13 +2676,25 @@ export async function removePathTarget(
           detail: "cleanup target boundary changed after local removal failed",
         };
       }
-      const immediateBoundary = await boundary(target, allowedParents, context);
-      if (!sameRemovalBoundary(fallbackBoundary, immediateBoundary)) {
+      const privilegedBoundary = await boundary(
+        target,
+        allowedParents,
+        context,
+      );
+      if (
+        !sameRemovalBoundaryExact(
+          fallbackBoundary,
+          privilegedBoundary,
+          allowedParents,
+          context,
+        )
+      ) {
         return {
           status: "failed",
           detail: "cleanup target boundary changed before privileged removal",
         };
       }
+      fallbackBoundary = privilegedBoundary;
     } catch (error) {
       return {
         status: "failed",
@@ -1297,17 +2707,88 @@ export async function removePathTarget(
         detail: "target type changed before privileged removal",
       };
     }
-    assertCommandTerminationConfirmed();
-    const result = await elevate(
-      context,
-      privilegedRemovalRuntime(context),
-      ["--input-type=module", "--eval", PRIVILEGED_ANCHORED_REMOVE_SOURCE],
-      {
-        input: serializedRemovalBoundary(target, fallbackBoundary),
-        silent: true,
-        timeoutMs: 10 * 60_000,
-      },
-    );
+    let result: CommandResult;
+    try {
+      if (context.platform === "macos") {
+        result = await runPrivilegedPythonAnchoredRemoval(
+          target,
+          fallbackBoundary,
+          context,
+          elevate,
+          dependencies.inspectExecutable ?? inspectExecutable,
+          dependencies.resolveExecutable ?? realpath,
+          dependencies.expectedPrivilegedPythonRuntime,
+          dependencies.traversalLimits,
+        );
+      } else {
+        assertCommandTerminationConfirmed();
+        const runtime = privilegedRemovalRuntime(context);
+        const runPythonFallback = async (): Promise<CommandResult> => {
+          const beforePython = await boundary(target, allowedParents, context);
+          if (
+            !sameRemovalBoundaryExact(
+              fallbackBoundary,
+              beforePython,
+              allowedParents,
+              context,
+            )
+          ) {
+            throw new Error(
+              "cleanup target boundary changed before Python privileged removal",
+            );
+          }
+          return await runPrivilegedPythonAnchoredRemoval(
+            target,
+            beforePython,
+            context,
+            elevate,
+            dependencies.inspectExecutable ?? inspectExecutable,
+            dependencies.resolveExecutable ?? realpath,
+            dependencies.expectedPrivilegedPythonRuntime,
+            dependencies.traversalLimits,
+          );
+        };
+        try {
+          const traversalTimeoutMs = normalizedRemovalTraversalLimits(
+            dependencies.traversalLimits,
+          ).timeoutMs;
+          result = await elevate(
+            context,
+            runtime,
+            [
+              "--input-type=module",
+              "--eval",
+              PRIVILEGED_ANCHORED_REMOVE_SOURCE,
+            ],
+            {
+              input: serializedRemovalBoundary(
+                target,
+                fallbackBoundary,
+                dependencies.traversalLimits,
+              ),
+              silent: true,
+              timeoutMs: traversalTimeoutMs + 60_000,
+            },
+          );
+        } catch (error) {
+          if (
+            !(error instanceof UntrustedUnixExecutableError) ||
+            error.executable !== runtime
+          ) {
+            throw error;
+          }
+          result = await runPythonFallback();
+        }
+        if (procRuntimeLaunchWasDenied(result, runtime)) {
+          result = await runPythonFallback();
+        }
+      }
+    } catch (error) {
+      return {
+        status: "failed",
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
     if (result.exitCode === 0) {
       return (await inspect(target)).exists
         ? {
@@ -1325,6 +2806,7 @@ export async function removePathTarget(
 
 export function createRemovePathOperation(
   options: RemovePathOptions,
+  dependencies: RemovePathDependencies = {},
 ): Operation {
   const target = assertSafeRemovalTarget(
     options.target,
@@ -1332,8 +2814,10 @@ export function createRemovePathOperation(
     options.context,
   );
   let validatedBoundary: RemovalBoundarySnapshot | undefined;
+  let validatedPrivilegedPythonRuntime: PrivilegedPythonRuntime | undefined;
+  let validatedWindowsRemovalRuntime: WindowsRemovalRuntime | undefined;
   const validate = async (): Promise<void> => {
-    const current = await captureSafeRemovalBoundary(
+    const current = await (dependencies.boundary ?? captureSafeRemovalBoundary)(
       target,
       options.allowedParents,
       options.context,
@@ -1345,12 +2829,82 @@ export function createRemovePathOperation(
       throw new Error("cleanup target boundary changed during plan validation");
     }
     validatedBoundary ??= current;
+    if (options.context.platform === "windows" && current.targetExists) {
+      const runtime = await captureWindowsRemovalRuntime(
+        options.context,
+        dependencies,
+      );
+      if (
+        validatedWindowsRemovalRuntime !== undefined &&
+        !sameWindowsRemovalRuntime(validatedWindowsRemovalRuntime, runtime)
+      ) {
+        throw new Error(
+          "Windows removal runtime changed after complete-plan validation",
+        );
+      }
+      validatedWindowsRemovalRuntime ??= runtime;
+      await preflightWindowsRemovalHelper(
+        target,
+        current,
+        options.context,
+        dependencies,
+        validatedWindowsRemovalRuntime,
+      );
+    } else if (current.targetExists) {
+      serializedRemovalBoundary(target, current, dependencies.traversalLimits);
+      const pythonRuntime = await capturePrivilegedPythonRuntime(
+        dependencies.inspectExecutable ?? inspectExecutable,
+        dependencies.resolveExecutable ?? realpath,
+      );
+      if (
+        validatedPrivilegedPythonRuntime !== undefined &&
+        (validatedPrivilegedPythonRuntime.executable !==
+          pythonRuntime.executable ||
+          !sameCommandFileIdentity(
+            validatedPrivilegedPythonRuntime.identity,
+            pythonRuntime.identity,
+          ))
+      ) {
+        throw new Error(
+          "OS Python executable changed after complete-plan validation",
+        );
+      }
+      validatedPrivilegedPythonRuntime ??= pythonRuntime;
+    }
+  };
+  const validateAfterPreflight = async (): Promise<void> => {
+    if (options.context.platform !== "windows") return;
+    if (validatedBoundary === undefined) await validate();
+    const expected = validatedBoundary;
+    if (expected === undefined) {
+      throw new Error("Windows removal boundary was not captured");
+    }
+    const current = await (dependencies.boundary ?? captureSafeRemovalBoundary)(
+      target,
+      options.allowedParents,
+      options.context,
+    );
+    if (!sameRemovalBoundary(expected, current)) {
+      throw new Error("Windows cleanup target changed after service preflight");
+    }
+    if (!current.targetExists) return;
+    const runtime = validatedWindowsRemovalRuntime;
+    if (runtime === undefined) {
+      throw new Error("Windows removal runtime was not captured");
+    }
+    await preflightWindowsRemovalLocks(
+      target,
+      current,
+      options.context,
+      dependencies,
+      runtime,
+    );
   };
   return {
     id: options.id,
     component: options.component,
     description: options.description,
-    phase: "filesystem",
+    phase: options.phase ?? "filesystem",
     dedupeKey: `path:${
       options.context.platform === "windows"
         ? win32.normalize(target).toLowerCase()
@@ -1363,6 +2917,9 @@ export function createRemovePathOperation(
       ? {}
       : { coveredBy: options.coveredBy }),
     validate,
+    ...(options.context.platform === "windows"
+      ? { validateAfterPreflight }
+      : {}),
     run: async () => {
       if (validatedBoundary === undefined) {
         try {
@@ -1385,7 +2942,21 @@ export function createRemovePathOperation(
         target,
         options.allowedParents,
         options.context,
-        { expectedBoundary },
+        {
+          ...dependencies,
+          expectedBoundary,
+          ...(validatedPrivilegedPythonRuntime === undefined
+            ? {}
+            : {
+                expectedPrivilegedPythonRuntime:
+                  validatedPrivilegedPythonRuntime,
+              }),
+          ...(validatedWindowsRemovalRuntime === undefined
+            ? {}
+            : {
+                expectedWindowsRemovalRuntime: validatedWindowsRemovalRuntime,
+              }),
+        },
       );
     },
   };
@@ -1416,6 +2987,9 @@ export function createFunctionOperation(options: {
   readonly always?: boolean;
   readonly fatal?: boolean;
   readonly validate?: () => Promise<void>;
+  readonly validateAfterPreflight?: () => Promise<void>;
+  readonly validateAfterPreflightLast?: boolean;
+  readonly validateBeforeRun?: () => Promise<void>;
   readonly rollback?: () => Promise<void>;
   readonly rollbackAfterPayloadMutation?: boolean;
   readonly run: () => Promise<OperationResult>;
@@ -1442,6 +3016,15 @@ export function createFunctionOperation(options: {
     ...(options.always === undefined ? {} : { always: options.always }),
     ...(options.fatal === undefined ? {} : { fatal: options.fatal }),
     ...(options.validate === undefined ? {} : { validate: options.validate }),
+    ...(options.validateAfterPreflight === undefined
+      ? {}
+      : { validateAfterPreflight: options.validateAfterPreflight }),
+    ...(options.validateAfterPreflightLast === undefined
+      ? {}
+      : { validateAfterPreflightLast: options.validateAfterPreflightLast }),
+    ...(options.validateBeforeRun === undefined
+      ? {}
+      : { validateBeforeRun: options.validateBeforeRun }),
     ...(options.rollback === undefined ? {} : { rollback: options.rollback }),
     ...(options.rollbackAfterPayloadMutation === undefined
       ? {}
@@ -1597,23 +3180,58 @@ export async function executeOperations(
   const resultsById = new Map<string, OperationResult>();
   const reversible: Operation[] = [];
   let payloadMutationMayHaveStarted = false;
+  const validateBeforeRun = async (operation: Operation): Promise<void> => {
+    if (operation.validateBeforeRun === undefined) return;
+    try {
+      await operation.validateBeforeRun();
+      assertCommandTerminationConfirmed();
+    } catch (error) {
+      if (error instanceof UnconfirmedCommandTerminationError) throw error;
+      assertCommandTerminationConfirmed();
+      throw new Error(
+        `${operation.description} failed immediate validation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  };
   try {
     for (const phase of PHASES) {
       const phaseOperations = operations.filter(
         (operation) => operation.phase === phase,
       );
-      if (phaseOperations.length === 0) continue;
-      await core.group(`${phase} cleanup`, async () => {
-        if (phase === "filesystem") {
-          const eligible = phaseOperations.filter(
-            (operation) =>
-              !isCoveredBySuccessfulOperation(operation, resultsById),
-          );
-          // Destructive path removals are deliberately serialized. If a command
-          // timeout cannot prove its process tree ended, no sibling deletion may
-          // already be in flight when the fatal termination latch is observed.
-          for (const operation of eligible) {
-            payloadMutationMayHaveStarted = true;
+      if (phaseOperations.length === 0 && phase !== "preflight") continue;
+      if (phaseOperations.length > 0) {
+        await core.group(`${phase} cleanup`, async () => {
+          if (phase === "filesystem") {
+            const eligible = phaseOperations.filter(
+              (operation) =>
+                !isCoveredBySuccessfulOperation(operation, resultsById),
+            );
+            // Destructive path removals are deliberately serialized. If a command
+            // timeout cannot prove its process tree ended, no sibling deletion may
+            // already be in flight when the fatal termination latch is observed.
+            for (const operation of eligible) {
+              await validateBeforeRun(operation);
+              payloadMutationMayHaveStarted = true;
+              const result = await runOne(operation);
+              results.push(result);
+              resultsById.set(operation.id, result);
+              if (
+                result.status === "removed" &&
+                operation.rollback !== undefined
+              ) {
+                reversible.push(operation);
+              }
+            }
+            return;
+          }
+
+          for (const operation of phaseOperations) {
+            if (isCoveredBySuccessfulOperation(operation, resultsById))
+              continue;
+            await validateBeforeRun(operation);
+            if (phase !== "preflight") payloadMutationMayHaveStarted = true;
             const result = await runOne(operation);
             results.push(result);
             resultsById.set(operation.id, result);
@@ -1624,20 +3242,40 @@ export async function executeOperations(
               reversible.push(operation);
             }
           }
-          return;
-        }
-
-        for (const operation of phaseOperations) {
-          if (isCoveredBySuccessfulOperation(operation, resultsById)) continue;
-          if (phase !== "preflight") payloadMutationMayHaveStarted = true;
-          const result = await runOne(operation);
-          results.push(result);
-          resultsById.set(operation.id, result);
-          if (result.status === "removed" && operation.rollback !== undefined) {
-            reversible.push(operation);
+        });
+      }
+      if (phase === "preflight") {
+        const failures: string[] = [];
+        for (const runLast of [false, true]) {
+          for (const operation of operations) {
+            if (
+              operation.validateAfterPreflight === undefined ||
+              (operation.validateAfterPreflightLast === true) !== runLast
+            ) {
+              continue;
+            }
+            try {
+              await operation.validateAfterPreflight();
+              assertCommandTerminationConfirmed();
+            } catch (error) {
+              if (error instanceof UnconfirmedCommandTerminationError) {
+                throw error;
+              }
+              assertCommandTerminationConfirmed();
+              failures.push(
+                `${operation.description}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+            }
           }
         }
-      });
+        if (failures.length > 0) {
+          throw new Error(
+            `Cleanup validation failed after reversible preflight and before payload mutation:\n${failures.join("\n")}`,
+          );
+        }
+      }
     }
   } catch (error) {
     // Never start rollback commands while an unconfirmed timed-out process may

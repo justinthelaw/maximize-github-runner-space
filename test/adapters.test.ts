@@ -23,30 +23,40 @@ import {
   classifyPostgreSqlServiceInventory,
   assertWindowsDirectoryChain,
   createWindowsDockerPruneOperation,
-  createWindowsDockerEngineOperation,
+  createWindowsDockerEngineOperation as createWindowsDockerEngineOperationImpl,
   createWindowsDockerServiceLifecycle,
   createWindowsChocolateyOperation,
+  createWindowsInventoryBudget,
   createWindowsMsiOperation,
   createWindowsSdkBundleOperation,
   createWindowsSdkComponentOperation,
   createWindowsVisualStudioOperation,
   createWindowsAdapter,
-  createWindowsServiceCoordinator,
+  createWindowsServiceRegistrationCleanup as createWindowsServiceRegistrationCleanupImpl,
+  createWindowsServiceCoordinator as createWindowsServiceCoordinatorImpl,
   createWindowsToolCacheRecreateOperation,
   executableUninstallOperation,
   isMissingWindowsService,
   isStoppedWindowsService,
   isStrictWindowsDescendant,
+  guardWindowsServiceOperation,
+  inspectWindowsServiceExecutable,
   listChocolateyPackages,
   listMsiProducts,
   listVisualStudioInstances,
+  listWindowsUninstallRecords,
+  listWindowsVersionedDirectories,
   managedDirectoryUninstallOperation,
   parseAndValidateWindowsServiceExecutable,
+  parseWindowsUninstallRecords,
   PINNED_WINDOWS_WEB_SERVICE_NAMES,
   POSTGRESQL_SERVICE_QUERY_ARGUMENTS,
   UNINSTALL_REGISTRY_ROOTS,
   type WindowsManagedPathProbe,
   type WindowsPathProbe,
+  type WindowsDockerEngineDependencies,
+  type WindowsDockerServiceLifecycle,
+  type WindowsPaths,
   type WindowsServiceControl,
   windowsInstallerExitDisposition,
   windowsPaths,
@@ -58,7 +68,13 @@ import {
   type RemovePathDependencies,
 } from "../src/operations.js";
 import { createPlan } from "../src/planner.js";
-import type { Adapter, ComponentId, Platform } from "../src/types.js";
+import type {
+  Adapter,
+  CleanupPlan,
+  ComponentId,
+  Platform,
+  RuntimeContext,
+} from "../src/types.js";
 import { contextFor, planFor } from "./helpers.js";
 
 const factories: Readonly<Record<Platform, () => Promise<Adapter>>> = {
@@ -66,6 +82,137 @@ const factories: Readonly<Record<Platform, () => Promise<Adapter>>> = {
   macos: async () => await createMacOSAdapter(contextFor("macos")),
   windows: async () => await createWindowsAdapter(contextFor("windows")),
 };
+
+test("Windows versioned inventories bound all inspected entries", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-windows-versions-"));
+  t.after(async () => await rm(root, { force: true, recursive: true }));
+  await Promise.all(
+    Array.from(
+      { length: 257 },
+      async (_, index) => await mkdir(join(root, `unrelated-${index}`)),
+    ),
+  );
+
+  await assert.rejects(
+    async () => await listWindowsVersionedDirectories(root, /^version-\d+$/),
+    /exceeded 256 inspected entries/,
+  );
+});
+
+test("Windows command inventories enforce one aggregate wall deadline", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+
+  let visualStudioNow = 0;
+  let visualStudioCommands = 0;
+  await assert.rejects(
+    async () =>
+      await listVisualStudioInstances(paths, {
+        now: () => visualStudioNow,
+        inspectExecutable: async () => {
+          visualStudioNow = 120_001;
+          return identity;
+        },
+        runCommand: async () => {
+          visualStudioCommands += 1;
+          return { exitCode: 0, stdout: "[]", stderr: "" };
+        },
+      }),
+    /two-minute aggregate deadline/,
+  );
+  assert.equal(visualStudioCommands, 0);
+
+  let registryNow = 0;
+  let registryCommands = 0;
+  await assert.rejects(
+    async () =>
+      await listWindowsUninstallRecords(paths, {
+        now: () => registryNow,
+        inspectExecutable: async () => identity,
+        runCommand: async () => {
+          registryCommands += 1;
+          registryNow = 120_001;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      }),
+    /two-minute aggregate deadline/,
+  );
+  assert.equal(registryCommands, 1);
+});
+
+test("Windows command inventories can share one debited operation budget", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  let now = 0;
+  const budget = createWindowsInventoryBudget({ now: () => now });
+  const dependencies = {
+    now: () => now,
+    inventoryBudget: budget,
+    inspectExecutable: async () => identity,
+    runCommand: async () => {
+      now += 70_000;
+      return { exitCode: 0, stdout: "[]", stderr: "" };
+    },
+  };
+
+  await listVisualStudioInstances(paths, dependencies);
+  await assert.rejects(
+    async () => await listVisualStudioInstances(paths, dependencies),
+    /two-minute aggregate deadline/,
+  );
+
+  now = 0;
+  const registryBudget = createWindowsInventoryBudget({ now: () => now });
+  const registryDependencies = {
+    now: () => now,
+    inventoryBudget: registryBudget,
+    inspectExecutable: async () => identity,
+    runCommand: async () => {
+      now += 35_000;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+
+  await listWindowsUninstallRecords(paths, registryDependencies);
+  await assert.rejects(
+    async () => await listWindowsUninstallRecords(paths, registryDependencies),
+    /two-minute aggregate deadline/,
+  );
+});
+
+test("Windows MSI selection is capped before executable probes", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  const products = Array.from({ length: 17 }, (_, index) => {
+    const suffix = index.toString(16).padStart(12, "0");
+    const productCode = `{00000000-0000-0000-0000-${suffix}}`;
+    return {
+      registryKey: `${UNINSTALL_REGISTRY_ROOTS[0]}\\${productCode}`,
+      productCode,
+      displayName: "GitHub CLI",
+      windowsInstaller: 1 as const,
+    };
+  });
+  let executableProbes = 0;
+  const operation = createWindowsMsiOperation(
+    paths,
+    "gh-cli",
+    [/^GitHub CLI$/],
+    async () => ({ products, registryExecutable: identity }),
+    "bounded-selection",
+    "Bounded MSI selection",
+    {
+      inspectExecutable: async () => {
+        executableProbes += 1;
+        return identity;
+      },
+    },
+  );
+  assert.ok(operation.validate);
+
+  await assert.rejects(operation.validate, /exceeded 16 products/);
+  assert.equal(executableProbes, 0);
+});
 
 function maxPlan(skipComponents = "") {
   return createPlan((name) => {
@@ -86,7 +233,7 @@ function testWindowsServiceConfiguration(serviceName: string) {
       : serviceName.toLowerCase() === "apache"
         ? `${paths.drive}\\tools\\Apache24\\bin\\httpd.exe -k runservice`
         : serviceName.toLowerCase() === "nginx"
-          ? `${paths.drive}\\tools\\nginx\\nginx.exe -s run`
+          ? `${paths.drive}\\tools\\nginx-1.31.3\\nginx.exe -s run`
           : postgresqlVersion !== undefined
             ? `"${paths.programFiles}\\PostgreSQL\\${postgresqlVersion}\\bin\\pg_ctl.exe" runservice`
             : undefined;
@@ -110,6 +257,125 @@ const TEST_WINDOWS_SERVICE_IDENTITY_CONTROL = {
     mtimeNs: 4n,
   }),
 };
+
+const TEST_WINDOWS_SERVICE_CONTROLS = new WeakMap<
+  WindowsServiceControl,
+  WindowsServiceControl
+>();
+
+function withTestWindowsServiceStartLatch(
+  control: WindowsServiceControl,
+  defaultStartType: 2 | 3 | 4 = 2,
+  latchWhenStopped = false,
+): WindowsServiceControl {
+  const cached = TEST_WINDOWS_SERVICE_CONTROLS.get(control);
+  if (cached !== undefined) return cached;
+  const startTypes = new Map<string, 2 | 3 | 4>();
+  const startTypeValue = (
+    setting: "auto" | "delayed-auto" | "demand" | "disabled",
+  ) =>
+    setting === "auto" || setting === "delayed-auto"
+      ? 2
+      : setting === "demand"
+        ? 3
+        : 4;
+  const startTypeLine = (value: 2 | 3 | 4): string =>
+    `START_TYPE : ${value} ${value === 2 ? "AUTO_START" : value === 3 ? "DEMAND_START" : "DISABLED"}\r\n`;
+  const wrapped: WindowsServiceControl = {
+    ...control,
+    query: async (serviceName: string, timeoutMs?: number) => {
+      const result = await control.query(serviceName, timeoutMs);
+      if (latchWhenStopped && isStoppedWindowsService(result)) {
+        startTypes.set(serviceName, 4);
+      }
+      return result;
+    },
+    ...(control.config === undefined
+      ? {}
+      : {
+          config: async (serviceName: string, timeoutMs?: number) => {
+            const result = await control.config?.(serviceName, timeoutMs);
+            if (
+              result === undefined ||
+              result.exitCode !== 0 ||
+              /^\s*START_TYPE\s*:/im.test(result.stdout)
+            ) {
+              if (result === undefined) {
+                throw new Error("test service configuration is unavailable");
+              }
+              return result;
+            }
+            return {
+              ...result,
+              stdout: `${startTypeLine(startTypes.get(serviceName) ?? defaultStartType)}${result.stdout}`,
+            };
+          },
+          configureStart: async (
+            serviceName: string,
+            setting: "auto" | "delayed-auto" | "demand" | "disabled",
+            timeoutMs?: number,
+          ) => {
+            const result =
+              control.configureStart === undefined
+                ? { exitCode: 0, stdout: "", stderr: "" }
+                : await control.configureStart(serviceName, setting, timeoutMs);
+            if (result.exitCode === 0) {
+              startTypes.set(serviceName, startTypeValue(setting));
+            }
+            return result;
+          },
+        }),
+  };
+  TEST_WINDOWS_SERVICE_CONTROLS.set(control, wrapped);
+  return wrapped;
+}
+
+function createWindowsServiceCoordinator(
+  paths: WindowsPaths,
+  plan: CleanupPlan,
+  control?: WindowsServiceControl,
+  lifecycle?: WindowsDockerServiceLifecycle,
+) {
+  return createWindowsServiceCoordinatorImpl(
+    paths,
+    plan,
+    control === undefined
+      ? undefined
+      : withTestWindowsServiceStartLatch(control),
+    lifecycle,
+  );
+}
+
+function createWindowsServiceRegistrationCleanup(
+  paths: WindowsPaths,
+  plan: CleanupPlan,
+  control?: WindowsServiceControl,
+  lifecycle?: WindowsDockerServiceLifecycle,
+) {
+  return createWindowsServiceRegistrationCleanupImpl(
+    paths,
+    plan,
+    control === undefined
+      ? undefined
+      : withTestWindowsServiceStartLatch(control, 2, true),
+    lifecycle,
+  );
+}
+
+function createWindowsDockerEngineOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  dependencies: WindowsDockerEngineDependencies = {},
+) {
+  return createWindowsDockerEngineOperationImpl(context, paths, {
+    ...dependencies,
+    ...(dependencies.control === undefined
+      ? {}
+      : {
+          control: withTestWindowsServiceStartLatch(dependencies.control, 4),
+        }),
+  });
+}
 
 for (const platform of ["linux", "macos", "windows"] as const) {
   test(`${platform} adapter has an operation for every declared capability`, async () => {
@@ -416,7 +682,7 @@ test("Windows Chocolatey uninstall pins version and verifies absence", async () 
       runCommand: async (_executable, args) => {
         if (args[0] === "uninstall") {
           uninstallArguments = args;
-          return { exitCode: 3010, stdout: "", stderr: "" };
+          return { exitCode: 0, stdout: "", stderr: "" };
         }
         listCalls += 1;
         return {
@@ -560,6 +826,61 @@ test("Windows MSI discovery excludes HKCU and distinguishes absence from command
   ]);
 });
 
+test("Windows MSI discovery rejects conflicting cross-root product identities", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  const productCode = "{01234567-89AB-CDEF-0123-456789ABCDEF}";
+
+  await assert.rejects(
+    async () =>
+      await listMsiProducts(paths, {
+        inspectExecutable: async () => identity,
+        runCommand: async (_executable, args) => {
+          const root = args[1] ?? "";
+          const wow = root.includes("WOW6432Node");
+          return {
+            exitCode: 0,
+            stderr: "",
+            stdout: [
+              `HKEY_LOCAL_MACHINE\\${wow ? "SOFTWARE\\WOW6432Node" : "SOFTWARE"}\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${productCode}`,
+              `    DisplayName    REG_SZ    ${wow ? "Workflow Impostor" : "Google Chrome"}`,
+              "    WindowsInstaller    REG_DWORD    0x1",
+            ].join("\r\n"),
+          };
+        },
+      }),
+    /conflicting.*product code|duplicate.*product code/i,
+  );
+});
+
+test("Windows uninstall parsing rejects malformed classification fields", () => {
+  const productKey =
+    "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{01234567-89AB-CDEF-0123-456789ABCDEF}";
+  for (const lines of [
+    [
+      productKey,
+      "    DisplayName    REG_SZ    Google Chrome",
+      "    WindowsInstaller    REG_SZ    1",
+    ],
+    [
+      productKey,
+      "    DisplayName    REG_SZ    Google Chrome",
+      "    WindowsInstaller    REG_DWORD    not-a-number",
+    ],
+    [
+      productKey,
+      "    DisplayName    REG_SZ    Google Chrome",
+      "    WindowsInstaller    REG_DWORD    0x1",
+      "    WindowsInstaller    REG_DWORD    0x0",
+    ],
+  ]) {
+    assert.throws(
+      () => parseWindowsUninstallRecords(lines.join("\r\n")),
+      /WindowsInstaller.*(?:type|value|duplicate)/i,
+    );
+  }
+});
+
 test("Windows MSI uninstall rejects exact registry product drift", async () => {
   const paths = windowsPaths();
   const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
@@ -662,7 +983,7 @@ test("Windows MSI uninstall treats restart-initiated exit 1641 as terminal", asy
 
 test("Windows installer exit classification accepts only completed outcomes", () => {
   assert.equal(windowsInstallerExitDisposition(0), "completed");
-  assert.equal(windowsInstallerExitDisposition(3010), "completed");
+  assert.equal(windowsInstallerExitDisposition(3010), "restart-required");
   assert.equal(windowsInstallerExitDisposition(1641), "restart-initiated");
   assert.equal(windowsInstallerExitDisposition(1), "failed");
 });
@@ -754,6 +1075,67 @@ test("Windows SDK bundle cleanup rejects executables outside Package Cache", asy
 
   assert.ok(operation.validate);
   await assert.rejects(operation.validate, /outside Package Cache/);
+});
+
+test("Windows SDK bundle inventory rejects excess records before path probes", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  const records = Array.from({ length: 17 }, (_, index) => ({
+    registryKey: `HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\sdk-${index}`,
+    displayName: `Windows Software Development Kit - Windows 10.0.26100.${index}`,
+    bundleCachePath: `C:\\ProgramData\\Package Cache\\sdk-${index}\\winsdksetup.exe`,
+  }));
+  let pathProbes = 0;
+  let executableInspections = 0;
+  const operation = createWindowsSdkBundleOperation(
+    paths,
+    async () => ({ records, registryExecutable: identity }),
+    {
+      inspectExecutable: async () => {
+        executableInspections += 1;
+        return identity;
+      },
+      pathProbe: {
+        lstat: async () => {
+          pathProbes += 1;
+          return windowsPathStats("directory");
+        },
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await assert.rejects(operation.validate, /exceeded 16 records/);
+  assert.equal(pathProbes, 0);
+  assert.equal(executableInspections, 0);
+});
+
+test("Windows SDK bundle inventory bounds the inventory provider and probes together", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  let now = 0;
+  let pathProbes = 0;
+  const operation = createWindowsSdkBundleOperation(
+    paths,
+    async () => {
+      now = 120_001;
+      return { records: [], registryExecutable: identity };
+    },
+    {
+      now: () => now,
+      inspectExecutable: async () => identity,
+      pathProbe: {
+        lstat: async () => {
+          pathProbes += 1;
+          return windowsPathStats("directory");
+        },
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await assert.rejects(operation.validate, /two-minute aggregate deadline/);
+  assert.equal(pathProbes, 0);
 });
 
 test("Windows rejects a workflow-controlled home on another drive", async () => {
@@ -974,13 +1356,7 @@ for (const protectedPayload of [
 
 test("Windows Docker engine cleanup owns its image data without a redundant prune", async () => {
   const adapter = await createWindowsAdapter(contextFor("windows"));
-  const plan = createPlan((name) =>
-    name === "cleanup-profile"
-      ? "custom"
-      : name === "remove-docker-engine"
-        ? "true"
-        : "",
-  );
+  const plan = planFor("docker-engine", "docker-images");
   const prepared = prepareOperations(await adapter.operations(plan), plan);
 
   assert.equal(
@@ -989,7 +1365,7 @@ test("Windows Docker engine cleanup owns its image data without a redundant prun
   );
   assert.equal(
     prepared.some(({ id }) => id === "windows:docker:data"),
-    true,
+    false,
   );
   assert.equal(
     prepared.some(({ id }) => id === "windows:docker:prune"),
@@ -1000,12 +1376,23 @@ test("Windows Docker engine cleanup owns its image data without a redundant prun
     "preflight",
   );
   assert.equal(
-    prepared.find(({ id }) => id === "windows:docker:data")?.phase,
-    "filesystem",
-  );
-  assert.equal(
     prepared.find(({ id }) => id === "windows:docker:engine")?.phase,
     "system",
+  );
+});
+
+test("Linux Docker engine cleanup owns its image data without a redundant prune", async () => {
+  const adapter = await createLinuxAdapter(contextFor("linux"));
+  const plan = planFor("docker-engine", "docker-images");
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+
+  assert.equal(
+    prepared.some(({ id }) => id === "docker:prune"),
+    false,
+  );
+  assert.equal(
+    prepared.find(({ id }) => id === "linux:services:stop")?.phase,
+    "preflight",
   );
 });
 
@@ -1486,6 +1873,25 @@ test("Windows toolcache recreation verifies directory writability", async () => 
   assert.match(result.detail ?? "", /not writable/);
 });
 
+test("Windows selected toolcache cleanup rejects missing or wrong runner context", async () => {
+  for (const toolCache of [undefined, "C:\\workflow\\toolcache"]) {
+    const adapter = await createWindowsAdapter({
+      ...contextFor("windows"),
+      toolCache,
+    });
+    await assert.rejects(
+      async () => await adapter.operations(planFor("cached-tools")),
+      /RUNNER_TOOL_CACHE.*C:\\hostedtoolcache\\windows/i,
+    );
+  }
+
+  const unrelated = await createWindowsAdapter({
+    ...contextFor("windows"),
+    toolCache: undefined,
+  });
+  assert.ok((await unrelated.operations(planFor("azcopy"))).length > 0);
+});
+
 test("Windows service discovery distinguishes absence from unsafe query failure", () => {
   assert.equal(
     isMissingWindowsService({
@@ -1548,6 +1954,17 @@ test("Windows PostgreSQL service discovery fails closed on incomplete or unrecog
       inventory,
     );
   }
+
+  const oversized = Array.from(
+    { length: 17 },
+    (_, index) => `SERVICE_NAME: postgresql-x64-${index + 1}`,
+  ).join("\r\n");
+  const classified = classifyPostgreSqlServiceInventory(oversized);
+  assert.equal(classified.status, "unsafe");
+  assert.match(
+    classified.status === "unsafe" ? classified.detail : "",
+    /exceeded 16 services/i,
+  );
 });
 
 test("Visual Studio discovery accepts only strict definition-root descendants", () => {
@@ -1584,6 +2001,44 @@ test("Visual Studio discovery rejects reparse points in an accepted path", async
   );
 });
 
+test("Windows service executable inspection rejects reparse-point ancestors", async () => {
+  const paths = windowsPaths();
+  const executable = `${paths.drive}\\tools\\Apache24\\bin\\httpd.exe`;
+  const linkedDirectory = `${paths.drive}\\tools\\Apache24`.toLowerCase();
+  const probe: WindowsPathProbe = {
+    lstat: async (path) =>
+      windowsPathStats(path === executable ? "file" : "directory", {
+        link: path.toLowerCase() === linkedDirectory,
+      }),
+  };
+
+  await assert.rejects(
+    async () => await inspectWindowsServiceExecutable(paths, executable, probe),
+    /reparse point/,
+  );
+});
+
+test("Windows service executable inspection rejects non-directory ancestors", async () => {
+  const paths = windowsPaths();
+  const executable = `${paths.drive}\\tools\\Apache24\\bin\\httpd.exe`;
+  const replacedDirectory = `${paths.drive}\\tools\\Apache24`.toLowerCase();
+  const probe: WindowsPathProbe = {
+    lstat: async (path) =>
+      windowsPathStats(
+        path.toLowerCase() === replacedDirectory
+          ? "file"
+          : path === executable
+            ? "file"
+            : "directory",
+      ),
+  };
+
+  await assert.rejects(
+    async () => await inspectWindowsServiceExecutable(paths, executable, probe),
+    /non-directory/,
+  );
+});
+
 test("Visual Studio inventory rejects silent target omission above its bound", async () => {
   const paths = windowsPaths();
   const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
@@ -1592,11 +2047,17 @@ test("Visual Studio inventory rejects silent target omission above its bound", a
     installationVersion: "17.14.0",
     productId: "Microsoft.VisualStudio.Product.Enterprise",
   }));
+  let pathProbes = 0;
   await assert.rejects(
     async () =>
       await listVisualStudioInstances(paths, {
         inspectExecutable: async () => identity,
-        pathProbe: { lstat: async () => windowsPathStats("directory") },
+        pathProbe: {
+          lstat: async () => {
+            pathProbes += 1;
+            return windowsPathStats("directory");
+          },
+        },
         runCommand: async () => ({
           exitCode: 0,
           stdout: JSON.stringify(records),
@@ -1605,6 +2066,7 @@ test("Visual Studio inventory rejects silent target omission above its bound", a
       }),
     /exceeded 8 instances/,
   );
+  assert.equal(pathProbes, 0);
 });
 
 test("Visual Studio inventory rejects malformed Enterprise records and ignores only explicit other products", async () => {
@@ -1885,6 +2347,50 @@ test("Visual Studio SDK modify preserves the selected directory identity", async
   assert.match(result.detail ?? "", /instance identity changed/);
 });
 
+test("Visual Studio SDK modify accepts metadata drift on the preserved directory", async () => {
+  const paths = windowsPaths();
+  const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+  const record = {
+    installationPath: `${paths.programFiles}\\Microsoft Visual Studio\\2022\\Enterprise`,
+    installationVersion: "17.14.0",
+    productId: "Microsoft.VisualStudio.Product.Enterprise",
+  };
+  let modified = false;
+  const dependencies = {
+    inspectExecutable: async () => identity,
+    pathProbe: {
+      lstat: async () =>
+        windowsPathStats("directory", { mtimeNs: modified ? 99n : 5n }),
+    },
+    runCommand: async (executable: string, args: readonly string[]) => {
+      if (executable === paths.vswhere) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify(
+            modified && args.includes("-requires") ? [] : [record],
+          ),
+          stderr: "",
+        };
+      }
+      modified = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  };
+  const inventory = async () =>
+    await listVisualStudioInstances(paths, dependencies);
+  const operation = createWindowsSdkComponentOperation(
+    paths,
+    inventory,
+    dependencies,
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+
+  assert.equal(result.status, "removed", result.detail ?? "SDK removal failed");
+});
+
 test("Visual Studio SDK postconditions reject a replaced vswhere executable", async () => {
   const paths = windowsPaths();
   const originalVswhere = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
@@ -2044,6 +2550,24 @@ test("Windows service discovery binds names to definition-owned executables", ()
   assert.equal(
     parseAndValidateWindowsServiceExecutable(
       paths,
+      "apache",
+      "Apache",
+      "BINARY_PATH_NAME : C:\\tools\\Apache24\\bin\\httpd.exe -k runservice",
+    ),
+    "C:\\tools\\Apache24\\bin\\httpd.exe",
+  );
+  assert.equal(
+    parseAndValidateWindowsServiceExecutable(
+      paths,
+      "nginx",
+      "nginx",
+      "BINARY_PATH_NAME : C:\\tools\\nginx-1.31.3\\nginx.exe -s run",
+    ),
+    "C:\\tools\\nginx-1.31.3\\nginx.exe",
+  );
+  assert.equal(
+    parseAndValidateWindowsServiceExecutable(
+      paths,
       "postgresql",
       "postgresql-x64-17",
       'BINARY_PATH_NAME : "C:\\Program Files\\PostgreSQL\\17\\bin\\pg_ctl.exe" runservice',
@@ -2070,6 +2594,395 @@ test("Windows service discovery binds names to definition-owned executables", ()
       ),
     /unquoted executable path/,
   );
+  for (const [component, serviceName, commandLine] of [
+    [
+      "apache",
+      "Apache",
+      "C:\\tools\\Apache24\\workflow-owned\\httpd.exe -k runservice",
+    ],
+    ["nginx", "nginx", "C:\\tools\\workflow-owned\\nginx.exe -s run"],
+    [
+      "nginx",
+      "nginx",
+      "C:\\tools\\nginx-1.31.3\\workflow-owned\\nginx.exe -s run",
+    ],
+    [
+      "postgresql",
+      "postgresql-x64-17",
+      '"C:\\Program Files\\PostgreSQL\\16\\bin\\pg_ctl.exe" runservice',
+    ],
+  ] as const) {
+    assert.throws(
+      () =>
+        parseAndValidateWindowsServiceExecutable(
+          paths,
+          component,
+          serviceName,
+          `BINARY_PATH_NAME : ${commandLine}`,
+        ),
+      /outside its runner-image installation root/,
+    );
+  }
+});
+
+test("Windows service discovery rejects a final executable inspection overrun", async () => {
+  let now = 0;
+  let stops = 0;
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    query: async () => ({
+      exitCode: 0,
+      stdout: "STATE : 4 RUNNING\r\n",
+      stderr: "",
+    }),
+    inspectExecutable: async () => {
+      now = 120_001;
+      return { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
+    },
+    stop: async () => {
+      stops += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    delete: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await assert.rejects(operation.validate, /two-minute aggregate deadline/);
+  assert.equal(stops, 0);
+});
+
+test("Windows service coordination disables before stop and restores before restart", async () => {
+  const paths = windowsPaths();
+  let running = true;
+  let startType: 2 | 3 | 4 = 2;
+  const events: string[] = [];
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const startTypeOutput = () =>
+    `START_TYPE : ${startType} ${startType === 2 ? "AUTO_START" : startType === 3 ? "DEMAND_START" : "DISABLED"}\r\n`;
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async () =>
+      result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+    config: async () =>
+      result(
+        `${startTypeOutput()}BINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+      ),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    configureStart: async (_serviceName, setting) => {
+      events.push(`configure:${setting}`);
+      startType =
+        setting === "auto" || setting === "delayed-auto"
+          ? 2
+          : setting === "demand"
+            ? 3
+            : 4;
+      return result();
+    },
+    stop: async () => {
+      events.push("stop");
+      running = false;
+      return result();
+    },
+    start: async () => {
+      events.push("start");
+      assert.equal(startType, 2);
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+    wait: async () => undefined,
+  };
+  const operation = createWindowsServiceCoordinator(
+    paths,
+    planFor("docker-engine"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(startType, 4);
+  assert.equal(running, false);
+  assert.ok(events.indexOf("configure:disabled") < events.indexOf("stop"));
+
+  // An ordinary SCM recovery attempt cannot start a disabled service.
+  if (startType !== 4) running = true;
+  assert.equal(running, false);
+  await operation.validateAfterPreflight?.();
+
+  await operation.rollback();
+  assert.equal(startType, 2);
+  assert.equal(running, true);
+  assert.ok(events.indexOf("configure:auto") < events.indexOf("start"));
+});
+
+test("Windows service coordination stops a service that starts while its latch is applied", async () => {
+  const paths = windowsPaths();
+  let running = false;
+  let startType: 2 | 3 | 4 = 2;
+  let stops = 0;
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async () =>
+      result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+    config: async () =>
+      result(
+        `START_TYPE : ${startType} ${startType === 4 ? "DISABLED" : "AUTO_START"}\r\nBINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+      ),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    configureStart: async (_serviceName, setting) => {
+      startType = setting === "disabled" ? 4 : setting === "demand" ? 3 : 2;
+      if (setting === "disabled") running = true;
+      return result();
+    },
+    stop: async () => {
+      stops += 1;
+      running = false;
+      return result();
+    },
+    start: async () => {
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+    wait: async () => undefined,
+  };
+  const operation = createWindowsServiceCoordinator(
+    paths,
+    planFor("docker-engine"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(stops, 1);
+  assert.equal(running, false);
+
+  await operation.rollback();
+  assert.equal(startType, 2);
+  assert.equal(running, false);
+});
+
+test("Windows service rollback preserves delayed automatic start", async () => {
+  const paths = windowsPaths();
+  let running = true;
+  let startSetting = "delayed-auto";
+  const configured: string[] = [];
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const startTypeOutput = () =>
+    startSetting === "disabled"
+      ? "START_TYPE : 4 DISABLED\r\n"
+      : startSetting === "delayed-auto"
+        ? "START_TYPE : 2 AUTO_START (DELAYED)\r\n"
+        : "START_TYPE : 2 AUTO_START\r\n";
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async () =>
+      result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+    config: async () =>
+      result(
+        `${startTypeOutput()}BINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+      ),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    configureStart: async (_serviceName, setting) => {
+      configured.push(setting);
+      startSetting = setting;
+      return result();
+    },
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+    wait: async () => undefined,
+  };
+  const operation = createWindowsServiceCoordinator(
+    paths,
+    planFor("docker-engine"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  await operation.rollback();
+
+  assert.deepEqual(configured, ["disabled", "delayed-auto"]);
+  assert.equal(startSetting, "delayed-auto");
+  assert.equal(running, true);
+});
+
+test("Windows service coordination rolls back a side-effecting start-mode failure", async () => {
+  const paths = windowsPaths();
+  let startType: 2 | 3 | 4 = 2;
+  let stops = 0;
+  const configured: string[] = [];
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async () => result("STATE : 4 RUNNING\r\n"),
+    config: async () =>
+      result(
+        `START_TYPE : ${startType} ${startType === 4 ? "DISABLED" : "AUTO_START"}\r\nBINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+      ),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    configureStart: async (_serviceName, setting) => {
+      configured.push(setting);
+      startType = setting === "disabled" ? 4 : setting === "demand" ? 3 : 2;
+      return setting === "disabled"
+        ? result("", 5, "simulated output loss after mutation")
+        : result();
+    },
+    stop: async () => {
+      stops += 1;
+      return result();
+    },
+    start: async () => result(),
+    delete: async () => result(),
+  };
+  const operation = createWindowsServiceCoordinator(
+    paths,
+    planFor("docker-engine"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  const cleanup = await operation.run();
+  assert.equal(cleanup.status, "failed");
+  assert.equal(startType, 2);
+  assert.equal(stops, 0);
+  assert.deepEqual(configured, ["disabled", "auto"]);
+});
+
+test("Windows service guard blocks reactivation during the final lock probe", async () => {
+  const paths = windowsPaths();
+  let running = true;
+  let startType: 2 | 3 | 4 = 2;
+  let payloadRan = false;
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async () =>
+      result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+    config: async () =>
+      result(
+        `START_TYPE : ${startType} ${startType === 4 ? "DISABLED" : "AUTO_START"}\r\nBINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+      ),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    configureStart: async (_serviceName, setting) => {
+      startType = setting === "disabled" ? 4 : setting === "demand" ? 3 : 2;
+      return result();
+    },
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+    wait: async () => undefined,
+  };
+  const coordinator = createWindowsServiceCoordinator(
+    paths,
+    planFor("docker-engine"),
+    control,
+  );
+  assert.ok(coordinator);
+  const payload = guardWindowsServiceOperation(
+    createFunctionOperation({
+      id: "windows:test:guarded-docker-payload",
+      component: "docker-engine",
+      description: "Run guarded Docker payload",
+      phase: "package",
+      // Model a service recovery race after a successful target lock probe.
+      validateBeforeRun: async () => {
+        running = true;
+      },
+      run: async () => {
+        payloadRan = true;
+        return { status: "removed" };
+      },
+    }),
+    coordinator,
+  );
+
+  await assert.rejects(
+    async () => await executeOperations([coordinator, payload]),
+    /unsafe reactivation|reactivated/,
+  );
+  assert.equal(payloadRan, false);
+  assert.equal(startType, 2);
+  assert.equal(running, true);
 });
 
 for (const service of [
@@ -2088,8 +3001,8 @@ for (const service of [
   {
     component: "nginx" as const,
     name: "nginx",
-    executable: "C:\\tools\\nginx\\nginx.exe",
-    commandLine: "C:\\tools\\nginx\\nginx.exe -s run",
+    executable: "C:\\tools\\nginx-1.31.3\\nginx.exe",
+    commandLine: "C:\\tools\\nginx-1.31.3\\nginx.exe -s run",
   },
   {
     component: "postgresql" as const,
@@ -2461,6 +3374,702 @@ test("Windows service coordination rejects unstable initial states before mutati
   }
 });
 
+test("Windows service stop and polling share one 30-second wall deadline", async () => {
+  let now = 0;
+  let stopRequested = false;
+  let stopPolling = false;
+  const transitionTimeouts: number[] = [];
+  const result = (stdout: string) => ({ exitCode: 0, stdout, stderr: "" });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result(""),
+    query: async (_name, timeoutMs) => {
+      if (!stopRequested) return result("STATE : 4 RUNNING\r\n");
+      if (!stopPolling || timeoutMs === undefined) {
+        return result("STATE : 1 STOPPED\r\n");
+      }
+      transitionTimeouts.push(timeoutMs);
+      now += timeoutMs;
+      stopPolling = false;
+      return result("STATE : 3 STOP_PENDING\r\n");
+    },
+    stop: async (_name, timeoutMs) => {
+      stopRequested = true;
+      stopPolling = true;
+      assert.notEqual(timeoutMs, undefined);
+      transitionTimeouts.push(timeoutMs ?? 0);
+      now += 10_000;
+      return result("");
+    },
+    start: async () => {
+      stopRequested = false;
+      return result("");
+    },
+    delete: async () => result(""),
+    wait: async (milliseconds) => {
+      now += milliseconds;
+    },
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  const operationResult = await operation.run();
+  assert.equal(operationResult.status, "failed");
+  assert.match(operationResult.detail ?? "", /30 seconds|deadline/i);
+  assert.ok(transitionTimeouts.length >= 2);
+  assert.ok(
+    transitionTimeouts.at(-1)! <= 20_000,
+    "polling must receive only the transition time left after sc stop",
+  );
+});
+
+test("Windows final service recheck cannot reset the coordination deadline", async () => {
+  let now = 0;
+  let running = true;
+  let stopCompleted = false;
+  let starts = 0;
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    exitCode,
+    stdout,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result(),
+    query: async () => {
+      if (!running && !stopCompleted) {
+        stopCompleted = true;
+        now += 120_001;
+      }
+      return result(
+        running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n",
+      );
+    },
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      starts += 1;
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+
+  const operationResult = await operation.run();
+
+  assert.equal(operationResult.status, "failed");
+  assert.match(operationResult.detail ?? "", /two-minute aggregate deadline/);
+  assert.equal(starts, 1, "rollback receives a fresh coordination budget");
+  assert.equal(running, true);
+});
+
+test("Windows service discovery shares one two-minute aggregate deadline", async () => {
+  let now = 0;
+  let stops = 0;
+  const timeouts: number[] = [];
+  const serviceNames = Array.from(
+    { length: 16 },
+    (_, index) => `postgresql-x64-${index + 1}`,
+  );
+  const consume = (timeoutMs: number | undefined): void => {
+    assert.notEqual(timeoutMs, undefined);
+    timeouts.push(timeoutMs ?? 0);
+    now += timeoutMs ?? 0;
+  };
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async (timeoutMs) => {
+      consume(timeoutMs);
+      return {
+        exitCode: 0,
+        stdout: serviceNames
+          .map((name) => `SERVICE_NAME: ${name}\r\n`)
+          .join(""),
+        stderr: "",
+      };
+    },
+    query: async (_name, timeoutMs) => {
+      consume(timeoutMs);
+      return { exitCode: 0, stdout: "STATE : 4 RUNNING\r\n", stderr: "" };
+    },
+    config: async (name, timeoutMs) => {
+      consume(timeoutMs);
+      return testWindowsServiceConfiguration(name);
+    },
+    stop: async () => {
+      stops += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    delete: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("postgresql"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await assert.rejects(operation.validate, /two-minute aggregate deadline/);
+  assert.ok(timeouts.length >= 1);
+  assert.ok(timeouts.reduce((total, timeout) => total + timeout, 0) <= 120_000);
+  assert.equal(stops, 0);
+});
+
+test("Windows cleanup removes exact stale service registrations after package cleanup", async () => {
+  const paths = windowsPaths();
+  const registered = new Set(["Apache", "nginx", "postgresql-x64-16"]);
+  const deleted: string[] = [];
+  let stopped = false;
+  let executablesPresent = true;
+  const removedInstallationDirectories = new Set(
+    [
+      `${paths.drive}\\tools\\Apache24`,
+      `${paths.drive}\\tools\\nginx-1.31.3`,
+      `${paths.programFiles}\\PostgreSQL\\16`,
+    ].map((path) => path.toLowerCase()),
+  );
+  const executableProbe: WindowsPathProbe = {
+    lstat: async (path) => {
+      if (
+        !executablesPresent &&
+        removedInstallationDirectories.has(path.toLowerCase())
+      ) {
+        throw Object.assign(new Error("installation directory is absent"), {
+          code: "ENOENT",
+        });
+      }
+      return windowsPathStats(/\.exe$/i.test(path) ? "file" : "directory");
+    },
+  };
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () =>
+      result(
+        registered.has("postgresql-x64-16")
+          ? "SERVICE_NAME: postgresql-x64-16\r\n"
+          : "SERVICE_NAME: EventLog\r\n",
+      ),
+    query: async (name) =>
+      registered.has(name)
+        ? result(stopped ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n")
+        : result("", 1060, "service does not exist"),
+    config: async (name) => testWindowsServiceConfiguration(name),
+    inspectExecutable: async (executable) =>
+      await inspectWindowsServiceExecutable(paths, executable, executableProbe),
+    stop: async () => result(""),
+    delete: async (name) => {
+      deleted.push(name);
+      registered.delete(name);
+      return result("");
+    },
+    wait: async () => undefined,
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    paths,
+    planFor("apache", "nginx", "postgresql"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  stopped = true;
+  executablesPresent = false;
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "removed", cleanupResult.detail ?? "");
+  assert.deepEqual(deleted, ["Apache", "nginx", "postgresql-x64-16"]);
+  assert.equal(registered.size, 0);
+});
+
+test("Windows service guards accept verified uninstaller absence and reject recreation", async () => {
+  const paths = windowsPaths();
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  let registered = true;
+  let running = true;
+  let residualRan = false;
+  let recreatedPayloadRan = false;
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () =>
+      registered
+        ? result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n")
+        : result("", 1060, "service does not exist"),
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      running = true;
+      return result();
+    },
+    delete: async () => {
+      registered = false;
+      return result();
+    },
+    wait: async () => undefined,
+  };
+  const plan = planFor("apache");
+  const coordinator = createWindowsServiceCoordinator(
+    paths,
+    plan,
+    control,
+    lifecycle,
+  );
+  const finalizer = createWindowsServiceRegistrationCleanup(
+    paths,
+    plan,
+    control,
+    lifecycle,
+  );
+  assert.ok(coordinator);
+  assert.ok(finalizer);
+  const uninstaller = guardWindowsServiceOperation(
+    createFunctionOperation({
+      id: "windows:test:apache-uninstaller",
+      component: "apache",
+      description: "Simulate Apache uninstaller",
+      phase: "package",
+      run: async () => {
+        registered = false;
+        return { status: "removed" };
+      },
+    }),
+    coordinator,
+  );
+  const residual = guardWindowsServiceOperation(
+    createFunctionOperation({
+      id: "windows:test:apache-residual",
+      component: "apache",
+      description: "Remove Apache residual",
+      phase: "system",
+      run: async () => {
+        residualRan = true;
+        return { status: "removed" };
+      },
+    }),
+    coordinator,
+  );
+  const recreated = guardWindowsServiceOperation(
+    createFunctionOperation({
+      id: "windows:test:apache-recreated",
+      component: "apache",
+      description: "Reject recreated Apache service",
+      phase: "system",
+      validateBeforeRun: async () => {
+        registered = true;
+      },
+      run: async () => {
+        recreatedPayloadRan = true;
+        return { status: "removed" };
+      },
+    }),
+    coordinator,
+  );
+
+  await assert.rejects(
+    async () =>
+      await executeOperations([
+        coordinator,
+        uninstaller,
+        finalizer,
+        residual,
+        recreated,
+      ]),
+    /reactivated|disabled latch/,
+  );
+  assert.equal(residualRan, true);
+  assert.equal(recreatedPayloadRan, false);
+  assert.equal(lifecycle.isRegistrationFinalized("apache"), true);
+});
+
+test("Windows service registration cleanup is the last selected package operation", async () => {
+  const adapter = await createWindowsAdapter(contextFor("windows"));
+  const plan = planFor("apache", "nginx", "postgresql");
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+  const cleanupIndex = prepared.findIndex(
+    ({ id }) => id === "windows:services:unregister",
+  );
+  const selectedPackageIndexes = prepared
+    .map((operation, index) => ({ operation, index }))
+    .filter(
+      ({ operation }) =>
+        operation.phase === "package" &&
+        operation.id !== "windows:services:unregister",
+    )
+    .map(({ index }) => index);
+
+  assert.notEqual(cleanupIndex, -1);
+  assert.equal(prepared[cleanupIndex]?.phase, "package");
+  assert.equal(prepared[cleanupIndex]?.validateBeforeRun, undefined);
+  assert.ok(selectedPackageIndexes.every((index) => index < cleanupIndex));
+  assert.equal(
+    selectedPackageIndexes
+      .map((index) => prepared[index])
+      .filter(
+        (operation) =>
+          operation !== undefined &&
+          ["apache", "nginx", "postgresql"].includes(operation.component),
+      )
+      .every((operation) => operation?.validateBeforeRun !== undefined),
+    true,
+  );
+});
+
+test("Windows service registration cleanup rejects new PostgreSQL services before any delete", async () => {
+  let inventoryCalls = 0;
+  const deleted: string[] = [];
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => {
+      inventoryCalls += 1;
+      return result(
+        inventoryCalls === 1
+          ? "SERVICE_NAME: postgresql-x64-16\r\n"
+          : "SERVICE_NAME: postgresql-x64-16\r\nSERVICE_NAME: postgresql-x64-17\r\n",
+      );
+    },
+    query: async () => result("STATE : 1 STOPPED\r\n"),
+    stop: async () => result(""),
+    delete: async (name) => {
+      deleted.push(name);
+      return result("");
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("postgresql"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /inventory changed/i);
+  assert.deepEqual(deleted, []);
+});
+
+test("Windows service registration cleanup rejects reactivation before any delete", async () => {
+  let validationComplete = false;
+  const deleted: string[] = [];
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async (name) =>
+      result(
+        validationComplete && name === "nginx"
+          ? "STATE : 4 RUNNING\r\n"
+          : validationComplete
+            ? "STATE : 1 STOPPED\r\n"
+            : "STATE : 4 RUNNING\r\n",
+      ),
+    stop: async () => result(""),
+    delete: async (name) => {
+      deleted.push(name);
+      return result("");
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache", "nginx"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  validationComplete = true;
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /reactivated/i);
+  assert.deepEqual(deleted, []);
+});
+
+test("Windows service registration cleanup rejects configuration drift before any delete", async () => {
+  let drifted = false;
+  const deleted: string[] = [];
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () =>
+      result(drifted ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n"),
+    config: async (name) =>
+      drifted
+        ? result(
+            `BINARY_PATH_NAME : ${windowsPaths().drive}\\workflow\\httpd.exe\r\n`,
+          )
+        : testWindowsServiceConfiguration(name),
+    inspectExecutable: async () => ({
+      dev: 1n,
+      ino: 2n,
+      size: 3n,
+      mtimeNs: 4n,
+    }),
+    stop: async () => result(""),
+    delete: async (name) => {
+      deleted.push(name);
+      return result("");
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  drifted = true;
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /outside|configuration changed/i);
+  assert.deepEqual(deleted, []);
+});
+
+test("Windows service registration deletion uses one 30-second wall deadline", async () => {
+  let now = 0;
+  let validationComplete = false;
+  let deletionAccepted = false;
+  const pollTimeouts: number[] = [];
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async (_name, timeoutMs) => {
+      if (deletionAccepted) {
+        if (timeoutMs !== undefined) {
+          pollTimeouts.push(timeoutMs);
+          now += timeoutMs;
+        }
+        return result("", 1072, "service marked for deletion");
+      }
+      return result(
+        validationComplete ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n",
+      );
+    },
+    stop: async () => result(""),
+    delete: async () => {
+      deletionAccepted = true;
+      return result("", 1072, "service marked for deletion");
+    },
+    wait: async (milliseconds) => {
+      now += milliseconds;
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  validationComplete = true;
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /30 seconds|deadline/i);
+  assert.ok(pollTimeouts.length >= 1);
+  assert.ok(
+    pollTimeouts.reduce((total, timeout) => total + timeout, 0) <= 30_000,
+  );
+});
+
+test("Windows service registration deletion includes the delete command in its deadline", async () => {
+  let now = 0;
+  let validationComplete = false;
+  let registered = true;
+  let postDeletionQueries = 0;
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () => {
+      if (!registered) {
+        postDeletionQueries += 1;
+        return result("", 1060, "service does not exist");
+      }
+      return result(
+        validationComplete ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n",
+      );
+    },
+    stop: async () => result(),
+    delete: async () => {
+      registered = false;
+      now += 30_001;
+      return result();
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+    lifecycle,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  validationComplete = true;
+
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /30 seconds|deadline/i);
+  assert.equal(postDeletionQueries, 0);
+  assert.equal(lifecycle.isRegistrationFinalized("apache"), false);
+});
+
+test("Windows service registration never finalizes after a terminal query overruns its budget", async () => {
+  let now = 0;
+  let stopped = false;
+  let registered = true;
+  let missingQueries = 0;
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  const result = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () => {
+      if (!registered) {
+        missingQueries += 1;
+        if (missingQueries === 2) now += 120_001;
+        return result("", 1060, "service does not exist");
+      }
+      return result(
+        stopped ? "STATE : 1 STOPPED\r\n" : "STATE : 4 RUNNING\r\n",
+      );
+    },
+    stop: async () => result(),
+    delete: async () => {
+      registered = false;
+      return result();
+    },
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+    lifecycle,
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+  stopped = true;
+
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /two-minute aggregate deadline/);
+  assert.equal(lifecycle.isRegistrationFinalized("apache"), false);
+});
+
+test("Windows service registration cleanup accepts an uninstaller deletion already in progress", async () => {
+  let validationComplete = false;
+  let pendingQueries = 0;
+  let deletes = 0;
+  const result = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () => {
+      if (!validationComplete) return result("STATE : 4 RUNNING\r\n");
+      pendingQueries += 1;
+      return pendingQueries < 3
+        ? result("", 1072, "service marked for deletion")
+        : result("", 1060, "service does not exist");
+    },
+    stop: async () => result(""),
+    delete: async () => {
+      deletes += 1;
+      return result("");
+    },
+    wait: async () => undefined,
+  };
+  const operation = createWindowsServiceRegistrationCleanup(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  validationComplete = true;
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "not-found", cleanupResult.detail ?? "");
+  assert.equal(deletes, 0);
+  assert.equal(pendingQueries, 4);
+});
+
 test("Windows Docker service remains registered after successful preflight", async () => {
   let stopped = false;
   let deleted = false;
@@ -2637,10 +4246,222 @@ test("Windows Docker removes dockerd only after verified service deletion", asyn
   assert.deepEqual(events, [
     `remove:${paths.system32}\\docker.exe`,
     `remove:${paths.systemRoot}\\SysWOW64\\docker.exe`,
-    `remove:${paths.programData}\\docker\\cli-plugins`,
+    `remove:${paths.programData}\\docker`,
     "delete:docker",
     `remove:${paths.system32}\\dockerd.exe`,
   ]);
+});
+
+test("Windows Docker propagates every validated target boundary to locked removal", async () => {
+  const paths = windowsPaths();
+  const targets = [
+    `${paths.system32}\\docker.exe`,
+    `${paths.systemRoot}\\SysWOW64\\docker.exe`,
+    `${paths.programData}\\docker`,
+    `${paths.system32}\\dockerd.exe`,
+  ];
+  const snapshots = new Map(
+    targets.map((target, index) => [
+      target,
+      {
+        targetExists: true,
+        entries: [
+          {
+            path: target,
+            device: 1n,
+            inode: BigInt(index + 10),
+            mode: 0o100755n,
+          },
+        ],
+      },
+    ]),
+  );
+  const removed: string[] = [];
+  const missingService = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    exists: async () => true,
+    inventory: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    query: async () => ({
+      exitCode: 1060,
+      stdout: "",
+      stderr: "service does not exist",
+    }),
+    stop: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    start: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    delete: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  } satisfies WindowsServiceControl;
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: missingService,
+      validateTarget: async (target) => snapshots.get(target),
+      removeTarget: async (target, expectedBoundary) => {
+        assert.equal(expectedBoundary, snapshots.get(target));
+        removed.push(target);
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.deepEqual(removed, targets);
+});
+
+test("Windows Docker preflights every locked target operation", async () => {
+  const paths = windowsPaths();
+  const validated: string[] = [];
+  const removed: string[] = [];
+  const expectedTargets = [
+    `${paths.system32}\\docker.exe`,
+    `${paths.systemRoot}\\SysWOW64\\docker.exe`,
+    `${paths.programData}\\docker`,
+    `${paths.system32}\\dockerd.exe`,
+  ];
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        exists: async () => true,
+        inventory: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        query: async () => ({
+          exitCode: 1060,
+          stdout: "",
+          stderr: "service does not exist",
+        }),
+        stop: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        delete: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      },
+      createTargetOperation: (target) =>
+        createFunctionOperation({
+          id: `locked-target:${target}`,
+          component: "docker-engine",
+          description: `locked target ${target}`,
+          phase: "system",
+          validate: async () => {
+            validated.push(target);
+          },
+          run: async () => {
+            removed.push(target);
+            return { status: "removed" };
+          },
+        }),
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.deepEqual(validated, expectedTargets);
+  assert.equal((await operation.run()).status, "removed");
+  assert.deepEqual(removed, expectedTargets);
+});
+
+test("Windows Docker preserves image data when docker-images is skipped", async () => {
+  const paths = windowsPaths();
+  const validated: string[] = [];
+  const removed: string[] = [];
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      removeDockerData: false,
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        exists: async () => true,
+        inventory: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        query: async () => ({
+          exitCode: 1060,
+          stdout: "",
+          stderr: "service does not exist",
+        }),
+        stop: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+        delete: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      },
+      createTargetOperation: (target) =>
+        createFunctionOperation({
+          id: `preserved-data-target:${target}`,
+          component: "docker-engine",
+          description: `preserved data target ${target}`,
+          phase: "system",
+          validate: async () => {
+            validated.push(target);
+          },
+          run: async () => {
+            removed.push(target);
+            return { status: "removed" };
+          },
+        }),
+    },
+  );
+  const expectedTargets = [
+    `${paths.system32}\\docker.exe`,
+    `${paths.systemRoot}\\SysWOW64\\docker.exe`,
+    `${paths.programData}\\docker\\cli-plugins`,
+    `${paths.system32}\\dockerd.exe`,
+  ];
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.deepEqual(validated, expectedTargets);
+  assert.equal((await operation.run()).status, "removed");
+  assert.deepEqual(removed, expectedTargets);
+  assert.equal(removed.includes(`${paths.programData}\\docker`), false);
+});
+
+test("Windows Docker stops before deleting data if its service reactivates mid-cleanup", async () => {
+  const paths = windowsPaths();
+  let running = false;
+  let registered = true;
+  const removed: string[] = [];
+  const commandResult = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        exists: async () => true,
+        inventory: async () => commandResult(""),
+        query: async () =>
+          registered
+            ? commandResult(
+                running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n",
+              )
+            : commandResult("", 1060, "service does not exist"),
+        config: async () =>
+          commandResult(
+            `BINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
+          ),
+        stop: async () => commandResult(""),
+        delete: async () => {
+          registered = false;
+          return commandResult("");
+        },
+      },
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        removed.push(target);
+        running = true;
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /not stopped|unsafe reactivation/);
+  assert.deepEqual(removed, [`${paths.system32}\\docker.exe`]);
+  assert.equal(removed.includes(`${paths.programData}\\docker`), false);
 });
 
 test("Windows Docker accepts a raced service-delete no-op only after absence is verified", async () => {
@@ -2743,15 +4564,331 @@ test("Windows Docker polls a service marked for deletion until 1060 verifies abs
   const started = Date.now();
   const results = await executeOperations([operation]);
   assert.equal(results[0]?.status, "removed");
-  assert.equal(pendingQueries, 3);
+  assert.equal(pendingQueries, 4);
   assert.ok(Date.now() - started >= 450);
 });
 
-test("Windows Docker fails if its service is recreated after dockerd removal", async () => {
+test("Windows Docker deletion polling shares one 30-second wall deadline", async () => {
   const paths = windowsPaths();
+  let now = 0;
+  let deletionAccepted = false;
+  const pollTimeouts: number[] = [];
+  const commandResult = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => commandResult(""),
+    query: async (_name, timeoutMs) => {
+      if (!deletionAccepted) return commandResult("STATE : 1 STOPPED\r\n");
+      if (timeoutMs !== undefined) {
+        pollTimeouts.push(timeoutMs);
+        now += timeoutMs;
+      }
+      return commandResult("", 1072, "service marked for deletion");
+    },
+    stop: async () => commandResult(""),
+    delete: async () => {
+      deletionAccepted = true;
+      return commandResult("", 1072, "service marked for deletion");
+    },
+    wait: async (milliseconds) => {
+      now += milliseconds;
+    },
+  };
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control,
+      validateTarget: async () => undefined,
+      removeTarget: async () => ({ status: "not-found" }),
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /30 seconds|deadline/i);
+  assert.ok(pollTimeouts.length >= 1);
+  assert.ok(
+    pollTimeouts.reduce((total, timeout) => total + timeout, 0) <= 30_000,
+  );
+});
+
+test("Windows Docker deletion includes the delete command in its deadline", async () => {
+  const paths = windowsPaths();
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  let now = 0;
+  let deletionStarted = false;
+  let postDeletionQueries = 0;
+  let dockerdRemovals = 0;
+  const commandResult = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => now,
+        exists: async () => true,
+        inventory: async () => commandResult(),
+        query: async () => {
+          if (deletionStarted) {
+            postDeletionQueries += 1;
+            return commandResult("", 1060, "service does not exist");
+          }
+          return commandResult("STATE : 1 STOPPED\r\n");
+        },
+        stop: async () => commandResult(),
+        delete: async () => {
+          deletionStarted = true;
+          now += 30_001;
+          return commandResult();
+        },
+      },
+      lifecycle,
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        if (target === `${paths.system32}\\dockerd.exe`) {
+          dockerdRemovals += 1;
+        }
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /30 seconds|deadline/i);
+  assert.equal(postDeletionQueries, 0);
+  assert.equal(dockerdRemovals, 0);
+  assert.equal(lifecycle.isRegistrationFinalized(), false);
+});
+
+test("Windows Docker service budget excludes bounded filesystem removal time", async () => {
+  const paths = windowsPaths();
+  let now = 0;
+  const removed: string[] = [];
+  const commandResult = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => now,
+        exists: async () => true,
+        inventory: async () => commandResult(""),
+        query: async () => commandResult("", 1060, "service does not exist"),
+        stop: async () => commandResult(""),
+        delete: async () => commandResult(""),
+      },
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        removed.push(target);
+        now += 120_001;
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+
+  assert.equal(
+    cleanupResult.status,
+    "removed",
+    cleanupResult.detail ?? "Docker cleanup failed",
+  );
+  assert.ok(removed.length > 1);
+});
+
+test("Windows Docker service budget rejects a completed task overrun", async () => {
+  const paths = windowsPaths();
+  let now = 0;
+  let dockerdRemoved = false;
+  let removals = 0;
+  const commandResult = (stdout: string, exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => now,
+        exists: async () => true,
+        inventory: async () => commandResult(""),
+        query: async () => {
+          if (dockerdRemoved) now = 120_001;
+          return commandResult("", 1060, "service does not exist");
+        },
+        stop: async () => commandResult(""),
+        delete: async () => commandResult(""),
+      },
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        removals += 1;
+        if (target === `${paths.system32}\\dockerd.exe`) {
+          dockerdRemoved = true;
+        }
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /two-minute aggregate deadline/);
+  assert.ok(removals > 0);
+});
+
+test("Windows Docker rejects a deadline crossed by its final budget debit", async () => {
+  const paths = windowsPaths();
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  let payloadRemovals = 0;
+  let completionClockReads = 0;
+  let completionClockArmed = false;
+  let dockerdRemovals = 0;
+  const commandResult = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => {
+          if (!completionClockArmed) return 0;
+          completionClockReads += 1;
+          return completionClockReads <= 3 ? 119_999 : 120_000;
+        },
+        exists: async () => true,
+        inventory: async () => commandResult(),
+        query: async () => {
+          if (payloadRemovals === 3 && !completionClockArmed) {
+            completionClockArmed = true;
+          }
+          return commandResult("", 1060, "service does not exist");
+        },
+        stop: async () => commandResult(),
+        delete: async () => commandResult(),
+      },
+      lifecycle,
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        if (target === `${paths.system32}\\dockerd.exe`) {
+          dockerdRemovals += 1;
+        } else {
+          payloadRemovals += 1;
+        }
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /two-minute aggregate deadline/);
+  assert.equal(completionClockReads, 4);
+  assert.equal(dockerdRemovals, 0);
+  assert.equal(lifecycle.isRegistrationFinalized(), false);
+});
+
+test("Windows Docker stops after an over-budget service deletion", async () => {
+  const paths = windowsPaths();
+  const lifecycle = createWindowsDockerServiceLifecycle();
+  let now = 0;
+  let deletionStarted = false;
+  let postDeletionQueries = 0;
+  let dockerdRemovals = 0;
+  const commandResult = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => now,
+        exists: async () => true,
+        inventory: async () => commandResult(),
+        query: async () => {
+          if (deletionStarted) {
+            postDeletionQueries += 1;
+            return commandResult("", 1060, "service does not exist");
+          }
+          return commandResult("STATE : 1 STOPPED\r\n");
+        },
+        stop: async () => commandResult(),
+        delete: async () => {
+          deletionStarted = true;
+          now += 120_001;
+          return commandResult();
+        },
+      },
+      lifecycle,
+      validateTarget: async () => undefined,
+      removeTarget: async (target) => {
+        if (target === `${paths.system32}\\dockerd.exe`) {
+          dockerdRemovals += 1;
+        }
+        return { status: "removed" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /two-minute aggregate deadline/);
+  assert.equal(postDeletionQueries, 0);
+  assert.equal(dockerdRemovals, 0);
+  assert.equal(lifecycle.isRegistrationFinalized(), false);
+});
+
+test("Windows Docker stops before dockerd removal if its service is recreated", async () => {
+  const paths = windowsPaths();
+  const lifecycle = createWindowsDockerServiceLifecycle();
   const identity = { dev: 1n, ino: 2n, size: 3n, mtimeNs: 4n };
   let registered = true;
   let dockerdRemoved = false;
+  let missingQueries = 0;
   const commandResult = (stdout: string, exitCode = 0, stderr = "") => ({
     stdout,
     exitCode,
@@ -2760,10 +4897,12 @@ test("Windows Docker fails if its service is recreated after dockerd removal", a
   const control: WindowsServiceControl = {
     exists: async () => true,
     inventory: async () => commandResult(""),
-    query: async () =>
-      registered
-        ? commandResult("STATE : 1 STOPPED\r\n")
-        : commandResult("", 1060, "service does not exist"),
+    query: async () => {
+      if (registered) return commandResult("STATE : 1 STOPPED\r\n");
+      missingQueries += 1;
+      if (missingQueries === 1) registered = true;
+      return commandResult("", 1060, "service does not exist");
+    },
     config: async () =>
       commandResult(
         `BINARY_PATH_NAME : ${paths.system32}\\dockerd.exe --run-service\r\n`,
@@ -2781,11 +4920,11 @@ test("Windows Docker fails if its service is recreated after dockerd removal", a
     paths,
     {
       control,
+      lifecycle,
       validateTarget: async () => undefined,
       removeTarget: async (target) => {
         if (target === `${paths.system32}\\dockerd.exe`) {
           dockerdRemoved = true;
-          registered = true;
         }
         return { status: "removed" };
       },
@@ -2795,12 +4934,56 @@ test("Windows Docker fails if its service is recreated after dockerd removal", a
   assert.ok(operation.validate);
   await operation.validate();
   const result = await operation.run();
-  assert.equal(dockerdRemoved, true);
+  assert.equal(dockerdRemoved, false);
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /service.*recreated|remained registered/i);
+  assert.equal(lifecycle.isRegistrationFinalized(), false);
 });
 
-test("Windows Docker rechecks service configuration after payload cleanup before deletion", async () => {
+test("Windows Docker preserves a primary discovery error that overruns its budget", async () => {
+  const paths = windowsPaths();
+  let now = 0;
+  let runStarted = false;
+  const commandResult = (stdout = "", exitCode = 0, stderr = "") => ({
+    stdout,
+    exitCode,
+    stderr,
+  });
+  const operation = createWindowsDockerEngineOperation(
+    contextFor("windows"),
+    paths,
+    {
+      control: {
+        ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+        now: () => now,
+        exists: async () => true,
+        inventory: async () => commandResult(),
+        query: async () => {
+          if (runStarted) {
+            now += 120_001;
+            throw new Error("primary Docker discovery failure");
+          }
+          return commandResult("", 1060, "service does not exist");
+        },
+        stop: async () => commandResult(),
+        delete: async () => commandResult(),
+      },
+      validateTarget: async () => undefined,
+      removeTarget: async () => ({ status: "removed" }),
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  runStarted = true;
+  const result = await operation.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /primary Docker discovery failure/);
+  assert.match(result.detail ?? "", /two-minute aggregate deadline/);
+});
+
+test("Windows Docker rechecks service configuration between payload targets", async () => {
   const paths = windowsPaths();
   let running = true;
   let drifted = false;
@@ -2873,7 +5056,7 @@ test("Windows Docker rechecks service configuration after payload cleanup before
     async () => await executeOperations([coordinator, engine]),
     /service executable is outside|configuration changed/,
   );
-  assert.equal(payloadRemovals, 3);
+  assert.equal(payloadRemovals, 1);
   assert.equal(deletes, 0);
   assert.equal(starts, 0);
   assert.equal(running, false);
@@ -2962,7 +5145,7 @@ test("Windows Docker rejects a drifted or reactivated service before any payload
     await assert.rejects(
       async () =>
         await executeOperations([coordinator, mutateAfterPreflight, engine]),
-      /service executable is outside|configuration changed|not stopped/,
+      /service executable is outside|configuration changed|not stopped|unsafe reactivation/,
     );
     assert.equal(payloadRemovals, 0, mutation);
     assert.equal(deletes, 0, mutation);
@@ -3052,7 +5235,7 @@ test("Windows Docker keeps dockerd available but stopped when service deletion f
   assert.deepEqual(removedTargets, [
     `${paths.system32}\\docker.exe`,
     `${paths.systemRoot}\\SysWOW64\\docker.exe`,
-    `${paths.programData}\\docker\\cli-plugins`,
+    `${paths.programData}\\docker`,
   ]);
 });
 
@@ -3263,6 +5446,206 @@ test("Windows service coordinator rolls back its own failure exactly once", asyn
   assert.equal(starts, 1);
 });
 
+for (const originallyRunning of [false, true]) {
+  test(`Windows service rollback rejects an over-budget terminal ${
+    originallyRunning ? "RUNNING" : "STOPPED"
+  } query`, async () => {
+    let now = 0;
+    let running = originallyRunning;
+    let rollbackPhase = false;
+    let overrunApplied = false;
+    let starts = 0;
+    const result = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    const control: WindowsServiceControl = {
+      ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+      now: () => now,
+      exists: async () => true,
+      inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+      query: async () => {
+        if (rollbackPhase && !overrunApplied && running === originallyRunning) {
+          overrunApplied = true;
+          now += 120_001;
+        }
+        return result(
+          running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n",
+        );
+      },
+      stop: async () => {
+        running = false;
+        return result();
+      },
+      start: async () => {
+        starts += 1;
+        running = true;
+        return result();
+      },
+      delete: async () => result(),
+    };
+    const operation = createWindowsServiceCoordinator(
+      windowsPaths(),
+      planFor("apache"),
+      control,
+    );
+    assert.ok(operation?.validate);
+    assert.ok(operation.rollback);
+    await operation.validate();
+    assert.equal((await operation.run()).status, "removed");
+    rollbackPhase = true;
+
+    await assert.rejects(
+      operation.rollback,
+      originallyRunning
+        ? /30 seconds|two-minute aggregate deadline/
+        : /two-minute aggregate deadline/,
+    );
+    assert.equal(overrunApplied, true);
+
+    await operation.rollback();
+    assert.equal(starts, originallyRunning ? 1 : 0);
+    assert.equal(running, originallyRunning);
+  });
+}
+
+test("Windows service rollback includes start in its 30-second deadline", async () => {
+  let now = 0;
+  let running = true;
+  let rollbackPhase = false;
+  let starts = 0;
+  const result = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => now,
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () =>
+      result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      starts += 1;
+      running = true;
+      if (rollbackPhase) now += 30_001;
+      return result();
+    },
+    delete: async () => result(),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  rollbackPhase = true;
+
+  await assert.rejects(operation.rollback, /30 seconds|deadline/i);
+  assert.equal(starts, 1);
+
+  await operation.rollback();
+  assert.equal(starts, 1);
+  assert.equal(running, true);
+});
+
+test("Windows service rollback retains its ledger after the final deadline check", async () => {
+  let rollbackPhase = false;
+  let overrunEnabled = true;
+  let finalClockArmed = false;
+  let finalClockReads = 0;
+  let running = false;
+  let starts = 0;
+  let rollbackQueries = 0;
+  const result = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+  const control: WindowsServiceControl = {
+    ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+    now: () => {
+      if (!finalClockArmed) return 0;
+      finalClockReads += 1;
+      return finalClockReads === 1 ? 119_999 : 120_000;
+    },
+    exists: async () => true,
+    inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+    query: async () => {
+      if (rollbackPhase) rollbackQueries += 1;
+      if (rollbackPhase && overrunEnabled && !running && !finalClockArmed) {
+        finalClockArmed = true;
+      }
+      return result(
+        running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n",
+      );
+    },
+    stop: async () => {
+      running = false;
+      return result();
+    },
+    start: async () => {
+      starts += 1;
+      running = true;
+      return result();
+    },
+    delete: async () => result(),
+  };
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    control,
+  );
+  assert.ok(operation?.validate);
+  assert.ok(operation.rollback);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  rollbackPhase = true;
+
+  await assert.rejects(operation.rollback, /two-minute aggregate deadline/);
+  const queriesAfterFailure = rollbackQueries;
+  overrunEnabled = false;
+  finalClockArmed = false;
+  finalClockReads = 0;
+
+  await operation.rollback();
+  assert.ok(rollbackQueries > queriesAfterFailure);
+  assert.equal(starts, 0);
+  assert.equal(running, false);
+});
+
+test("Windows service deadlines preserve an overrun task error", async () => {
+  let now = 0;
+  let running = true;
+  const result = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+  const operation = createWindowsServiceCoordinator(
+    windowsPaths(),
+    planFor("apache"),
+    {
+      ...TEST_WINDOWS_SERVICE_IDENTITY_CONTROL,
+      now: () => now,
+      exists: async () => true,
+      inventory: async () => result("SERVICE_NAME: EventLog\r\n"),
+      query: async () =>
+        result(running ? "STATE : 4 RUNNING\r\n" : "STATE : 1 STOPPED\r\n"),
+      stop: async () => {
+        now += 30_001;
+        throw new Error("primary Windows stop failure");
+      },
+      start: async () => {
+        running = true;
+        return result();
+      },
+      delete: async () => result(),
+    },
+  );
+  assert.ok(operation?.validate);
+  await operation.validate();
+
+  const cleanupResult = await operation.run();
+
+  assert.equal(cleanupResult.status, "failed");
+  assert.match(cleanupResult.detail ?? "", /primary Windows stop failure/);
+  assert.match(cleanupResult.detail ?? "", /30 seconds/);
+});
+
 test("Windows service rollback continues after one restart query throws", async () => {
   const stopped = new Set<string>();
   const starts: string[] = [];
@@ -3408,7 +5791,7 @@ test("Windows service coordination rejects PostgreSQL membership changes after s
   assert.deepEqual(restarted, ["postgresql-x64-16"]);
 });
 
-test("Windows service coordination recognizes canonical stopped output without mutation", async () => {
+test("Windows service coordination idempotently stops a canonical stopped service", async () => {
   let stops = 0;
   const result = (stdout: string, exitCode = 0, stderr = "") => ({
     stdout,
@@ -3435,7 +5818,7 @@ test("Windows service coordination recognizes canonical stopped output without m
   await operation.validate();
   const operationResult = await operation.run();
   assert.equal(operationResult.status, "removed");
-  assert.equal(stops, 0);
+  assert.equal(stops, 1);
 });
 
 test("Windows manual path removers participate in complete-plan validation", async () => {
@@ -3535,6 +5918,7 @@ function windowsPathStats(
   options: {
     readonly link?: boolean;
     readonly ino?: bigint;
+    readonly mtimeNs?: bigint;
   } = {},
 ): Awaited<ReturnType<WindowsPathProbe["lstat"]>> {
   return {
@@ -3544,9 +5928,21 @@ function windowsPathStats(
     dev: 1n,
     ino: options.ino ?? (kind === "directory" ? 2n : 3n),
     size: 4n,
-    mtimeNs: 5n,
+    mtimeNs: options.mtimeNs ?? 5n,
   };
 }
+
+const TEST_WINDOWS_REMOVAL_RUNTIME_IDENTITY = {
+  device: 1n,
+  inode: 10n,
+  size: 100n,
+  modifiedNanoseconds: 200n,
+  changedNanoseconds: 300n,
+  mode: 0o100755n,
+  userId: 0n,
+  groupId: 0n,
+  contentSha256: "a".repeat(64),
+};
 
 test("Windows executable uninstall preflights all roots and executable types before spawn", async () => {
   const safeRoot = "C:\\Program Files\\Mozilla Firefox";
@@ -3595,6 +5991,72 @@ test("Windows executable uninstall preflights all roots and executable types bef
     );
     assert.equal(executions, 0);
   }
+});
+
+test("Windows executable uninstall preflights locked residual deletion before spawn", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  let executed = false;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-removal-preflight-test",
+    description: "test PostgreSQL removal preflight",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStats(path === installationRoot ? "directory" : "file"),
+    },
+    execute: async () => {
+      executed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removalDependencies: {
+      inspect: async (target) => ({
+        exists: true,
+        isLink: false,
+        realPath: target,
+      }),
+      boundary: async () => ({
+        targetExists: true,
+        entries: [
+          {
+            path: "C:\\Program Files",
+            device: 1n,
+            inode: 20n,
+            mode: 0o40755n,
+          },
+          {
+            path: "C:\\Program Files\\PostgreSQL",
+            device: 1n,
+            inode: 21n,
+            mode: 0o40755n,
+          },
+          {
+            path: installationRoot,
+            device: 1n,
+            inode: 22n,
+            mode: 0o40755n,
+          },
+        ],
+      }),
+      hostPlatform: "win32",
+      currentRuntimeExecutable: contextFor("windows").runtimeExecutable,
+      inspectExecutable: async () => TEST_WINDOWS_REMOVAL_RUNTIME_IDENTITY,
+      commandRunner: async () => ({
+        exitCode: 5,
+        stdout: "",
+        stderr: "residual root denies DELETE access",
+      }),
+    },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([operation]),
+    /residual root denies DELETE access/,
+  );
+  assert.equal(executed, false);
 });
 
 test("Windows executable uninstall rejects root and file replacement immediately before spawn", async () => {
@@ -3673,7 +6135,97 @@ test("Windows executable uninstall rejects same-metadata content replacement", a
   assert.equal(executed, false);
 });
 
-test("Windows executable uninstall preserves missing and reboot-required exit semantics", async () => {
+test("Windows executable uninstall rejects a replaced root after the uninstaller exits", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  let rootInode = 2n;
+  let executablePresent = true;
+  let removerCalled = false;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-root-replacement-test",
+    description: "test PostgreSQL root replacement",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) => {
+        if (path === executable && !executablePresent) throw missing;
+        return windowsPathStats(
+          path === installationRoot ? "directory" : "file",
+          {
+            ino: path === installationRoot ? rootInode : 3n,
+          },
+        );
+      },
+    },
+    execute: async () => {
+      executablePresent = false;
+      rootInode = 99n;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removeInstallationRoot: async () => {
+      removerCalled = true;
+      return { status: "removed" };
+    },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(
+    result.detail ?? "",
+    /installation root changed after uninstall/i,
+  );
+  assert.equal(removerCalled, false);
+});
+
+test("Windows executable uninstall allows expected directory timestamp changes", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  let uninstalled = false;
+  let removed = false;
+  let rootPresent = true;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-directory-mtime-test",
+    description: "test PostgreSQL directory mutation",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) => {
+        if (path === installationRoot && !rootPresent) throw missing;
+        if (path === executable && uninstalled) throw missing;
+        return windowsPathStats(
+          path === installationRoot ? "directory" : "file",
+          {
+            mtimeNs: path === installationRoot && uninstalled ? 99n : 5n,
+          },
+        );
+      },
+    },
+    execute: async () => {
+      uninstalled = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removeInstallationRoot: async () => {
+      removed = true;
+      rootPresent = false;
+      return { status: "removed" };
+    },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(removed, true);
+});
+
+test("Windows executable uninstall preserves absence and rejects reboot-required success", async () => {
   const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
   const executable = `${installationRoot}\\uninstall-postgresql.exe`;
   const missing = (): NodeJS.ErrnoException =>
@@ -3727,6 +6279,7 @@ test("Windows executable uninstall preserves missing and reboot-required exit se
 
   let uninstalled = false;
   let rootPresent = true;
+  let residualRemovalAttempted = false;
   const operation = executableUninstallOperation({
     context: contextFor("windows"),
     component: "postgresql",
@@ -3748,13 +6301,18 @@ test("Windows executable uninstall preserves missing and reboot-required exit se
       return { exitCode: 3010, stdout: "", stderr: "" };
     },
     removeInstallationRoot: async () => {
+      residualRemovalAttempted = true;
       rootPresent = false;
       return { status: "removed" };
     },
   });
   assert.ok(operation.validate);
   await operation.validate();
-  assert.equal((await operation.run()).status, "removed");
+  const rebootRequired = await operation.run();
+  assert.equal(rebootRequired.status, "failed");
+  assert.equal(rebootRequired.abortAction, true);
+  assert.match(rebootRequired.detail ?? "", /3010.*restart is required/i);
+  assert.equal(residualRemovalAttempted, false);
 });
 
 test("Windows executable uninstall does not treat a residual root as absent", async () => {
@@ -3856,6 +6414,55 @@ test("Windows managed uninstall rejects a junction root and linked uninstaller",
   }
 });
 
+test("Windows managed uninstall preflights locked residual deletion before spawn", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  let executed = false;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-removal-preflight-test",
+    description: "test Miniconda removal preflight",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStats(path === root ? "directory" : "file"),
+    },
+    execute: async () => {
+      executed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removalDependencies: {
+      inspect: async (target) => ({
+        exists: true,
+        isLink: false,
+        realPath: target,
+      }),
+      boundary: async () => ({
+        targetExists: true,
+        entries: [{ path: root, device: 1n, inode: 20n, mode: 0o40755n }],
+      }),
+      hostPlatform: "win32",
+      currentRuntimeExecutable: contextFor("windows").runtimeExecutable,
+      inspectExecutable: async () => TEST_WINDOWS_REMOVAL_RUNTIME_IDENTITY,
+      commandRunner: async () => ({
+        exitCode: 5,
+        stdout: "",
+        stderr: "managed root denies DELETE access",
+      }),
+    },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([operation]),
+    /managed root denies DELETE access/,
+  );
+  assert.equal(executed, false);
+  assert.equal(executable.endsWith(".exe"), true);
+});
+
 test("Windows managed uninstall rechecks file identity immediately before spawn", async () => {
   const root = "C:\\Miniconda";
   const executable = `${root}\\Uninstall-Miniconda3.exe`;
@@ -3929,6 +6536,89 @@ test("Windows managed uninstall rejects same-metadata content replacement", asyn
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /changed after plan validation/);
   assert.equal(executed, false);
+});
+
+test("Windows managed uninstall rejects a replaced root after the uninstaller exits", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  let rootInode = 2n;
+  let executablePresent = true;
+  let removerCalled = false;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-root-replacement-test",
+    description: "test Miniconda root replacement",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) => {
+        if (path === executable && !executablePresent) throw missing;
+        return windowsPathStats(path === root ? "directory" : "file", {
+          ino: path === root ? rootInode : 3n,
+        });
+      },
+    },
+    execute: async () => {
+      executablePresent = false;
+      rootInode = 99n;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removeInstallationRoot: async () => {
+      removerCalled = true;
+      return { status: "removed" };
+    },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+  assert.equal(result.status, "failed");
+  assert.match(
+    result.detail ?? "",
+    /installation root changed after uninstall/i,
+  );
+  assert.equal(removerCalled, false);
+});
+
+test("Windows managed uninstall allows expected directory timestamp changes", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  let uninstalled = false;
+  let removed = false;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-directory-mtime-test",
+    description: "test Miniconda directory mutation",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) => {
+        if (path === executable && uninstalled) throw missing;
+        return windowsPathStats(path === root ? "directory" : "file", {
+          mtimeNs: path === root && uninstalled ? 99n : 5n,
+        });
+      },
+    },
+    execute: async () => {
+      uninstalled = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    removeInstallationRoot: async () => {
+      removed = true;
+      return { status: "removed" };
+    },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(removed, true);
 });
 
 test("swapfile discovery distinguishes absence from command failure", () => {

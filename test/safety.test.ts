@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import {
   access,
   chmod,
   mkdir,
   mkdtemp,
   lstat,
+  readdir,
   readFile,
   rename,
   rm,
@@ -14,9 +16,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, parse } from "node:path";
 import test from "node:test";
-import { runCommand } from "../src/command.js";
+import { runCommand, UntrustedUnixExecutableError } from "../src/command.js";
 import {
   assertSameRemovalMount,
   assertSameRemovalFilesystem,
@@ -31,6 +33,7 @@ import {
   createSwapOperation,
   LINUX_SWAP_EXECUTABLES,
   linuxSwapCommandEnvironment,
+  validateSwapTargets,
   type LinuxSwapCommandInvocation,
 } from "../src/platforms/linux.js";
 import {
@@ -247,6 +250,140 @@ test("filesystem removal aborts when an ancestor identity changes immediately be
   assert.equal(removed, false);
 });
 
+test("filesystem removal pins boundary ownership before mutation", async () => {
+  let reads = 0;
+  let removed = false;
+  const result = await removePathTarget(
+    "/usr/local/share/example",
+    ["/usr/local/share"],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      inspect: async () => ({
+        exists: true,
+        isLink: false,
+        realPath: "/usr/local/share/example",
+      }),
+      boundary: async () => ({
+        targetExists: true,
+        entries: [
+          {
+            path: "/usr/local/share/example",
+            device: 1n,
+            inode: 2n,
+            mode: 0o40755n,
+            userId: BigInt(++reads),
+            groupId: 3n,
+            birthtimeNanoseconds: 4n,
+            changedNanoseconds: 5n,
+          },
+        ],
+      }),
+      remove: async () => {
+        removed = true;
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /boundary changed/);
+  assert.equal(removed, false);
+});
+
+test("anchored removal receives the final target metadata snapshot", async () => {
+  let reads = 0;
+  let exists = true;
+  let anchoredChangedNanoseconds: bigint | undefined;
+  const result = await removePathTarget(
+    "/usr/local/share/example",
+    ["/usr/local/share"],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      inspect: async () => ({
+        exists,
+        isLink: false,
+        realPath: "/usr/local/share/example",
+      }),
+      boundary: async () => ({
+        targetExists: true,
+        entries: [
+          {
+            path: "/usr/local/share/example",
+            device: 1n,
+            inode: 2n,
+            mode: 0o40755n,
+            userId: 3n,
+            groupId: 4n,
+            birthtimeNanoseconds: 5n,
+            changedNanoseconds: BigInt(++reads),
+          },
+        ],
+      }),
+      anchoredRemove: async (_target, boundary) => {
+        anchoredChangedNanoseconds =
+          boundary.entries.at(-1)?.changedNanoseconds;
+        exists = false;
+      },
+    },
+  );
+
+  assert.equal(result.status, "removed", result.detail ?? "removal failed");
+  assert.equal(anchoredChangedNanoseconds, 2n);
+});
+
+test("filesystem removal fails when a throwing remover only moves the target", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-moved-target-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  const moved = join(allowed, "moved-payload");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "sentinel"), "still present");
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      anchoredRemove: async () => {
+        await rename(target, moved);
+        throw new Error("cleanup target moved during anchored removal");
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /moved during anchored removal/);
+  assert.equal(
+    await readFile(join(moved, "sentinel"), "utf8"),
+    "still present",
+  );
+});
+
+test("filesystem removal succeeds when a non-throwing remover deletes the target", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-deleted-target-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      anchoredRemove: async () => {
+        await rm(target, { recursive: true });
+      },
+    },
+  );
+
+  assert.equal(result.status, "removed", result.detail ?? "removal failed");
+});
+
 test("Windows removal uses the locked boundary helper instead of raw recursive rm", async () => {
   const target = "C:\\tools\\payload";
   const boundary = {
@@ -298,7 +435,7 @@ test("Windows removal uses the locked boundary helper instead of raw recursive r
   assert.equal(rawRemovalCalled, false);
 });
 
-test("Windows locked removal pins its runtimes and ignores workflow command configuration", async () => {
+test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores workflow command configuration", async () => {
   const target = "C:\\tools\\payload";
   const runtimeExecutable =
     "C:\\hostedtoolcache\\windows\\node\\24.0.0\\x64\\node.exe";
@@ -423,8 +560,63 @@ test("Windows locked removal pins its runtimes and ignores workflow command conf
   assert.match(helperSource, /FirstChild/);
   assert.doesNotMatch(helperSource, /EnumerateFileSystemEntries/);
   assert.doesNotMatch(helperSource, /IEnumerable<string> Children/);
+  assert.match(helperSource, /AssertExecutable/);
+  assert.match(helperSource, /ComputeHash/);
+  assert.match(
+    helperSource,
+    /OpenAnchor[\s\S]*?IsDirectory[\s\S]*?IsReparsePoint/,
+  );
+  assert.match(helperSource, /function Test-LockedEntry/);
+  assert.match(helperSource, /function Assert-Traversal/);
+  assert.match(helperSource, /function Reset-Traversal/);
+  assert.match(helperSource, /\$spec\.limits\.maxEntries/);
+  assert.match(
+    helperSource,
+    /Assert-Traversal -Depth \$Depth\s*\n\s*\[LockedRemovalNative\]::MarkDelete\(\$Handle\)/,
+  );
+  assert.match(
+    helperSource,
+    /\$spec\.mode -eq 'locks'[\s\S]*?Test-LockedEntry/,
+  );
+  assert.match(
+    helperSource,
+    /\$spec\.mode -eq 'remove'[\s\S]*?Test-LockedEntry[\s\S]*?Remove-LockedEntry/,
+  );
+  assert.match(
+    helperSource,
+    /OpenExecutable\(\[string\]\$spec\.runtimeExecutable\)[\s\S]*?Assert-LockedExecutable[\s\S]*?\$validator\.Start\(\)/,
+  );
+  assert.match(helperSource, /StandardInput\.WriteAsync\(\$jsonInput\)/);
+  assert.match(
+    helperSource,
+    /\$validatorDeadline = \[Diagnostics\.Stopwatch\]::StartNew\(\)/,
+  );
+  assert.doesNotMatch(helperSource, /StandardInput\.Write\(\$jsonInput\)/);
+  assert.match(
+    helperSource,
+    /\$validator = \$null[\s\S]*?\$validatorStarted = \$false[\s\S]*?finally \{[\s\S]*?\$validatorStarted -and -not \$validator\.HasExited[\s\S]*?\$validator\.Kill\(\)[\s\S]*?WaitForExit\(5000\)[\s\S]*?\$validator\.Dispose\(\)/,
+  );
+  const validatorBase64 = helperSource.match(
+    /\$nodeSourceBase64 = '([A-Za-z0-9+/=]+)'/,
+  )?.[1];
+  assert.ok(validatorBase64);
+  const validatorExpressionTemplate = helperSource.match(
+    /\$nodeExpression = "([^"\r\n]+)"/,
+  )?.[1];
+  assert.ok(validatorExpressionTemplate);
+  const validatorExpression = validatorExpressionTemplate.replace(
+    "$nodeSourceBase64",
+    validatorBase64,
+  );
+  const validatorProbe = await runCommand(
+    process.execPath,
+    ["--input-type=module", "--eval", validatorExpression],
+    { input: "{}", silent: true },
+  );
+  assert.notEqual(validatorProbe.exitCode, 0);
+  assert.doesNotMatch(validatorProbe.stderr, /SyntaxError/);
   assert.equal(invocation.options.cwd, "C:\\Windows\\System32");
-  assert.equal(invocation.options.timeoutMs, 10 * 60_000);
+  assert.equal(invocation.options.timeoutMs, 22 * 60_000);
   assert.equal(invocation.options.silent, true);
   const commandEnvironment = invocation.options.env;
   assert.equal(commandEnvironment?.BASH_ENV, undefined);
@@ -444,6 +636,12 @@ test("Windows locked removal pins its runtimes and ignores workflow command conf
     Buffer.from(String(invocation.options.input), "base64").toString("utf8"),
   );
   assert.equal(serialized.target, target);
+  assert.equal(serialized.mode, "remove");
+  assert.deepEqual(serialized.limits, {
+    maxEntries: 2_000_000,
+    maxDepth: 256,
+    timeoutMs: 10 * 60_000,
+  });
   assert.equal(serialized.runtimeExecutable, runtimeExecutable);
   assert.equal(serialized.powershellExecutable, powershellExecutable);
   assert.deepEqual(serialized.entries, [
@@ -714,6 +912,171 @@ test("Windows locked removal rejects a boundary that omits an ancestor", async (
   assert.equal(helperCalled, false);
 });
 
+test("Windows helper preflight fails the complete plan before package mutation", async () => {
+  const target = "C:\\tools\\payload";
+  const runtimeExecutable = "C:\\runner\\node.exe";
+  const boundary = {
+    targetExists: true,
+    entries: [
+      {
+        path: "C:\\tools",
+        device: 1n,
+        inode: 2n,
+        mode: 0o40755n,
+      },
+      {
+        path: target,
+        device: 1n,
+        inode: 3n,
+        mode: 0o40755n,
+      },
+    ],
+  };
+  const identity = {
+    device: 1n,
+    inode: 10n,
+    size: 100n,
+    modifiedNanoseconds: 200n,
+    changedNanoseconds: 300n,
+    mode: 0o100755n,
+    userId: 0n,
+    groupId: 0n,
+    contentSha256: "a".repeat(64),
+  };
+  let packageRan = false;
+  let helperRuns = 0;
+  const packageOperation = createFunctionOperation({
+    id: "package-before-windows-helper",
+    component: "large-packages",
+    description: "package mutation fixture",
+    phase: "package",
+    run: async () => {
+      packageRan = true;
+      return { status: "removed" };
+    },
+  });
+  const pathOperation = createRemovePathOperation(
+    {
+      id: "windows-helper-preflight",
+      component: "vcpkg",
+      description: "Windows helper preflight fixture",
+      target,
+      allowedParents: ["C:\\tools"],
+      context: {
+        ...contextFor("windows"),
+        workspace: undefined,
+        runtimeExecutable,
+      },
+    },
+    {
+      inspect: async () => ({ exists: true, isLink: false, realPath: target }),
+      boundary: async () => boundary,
+      hostPlatform: "win32",
+      currentRuntimeExecutable: runtimeExecutable,
+      inspectExecutable: async () => identity,
+      commandRunner: async () => {
+        helperRuns += 1;
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "simulated Windows helper load failure",
+        };
+      },
+    },
+  );
+
+  await assert.rejects(
+    async () => await executeOperations([packageOperation, pathOperation]),
+    /simulated Windows helper load failure/,
+  );
+  assert.equal(helperRuns, 1);
+  assert.equal(packageRan, false);
+});
+
+test("Windows helper preflight validates every distinct deletion target", async () => {
+  const runtimeExecutable = "C:\\runner\\node.exe";
+  const targets = ["C:\\tools\\first", "C:\\tools\\second"];
+  const identity = {
+    device: 1n,
+    inode: 10n,
+    size: 100n,
+    modifiedNanoseconds: 200n,
+    changedNanoseconds: 300n,
+    mode: 0o100755n,
+    userId: 0n,
+    groupId: 0n,
+    contentSha256: "a".repeat(64),
+  };
+  let packageRan = false;
+  let helperRuns = 0;
+  const dependencies = {
+    inspect: async (target: string) => ({
+      exists: true,
+      isLink: false,
+      realPath: target,
+    }),
+    boundary: async (target: string) => ({
+      targetExists: true,
+      entries: [
+        { path: "C:\\tools", device: 1n, inode: 2n, mode: 0o40755n },
+        {
+          path: target,
+          device: 1n,
+          inode: target.endsWith("first") ? 3n : 4n,
+          mode: 0o40755n,
+        },
+      ],
+    }),
+    hostPlatform: "win32" as NodeJS.Platform,
+    currentRuntimeExecutable: runtimeExecutable,
+    inspectExecutable: async () => identity,
+    commandRunner: async () => {
+      helperRuns += 1;
+      return helperRuns === 1
+        ? { exitCode: 0, stdout: "", stderr: "" }
+        : {
+            exitCode: 5,
+            stdout: "",
+            stderr: "second target denies DELETE access",
+          };
+    },
+  };
+  const operations = targets.map((target, index) =>
+    createRemovePathOperation(
+      {
+        id: `windows-target-${index}`,
+        component: "vcpkg",
+        description: `Windows target ${index}`,
+        target,
+        allowedParents: ["C:\\tools"],
+        context: {
+          ...contextFor("windows"),
+          workspace: undefined,
+          runtimeExecutable,
+        },
+      },
+      dependencies,
+    ),
+  );
+  const packageOperation = createFunctionOperation({
+    id: "package-after-two-windows-targets",
+    component: "large-packages",
+    description: "package mutation fixture",
+    phase: "package",
+    run: async () => {
+      packageRan = true;
+      return { status: "removed" };
+    },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([packageOperation, ...operations]),
+    /second target denies DELETE access/,
+  );
+  assert.equal(helperRuns, 2);
+  assert.equal(packageRan, false);
+});
+
 test(
   "Windows hosted smoke removes a target through native locked handles",
   { skip: process.platform !== "win32" },
@@ -741,7 +1104,17 @@ test(
       runtimeExecutable: process.execPath,
     };
 
-    const result = await removePathTarget(target, [root], context);
+    const operation = createRemovePathOperation({
+      id: "windows-native-locked-removal",
+      component: "vcpkg",
+      description: "Windows native locked removal fixture",
+      target,
+      allowedParents: [root],
+      context,
+    });
+    assert.ok(operation.validate);
+    await operation.validate();
+    const result = await operation.run();
 
     assert.equal(result.status, "removed", result.detail ?? "removal failed");
     await assert.rejects(async () => await access(target));
@@ -749,8 +1122,203 @@ test(
       await readFile(join(outside, "sentinel"), "utf8"),
       "preserve me",
     );
+
+    const ancestorTarget = join(outside, "ancestor-target");
+    const ancestorJunction = join(root, "ancestor-junction");
+    await mkdir(ancestorTarget);
+    await writeFile(join(ancestorTarget, "sentinel"), "preserve ancestor");
+    await symlink(ancestorTarget, ancestorJunction, "junction");
+    const ancestorResult = await removePathTarget(
+      join(ancestorJunction, "sentinel"),
+      [root],
+      context,
+    );
+    assert.equal(ancestorResult.status, "failed");
+    assert.equal(
+      await readFile(join(ancestorTarget, "sentinel"), "utf8"),
+      "preserve ancestor",
+    );
+
+    const lockedTarget = join(root, "locked-payload");
+    const lockedChild = join(lockedTarget, "locked-child");
+    await mkdir(lockedTarget);
+    await writeFile(lockedChild, "preserve locked child");
+    const powershell =
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const holder = spawn(
+      powershell,
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference='Stop'; $stream=[IO.File]::Open($args[0],[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); [Console]::In.ReadLine() | Out-Null } finally { $stream.Dispose() }",
+        lockedChild,
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] },
+    );
+    testContext.after(() => {
+      if (!holder.killed) holder.kill();
+    });
+    const [holderReady] = (await once(holder.stdout, "data")) as [Buffer];
+    assert.match(holderReady.toString("utf8"), /LOCKED/);
+    const lockedOperation = createRemovePathOperation({
+      id: "windows-native-locked-child-preflight",
+      component: "vcpkg",
+      description: "Windows native locked child preflight fixture",
+      target: lockedTarget,
+      allowedParents: [root],
+      context,
+    });
+    assert.ok(lockedOperation.validate);
+    assert.ok(lockedOperation.validateAfterPreflight);
+    await lockedOperation.validate();
+    try {
+      await assert.rejects(
+        async () => await lockedOperation.validateAfterPreflight?.(),
+        /lock|sharing violation|used by another process/i,
+      );
+    } finally {
+      holder.stdin.end("\n");
+      const [holderExit] = (await once(holder, "close")) as [number];
+      assert.equal(holderExit, 0);
+    }
+    assert.equal(await readFile(lockedChild, "utf8"), "preserve locked child");
+
+    const boundedTarget = join(root, "bounded-payload");
+    await mkdir(boundedTarget);
+    for (const name of ["a", "b", "c", "d"]) {
+      await writeFile(join(boundedTarget, name), "preserve bounded child");
+    }
+    const boundedOperation = createRemovePathOperation(
+      {
+        id: "windows-native-bounded-preflight",
+        component: "vcpkg",
+        description: "Windows native bounded preflight fixture",
+        target: boundedTarget,
+        allowedParents: [root],
+        context,
+      },
+      {
+        traversalLimits: {
+          maxEntries: 2,
+          maxDepth: 8,
+          timeoutMs: 10_000,
+        },
+      },
+    );
+    assert.ok(boundedOperation.validate);
+    assert.ok(boundedOperation.validateAfterPreflight);
+    await boundedOperation.validate();
+    await assert.rejects(
+      async () => await boundedOperation.validateAfterPreflight?.(),
+      /traversal exceeded 2 entries/i,
+    );
+    assert.equal((await readdir(boundedTarget)).length, 4);
+
+    const mountvol = "C:\\Windows\\System32\\mountvol.exe";
+    const driveRoot = parse(root).root;
+    const volumeQuery = spawnSync(mountvol, [driveRoot, "/L"], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(volumeQuery.status, 0, volumeQuery.stderr);
+    const volumeName = volumeQuery.stdout.trim();
+    assert.match(volumeName, /^\\\\\?\\Volume\{[0-9A-F-]+\}\\$/i);
+    const mountedAncestor = join(root, "mounted-volume");
+    const mountedFixtureName = `maximize-space-mounted-${process.pid}-${Date.now()}`;
+    const mountedFixture = join(driveRoot, mountedFixtureName);
+    await mkdir(mountedAncestor);
+    await mkdir(mountedFixture);
+    await writeFile(join(mountedFixture, "sentinel"), "preserve mounted data");
+    const mounted = spawnSync(mountvol, [mountedAncestor, volumeName], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    assert.equal(mounted.status, 0, mounted.stderr);
+    try {
+      const mountedOperation = createRemovePathOperation({
+        id: "windows-native-mounted-ancestor",
+        component: "vcpkg",
+        description: "Windows native mounted ancestor fixture",
+        target: join(mountedAncestor, mountedFixtureName),
+        allowedParents: [root],
+        context,
+      });
+      assert.ok(mountedOperation.validate);
+      await assert.rejects(
+        async () => await mountedOperation.validate?.(),
+        /ancestor|direct directory|redirected|reparse/i,
+      );
+      assert.equal(
+        await readFile(join(mountedFixture, "sentinel"), "utf8"),
+        "preserve mounted data",
+      );
+    } finally {
+      const unmounted = spawnSync(mountvol, [mountedAncestor, "/D"], {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      assert.equal(unmounted.status, 0, unmounted.stderr);
+      await rm(mountedFixture, { recursive: true, force: true });
+    }
+
+    const finalJunction = join(root, "final-junction");
+    await symlink(outside, finalJunction, "junction");
+    const junctionResult = await removePathTarget(
+      finalJunction,
+      [root],
+      context,
+    );
+    assert.equal(
+      junctionResult.status,
+      "removed",
+      junctionResult.detail ?? "final junction removal failed",
+    );
+    await assert.rejects(async () => await access(finalJunction));
+    assert.equal(
+      await readFile(join(outside, "sentinel"), "utf8"),
+      "preserve me",
+    );
   },
 );
+
+test("complete-plan validation rejects an oversized Unix removal boundary", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-boundary-limit-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, ...Array<string>(400).fill("d"));
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "owned"), "preserve me");
+  let packageRan = false;
+  const packageOperation = createFunctionOperation({
+    id: "package-before-oversized-boundary",
+    component: "large-packages",
+    description: "package mutation fixture",
+    phase: "package",
+    run: async () => {
+      packageRan = true;
+      return { status: "removed" };
+    },
+  });
+  const pathOperation = createRemovePathOperation({
+    id: "oversized-boundary",
+    component: "vcpkg",
+    description: "oversized boundary fixture",
+    target,
+    allowedParents: [allowed],
+    context: { ...contextFor("linux"), workspace: undefined },
+  });
+
+  await assert.rejects(
+    async () => await executeOperations([packageOperation, pathOperation]),
+    /removal boundary exceeded 128 KiB|more than 512 entries/i,
+  );
+  assert.equal(packageRan, false);
+  assert.equal(await readFile(join(target, "owned"), "utf8"), "preserve me");
+});
 
 test("anchored Unix removal rejects an ancestor swapped after the final snapshot", async (testContext) => {
   const root = await mkdtemp(join(tmpdir(), "maximize-space-anchored-race-"));
@@ -786,6 +1354,48 @@ test("anchored Unix removal rejects an ancestor swapped after the final snapshot
   );
 });
 
+test("anchored Unix removal stops when the opened target is moved", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-target-move-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  const moved = join(root, "moved-payload");
+  await mkdir(target, { recursive: true });
+  for (let index = 0; index < 2_000; index += 1) {
+    await writeFile(join(target, index.toString().padStart(6, "0")), "keep");
+  }
+  const context = { ...contextFor("linux"), workspace: undefined };
+  const expected = await captureSafeRemovalBoundary(target, [allowed], context);
+
+  const mover = (async () => {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      try {
+        if ((await readdir(target)).length < 2_000) {
+          await rename(target, moved);
+          return;
+        }
+      } catch {
+        // Retry until the target is partially cleaned.
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    throw new Error("anchored removal did not begin before the deadline");
+  })();
+
+  await assert.rejects(
+    async () => await removeAnchoredUnixPath(target, expected),
+    /moved outside|boundary changed|no such file/i,
+  );
+  await mover;
+  assert.ok(
+    (await readdir(moved)).length > 0,
+    "deletion continued through the moved directory handle",
+  );
+});
+
 test("anchored Unix removal unlinks nested links without traversing them", async (testContext) => {
   const root = await mkdtemp(join(tmpdir(), "maximize-space-anchored-link-"));
   testContext.after(
@@ -809,6 +1419,120 @@ test("anchored Unix removal unlinks nested links without traversing them", async
     await readFile(join(outside, "sentinel"), "utf8"),
     "preserve me",
   );
+});
+
+test("anchored Unix removal stops at its traversal work budget", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-removal-budget-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+  for (const name of ["a", "b", "c", "d"]) {
+    await writeFile(join(target, name), "payload");
+  }
+  const context = { ...contextFor("linux"), workspace: undefined };
+  const expected = await captureSafeRemovalBoundary(target, [allowed], context);
+
+  await assert.rejects(
+    async () =>
+      await removeAnchoredUnixPath(target, expected, {
+        maxEntries: 2,
+        maxDepth: 8,
+        timeoutMs: 10_000,
+      }),
+    /traversal exceeded 2 entries/i,
+  );
+  assert.ok(
+    (await readdir(target)).length > 0,
+    "budget failure did not stop later deletion work",
+  );
+});
+
+test("anchored Unix removal rechecks its deadline immediately before nested unlink", async (testContext) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-removal-deadline-child-"),
+  );
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  const child = join(target, "owned");
+  await mkdir(target, { recursive: true });
+  await writeFile(child, "preserve me");
+  const context = { ...contextFor("linux"), workspace: undefined };
+  const expected = await captureSafeRemovalBoundary(target, [allowed], context);
+  let clockReads = 0;
+
+  await assert.rejects(
+    async () =>
+      await removeAnchoredUnixPath(target, expected, {
+        timeoutMs: 100,
+        now: () => (++clockReads >= 4 ? 100 : 0),
+      }),
+    /traversal exceeded its time limit/i,
+  );
+  assert.equal(await readFile(child, "utf8"), "preserve me");
+});
+
+test("anchored Unix removal rechecks its deadline immediately before final unlink", async (testContext) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-removal-deadline-target-"),
+  );
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(allowed, { recursive: true });
+  await writeFile(target, "preserve me");
+  const context = { ...contextFor("linux"), workspace: undefined };
+  const expected = await captureSafeRemovalBoundary(target, [allowed], context);
+  let clockReads = 0;
+
+  await assert.rejects(
+    async () =>
+      await removeAnchoredUnixPath(target, expected, {
+        timeoutMs: 100,
+        now: () => (++clockReads >= 2 ? 100 : 0),
+      }),
+    /traversal exceeded its time limit/i,
+  );
+  assert.equal(await readFile(target, "utf8"), "preserve me");
+});
+
+test("filesystem removal never resets an exhausted traversal budget through elevation", async (testContext) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-removal-fallback-budget-"),
+  );
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "a"), "payload");
+  await writeFile(join(target, "b"), "payload");
+  let elevationAttempts = 0;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      traversalLimits: { maxEntries: 1, maxDepth: 8, timeoutMs: 10_000 },
+      elevate: async () => {
+        elevationAttempts += 1;
+        return { exitCode: 1, stdout: "", stderr: "unexpected elevation" };
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /traversal exceeded 1 entries/i);
+  assert.equal(elevationAttempts, 0);
 });
 
 test("anchored Unix removal refuses to cross a mounted filesystem", () => {
@@ -897,6 +1621,182 @@ test("privileged fallback rejects a same-type target replacement after local fai
   assert.equal(elevated, false);
 });
 
+test("privileged fallback ignores unrelated ancestor directory churn", async () => {
+  const allowed = "/tmp/maximize-space-owned";
+  const target = `${allowed}/payload`;
+  const pythonIdentity = {
+    device: 1n,
+    inode: 50n,
+    size: 100n,
+    modifiedNanoseconds: 200n,
+    changedNanoseconds: 300n,
+    mode: 0o100755n,
+    userId: 0n,
+    groupId: 0n,
+    contentSha256: "a".repeat(64),
+  };
+  let boundaryReads = 0;
+  let exists = true;
+  let procLaunches = 0;
+  let pythonLaunches = 0;
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      workspace: undefined,
+      runtimeExecutable: process.execPath,
+    },
+    {
+      inspect: async () =>
+        exists
+          ? { exists: true, isLink: false, realPath: target }
+          : { exists: false, isLink: false },
+      boundary: async () => {
+        boundaryReads += 1;
+        return {
+          targetExists: true,
+          entries: [
+            {
+              path: "/tmp",
+              device: 1n,
+              inode: 2n,
+              mode: 0o41777n,
+              changedNanoseconds: BigInt(boundaryReads),
+            },
+            {
+              path: allowed,
+              device: 1n,
+              inode: 3n,
+              mode: 0o40755n,
+              changedNanoseconds: 10n,
+            },
+            {
+              path: target,
+              device: 1n,
+              inode: 4n,
+              mode: 0o40755n,
+              changedNanoseconds: 20n,
+            },
+          ],
+        };
+      },
+      remove: async () => {
+        throw Object.assign(new Error("permission denied"), {
+          code: "EACCES",
+        });
+      },
+      elevate: async (_context, executable) => {
+        if (executable === `/proc/${process.pid}/exe`) {
+          procLaunches += 1;
+          return {
+            exitCode: 126,
+            stdout: "",
+            stderr: `${executable}: Permission denied`,
+          };
+        }
+        pythonLaunches += 1;
+        exists = false;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      expectedPrivilegedPythonRuntime: {
+        executable: "/usr/bin/python3",
+        identity: pythonIdentity,
+      },
+      inspectExecutable: async () => pythonIdentity,
+    },
+  );
+
+  assert.equal(result.status, "removed", result.detail ?? "removal failed");
+  assert.equal(procLaunches, 1);
+  assert.equal(pythonLaunches, 1);
+});
+
+for (const churnRead of [4, 5]) {
+  test(`privileged fallback rejects owned-boundary churn at check ${churnRead - 3}`, async () => {
+    const allowed = "/usr/local/share";
+    const target = `${allowed}/example`;
+    const pythonIdentity = {
+      device: 1n,
+      inode: 50n,
+      size: 100n,
+      modifiedNanoseconds: 200n,
+      changedNanoseconds: 300n,
+      mode: 0o100755n,
+      userId: 0n,
+      groupId: 0n,
+      contentSha256: "a".repeat(64),
+    };
+    let boundaryReads = 0;
+    let procLaunches = 0;
+    let pythonLaunches = 0;
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      { ...contextFor("linux"), workspace: undefined },
+      {
+        inspect: async () => ({
+          exists: true,
+          isLink: false,
+          realPath: target,
+        }),
+        boundary: async () => {
+          boundaryReads += 1;
+          return {
+            targetExists: true,
+            entries: [
+              {
+                path: allowed,
+                device: 1n,
+                inode: 10n,
+                mode: 0o40755n,
+                changedNanoseconds: boundaryReads >= churnRead ? 2n : 1n,
+              },
+              {
+                path: target,
+                device: 1n,
+                inode: 20n,
+                mode: 0o40755n,
+                changedNanoseconds: 1n,
+              },
+            ],
+          };
+        },
+        remove: async () => {
+          throw new Error("simulated local removal failure");
+        },
+        elevate: async (_context, executable) => {
+          if (executable === `/proc/${process.pid}/exe`) {
+            procLaunches += 1;
+            return {
+              exitCode: 126,
+              stdout: "",
+              stderr: `${executable}: Permission denied`,
+            };
+          }
+          pythonLaunches += 1;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        expectedPrivilegedPythonRuntime: {
+          executable: "/usr/bin/python3",
+          identity: pythonIdentity,
+        },
+        inspectExecutable: async () => pythonIdentity,
+      },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.match(
+      result.detail ?? "",
+      churnRead === 4
+        ? /changed before privileged removal/
+        : /changed before Python privileged removal/,
+    );
+    assert.equal(procLaunches, churnRead === 4 ? 0 : 1);
+    assert.equal(pythonLaunches, 0);
+  });
+}
+
 test("privileged Unix fallback uses the anchored Node helper instead of path-based rm", async (testContext) => {
   const root = await mkdtemp(join(tmpdir(), "maximize-space-anchored-sudo-"));
   testContext.after(
@@ -948,8 +1848,576 @@ test("privileged Unix fallback uses the anchored Node helper instead of path-bas
   assert.equal(JSON.parse(String(elevatedInput)).target, target);
 });
 
+test("privileged Node removal supervisor adds grace to default and custom traversal deadlines", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-node-supervisor-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  await mkdir(allowed, { recursive: true });
+
+  for (const [name, traversalLimits, expectedTimeout] of [
+    ["default", undefined, 11 * 60_000],
+    ["custom", { maxEntries: 10, maxDepth: 4, timeoutMs: 12_345 }, 72_345],
+  ] as const) {
+    const target = join(allowed, name);
+    await mkdir(target);
+    await writeFile(join(target, "owned"), "preserve me");
+    let observedTimeout: number | undefined;
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("linux"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        ...(traversalLimits === undefined ? {} : { traversalLimits }),
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, _executable, _args, options) => {
+          observedTimeout = options?.timeoutMs;
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: "simulated helper failure",
+          };
+        },
+      },
+    );
+
+    assert.equal(result.status, "failed");
+    assert.equal(observedTimeout, expectedTimeout);
+  }
+});
+
+test("every Unix remover checks its deadline immediately before destructive mutation", async () => {
+  const source = await readFile(
+    join(process.cwd(), "src", "operations.ts"),
+    "utf8",
+  );
+  const embeddedNode = source.match(
+    /const PRIVILEGED_ANCHORED_REMOVE_SOURCE = String\.raw`([\s\S]*?)`;\n\nconst PRIVILEGED_PYTHON_ANCHORED_REMOVE_SOURCE/,
+  )?.[1];
+  const embeddedPython = source.match(
+    /const PRIVILEGED_PYTHON_ANCHORED_REMOVE_SOURCE = String\.raw`([\s\S]*?)`;\n\nconst UNIX_PYTHON_EXECUTABLE/,
+  )?.[1];
+  const inProcess = source.match(
+    /async function removeAnchoredDirectoryContents([\s\S]*?)export async function validateRemovePathTarget/,
+  )?.[1];
+  assert.ok(embeddedNode);
+  assert.ok(embeddedPython);
+  assert.ok(inProcess);
+
+  const nodeMutations = [...embeddedNode.matchAll(/await (?:rmdir|unlink)\(/g)];
+  const guardedNodeMutations = [
+    ...embeddedNode.matchAll(
+      /checkTraversal\([^;\n]*\);\n\s*await (?:rmdir|unlink)\(/g,
+    ),
+  ];
+  assert.equal(nodeMutations.length, 4);
+  assert.equal(guardedNodeMutations.length, nodeMutations.length);
+
+  const pythonMutations = [
+    ...embeddedPython.matchAll(/os\.(?:rmdir|unlink)\(/g),
+  ];
+  const guardedPythonMutations = [
+    ...embeddedPython.matchAll(
+      /check_traversal\([^\n]*\)\n\s*os\.(?:rmdir|unlink)\(/g,
+    ),
+  ];
+  assert.equal(pythonMutations.length, 4);
+  assert.equal(guardedPythonMutations.length, pythonMutations.length);
+
+  const inProcessMutations = [
+    ...inProcess.matchAll(/await (?:rmdir|unlink)\(/g),
+  ];
+  const guardedInProcessMutations = [
+    ...inProcess.matchAll(
+      /checkRemovalTraversal\([^;\n]*\);\n\s*await (?:rmdir|unlink)\(/g,
+    ),
+  ];
+  assert.equal(inProcessMutations.length, 4);
+  assert.equal(guardedInProcessMutations.length, inProcessMutations.length);
+});
+
+test("privileged Node removal stops when its opened target is moved", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-node-move-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  const moved = join(root, "moved-payload");
+  await mkdir(target, { recursive: true });
+  for (let index = 0; index < 2_000; index += 1) {
+    await writeFile(join(target, index.toString().padStart(6, "0")), "keep");
+  }
+  const mover = (async () => {
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline) {
+      try {
+        if ((await readdir(target)).length < 2_000) {
+          await rename(target, moved);
+          return;
+        }
+      } catch {
+        // Retry until the target is either partially cleaned or moved.
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    throw new Error(
+      "privileged Node removal did not begin before the deadline",
+    );
+  })();
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      workspace: undefined,
+      runtimeExecutable: process.execPath,
+    },
+    {
+      remove: async () => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      },
+      elevate: async (_context, _executable, args, options) =>
+        await runCommand(process.execPath, args, {
+          ...(options?.input === undefined ? {} : { input: options.input }),
+          silent: true,
+          timeoutMs: 30_000,
+        }),
+    },
+  );
+
+  await mover.catch((error: unknown) => {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)}; removal result: ${result.status}: ${result.detail ?? "no detail"}`,
+    );
+  });
+  assert.equal(result.status, "failed");
+  assert.match(
+    result.detail ?? "",
+    /moved outside|boundary changed|no such file/i,
+  );
+  assert.ok(
+    (await readdir(moved)).length > 0,
+    "privileged Node deletion continued through the moved directory handle",
+  );
+});
+
 test(
-  "Linux hosted smoke rejects a same-device bind mount in both removal helpers",
+  "privileged Python removal uses dir-fd traversal without following nested links",
+  { skip: process.platform === "win32" },
+  async (testContext) => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-macos-dirfd-"));
+    testContext.after(
+      async () => await rm(root, { recursive: true, force: true }),
+    );
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    const outside = join(root, "outside");
+    await mkdir(target, { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(target, "owned"), "remove me");
+    await writeFile(join(outside, "sentinel"), "preserve me");
+    await symlink(outside, join(target, "redirect"));
+    let pythonArguments: readonly string[] = [];
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("macos"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) => {
+          if (!/^\/usr\/bin\/python3(?:\.[0-9]+)*$/.test(executable)) {
+            return {
+              exitCode: 1,
+              stdout: "",
+              stderr: "macOS descriptor-path traversal is unavailable",
+            };
+          }
+          pythonArguments = args;
+          return await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          });
+        },
+      },
+    );
+
+    assert.equal(result.status, "removed", result.detail ?? "removal failed");
+    assert.deepEqual(pythonArguments.slice(0, 3), ["-I", "-S", "-c"]);
+    assert.match(String(pythonArguments[3]), /fstatfs/);
+    await assert.rejects(async () => await access(target));
+    assert.equal(
+      await readFile(join(outside, "sentinel"), "utf8"),
+      "preserve me",
+    );
+  },
+);
+
+test(
+  "privileged Python removal stops when its opened target is moved",
+  { skip: process.platform === "win32" },
+  async (testContext) => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-python-move-"));
+    testContext.after(
+      async () => await rm(root, { recursive: true, force: true }),
+    );
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    const moved = join(root, "moved-payload");
+    await mkdir(target, { recursive: true });
+    for (let index = 0; index < 2_000; index += 1) {
+      await writeFile(join(target, index.toString().padStart(6, "0")), "keep");
+    }
+    const mover = (async () => {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        try {
+          if ((await readdir(target)).length < 2_000) {
+            await rename(target, moved);
+            return;
+          }
+        } catch {
+          // Retry until the target is either partially cleaned or moved.
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      throw new Error(
+        "privileged Python removal did not begin before the deadline",
+      );
+    })();
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("macos"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) => {
+          if (!/^\/usr\/bin\/python3(?:\.[0-9]+)*$/.test(executable)) {
+            return { exitCode: 127, stdout: "", stderr: "unexpected helper" };
+          }
+          return await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          });
+        },
+      },
+    );
+
+    await mover;
+    assert.equal(result.status, "failed");
+    assert.match(
+      result.detail ?? "",
+      /moved outside|boundary changed|no such file/i,
+    );
+    assert.ok(
+      (await readdir(moved)).length > 0,
+      "privileged Python deletion continued through the moved directory handle",
+    );
+  },
+);
+
+test(
+  "macOS native privileged removal deletes a root-owned tree without following links",
+  { skip: process.platform !== "darwin" },
+  async (testContext) => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-macos-native-"));
+    const uid = process.getuid?.();
+    const gid = process.getgid?.();
+    assert.notEqual(uid, undefined);
+    assert.notEqual(gid, undefined);
+    const sudo = async (
+      executable: string,
+      args: readonly string[],
+    ): Promise<void> => {
+      const result = await runCommand(
+        "/usr/bin/sudo",
+        ["-n", "--", executable, ...args],
+        { silent: true, timeoutMs: 10_000 },
+      );
+      assert.equal(
+        result.exitCode,
+        0,
+        result.stderr || `${executable} exited ${result.exitCode}`,
+      );
+    };
+    testContext.after(async () => {
+      await sudo("/usr/sbin/chown", ["-R", `${uid}:${gid}`, root]).catch(
+        () => undefined,
+      );
+      await rm(root, { recursive: true, force: true });
+    });
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    const outside = join(root, "outside");
+    await mkdir(target, { recursive: true });
+    await mkdir(outside);
+    await writeFile(join(target, "owned"), "remove me");
+    await writeFile(join(outside, "sentinel"), "preserve me");
+    await symlink(outside, join(target, "redirect"));
+    await sudo("/usr/sbin/chown", ["-R", "0:0", target]);
+    await sudo("/bin/chmod", ["500", target]);
+
+    const result = await removePathTarget(target, [allowed], {
+      ...contextFor("macos"),
+      workspace: undefined,
+      runtimeExecutable: process.execPath,
+    });
+
+    assert.equal(result.status, "removed", result.detail ?? "removal failed");
+    await assert.rejects(async () => await access(target));
+    assert.equal(
+      await readFile(join(outside, "sentinel"), "utf8"),
+      "preserve me",
+    );
+  },
+);
+
+test(
+  "Linux privileged removal falls back when procfs blocks the running runtime inode",
+  { skip: process.platform !== "linux" },
+  async (testContext) => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-proc-denied-"));
+    testContext.after(
+      async () => await rm(root, { recursive: true, force: true }),
+    );
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "owned"), "remove me");
+    let procLaunches = 0;
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("linux"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) => {
+          if (executable === `/proc/${process.pid}/exe`) {
+            procLaunches += 1;
+            return {
+              exitCode: 126,
+              stdout: "",
+              stderr: `/usr/bin/env: '/proc/${process.pid}/exe': Permission denied`,
+            };
+          }
+          if (!/^\/usr\/bin\/python3(?:\.[0-9]+)*$/.test(executable)) {
+            return { exitCode: 127, stdout: "", stderr: "unexpected helper" };
+          }
+          return await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          });
+        },
+      },
+    );
+
+    assert.equal(result.status, "removed", result.detail ?? "removal failed");
+    assert.equal(procLaunches, 1);
+    await assert.rejects(async () => await access(target));
+  },
+);
+
+test(
+  "Linux privileged removal falls back when procfs reports the running runtime missing",
+  { skip: process.platform !== "linux" },
+  async (testContext) => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-proc-missing-"));
+    testContext.after(
+      async () => await rm(root, { recursive: true, force: true }),
+    );
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "owned"), "remove me");
+    let procLaunches = 0;
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("linux"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) => {
+          if (executable === `/proc/${process.pid}/exe`) {
+            procLaunches += 1;
+            return {
+              exitCode: 127,
+              stdout: "",
+              stderr: `/usr/bin/env: '/proc/${process.pid}/exe': No such file or directory`,
+            };
+          }
+          return await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          });
+        },
+      },
+    );
+
+    assert.equal(result.status, "removed", result.detail ?? "removal failed");
+    assert.equal(procLaunches, 1);
+    await assert.rejects(async () => await access(target));
+  },
+);
+
+test(
+  "Linux privileged removal falls back when the running Node runtime is untrusted",
+  { skip: process.platform !== "linux" },
+  async (testContext) => {
+    const root = await mkdtemp(
+      join(tmpdir(), "maximize-space-proc-untrusted-"),
+    );
+    testContext.after(
+      async () => await rm(root, { recursive: true, force: true }),
+    );
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "payload");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "owned"), "remove me");
+    let procLaunches = 0;
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("linux"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) => {
+          if (executable === `/proc/${process.pid}/exe`) {
+            procLaunches += 1;
+            throw new UntrustedUnixExecutableError(
+              executable,
+              "runner Node runtime is writable",
+            );
+          }
+          return await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          });
+        },
+      },
+    );
+
+    assert.equal(result.status, "removed", result.detail ?? "removal failed");
+    assert.equal(procLaunches, 1);
+    await assert.rejects(async () => await access(target));
+  },
+);
+
+test("privileged Unix removal rejects OS Python identity drift before elevation", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-python-drift-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "owned"), "preserve me");
+  let elevated = false;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("macos"),
+      workspace: undefined,
+      runtimeExecutable: process.execPath,
+    },
+    {
+      remove: async () => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      },
+      expectedPrivilegedPythonRuntime: {
+        executable: "/usr/bin/python3",
+        identity: {
+          device: 1n,
+          inode: 2n,
+          size: 3n,
+          modifiedNanoseconds: 4n,
+          contentSha256: "before",
+        },
+      },
+      inspectExecutable: async () => ({
+        device: 1n,
+        inode: 2n,
+        size: 3n,
+        modifiedNanoseconds: 4n,
+        contentSha256: "after",
+      }),
+      elevate: async () => {
+        elevated = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /OS Python executable changed/);
+  assert.equal(elevated, false);
+  assert.equal(await readFile(join(target, "owned"), "utf8"), "preserve me");
+});
+
+test(
+  "Linux hosted smoke rejects a same-device bind mount in every Unix removal helper",
   {
     skip:
       process.platform !== "linux" ||
@@ -965,9 +2433,10 @@ test(
     await mkdir(outside);
     await writeFile(join(outside, "sentinel"), "preserve me");
     let mountedActive = false;
+    let mountedPath = mounted;
     testContext.after(async () => {
       if (mountedActive) {
-        const unmounted = spawnSync("/usr/bin/umount", [mounted], {
+        const unmounted = spawnSync("/usr/bin/umount", [mountedPath], {
           encoding: "utf8",
           shell: false,
         });
@@ -1011,9 +2480,76 @@ test(
     assert.equal(result.status, "failed");
     assert.match(result.detail ?? "", /crosses a mounted filesystem/);
     assert.equal(elevated, true);
+
+    const pythonResult = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("macos"),
+        workspace: undefined,
+        runtimeExecutable: process.execPath,
+      },
+      {
+        remove: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        elevate: async (_context, executable, args, options) =>
+          await runCommand(executable, args, {
+            ...(options?.input === undefined ? {} : { input: options.input }),
+            silent: true,
+            timeoutMs: 10_000,
+          }),
+      },
+    );
+    assert.equal(pythonResult.status, "failed");
+    assert.match(pythonResult.detail ?? "", /crosses a mounted filesystem/);
     assert.equal(
       await readFile(join(outside, "sentinel"), "utf8"),
       "preserve me",
+    );
+
+    const directoryUnmount = spawnSync("/usr/bin/umount", [mounted], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(
+      directoryUnmount.status,
+      0,
+      directoryUnmount.stderr || "directory bind unmount failed",
+    );
+    mountedActive = false;
+
+    const swapRoot = join(root, "swap");
+    const swapMount = join(swapRoot, "mnt");
+    const swapEtc = join(swapRoot, "etc");
+    const swapFstab = join(swapEtc, "fstab");
+    const outsideFstab = join(root, "outside-fstab");
+    await mkdir(swapMount, { recursive: true });
+    await mkdir(swapEtc);
+    await writeFile(swapFstab, "# fixture\n");
+    await writeFile(outsideFstab, "# mounted fixture\n");
+    const fstabMount = spawnSync(
+      "/usr/bin/mount",
+      ["--bind", outsideFstab, swapFstab],
+      { encoding: "utf8", shell: false },
+    );
+    assert.equal(
+      fstabMount.status,
+      0,
+      fstabMount.stderr || "fstab bind mount failed",
+    );
+    mountedPath = swapFstab;
+    mountedActive = true;
+    assert.equal((await lstat(outsideFstab)).dev, (await lstat(swapFstab)).dev);
+    await assert.rejects(
+      async () =>
+        await validateSwapTargets(
+          { ...contextFor("linux"), workspace: undefined },
+          swapRoot,
+        ),
+      /fstab.*mounted|mount.*fstab/i,
     );
   },
 );
@@ -1057,6 +2593,49 @@ test("complete-plan path validation aborts before an earlier package mutation", 
     await readFile(join(outside, "sentinel"), "utf8"),
     "preserve me",
   );
+});
+
+test("complete-plan validation requires the privileged Unix removal runtime before mutation", async (testContext) => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-runtime-plan-"));
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, "owned"), "remove me");
+  let packageRan = false;
+  const packageOperation = createFunctionOperation({
+    id: "package-before-runtime-validation",
+    component: "vcpkg",
+    description: "package mutation fixture",
+    phase: "package",
+    run: async () => {
+      packageRan = true;
+      return { status: "removed" };
+    },
+  });
+  const pathOperation = createRemovePathOperation(
+    {
+      id: "path-requires-python",
+      component: "vcpkg",
+      description: "privileged path fixture",
+      target,
+      allowedParents: [allowed],
+      context: { ...contextFor("macos"), workspace: undefined },
+    },
+    {
+      resolveExecutable: async () => "/usr/bin/python3",
+      inspectExecutable: async () => undefined,
+    },
+  );
+
+  await assert.rejects(
+    async () => await executeOperations([packageOperation, pathOperation]),
+    /validation failed before mutation.*OS Python executable identity is unavailable/s,
+  );
+  assert.equal(packageRan, false);
+  assert.equal(await readFile(join(target, "owned"), "utf8"), "remove me");
 });
 
 test("a package may satisfy a validated residual path by removing it", async () => {
@@ -1301,6 +2880,45 @@ test("missing swap utilities fail complete-plan validation before package cleanu
     /mkswap.*unavailable/s,
   );
   assert.equal(packageRan, false);
+});
+
+test("swap removal does not require creation-only utilities", async () => {
+  const { context, root } = await createSwapFixture();
+  const creationOnly = new Set<string>([
+    LINUX_SWAP_EXECUTABLES.dd,
+    LINUX_SWAP_EXECUTABLES.df,
+    LINUX_SWAP_EXECUTABLES.fallocate,
+    LINUX_SWAP_EXECUTABLES.mkswap,
+    LINUX_SWAP_EXECUTABLES.truncate,
+  ]);
+  const operation = createSwapOperation(context, 0n, root, {
+    commandRunner: async ({ executable, args }) => {
+      if (
+        executable === LINUX_SWAP_EXECUTABLES.swapon &&
+        args[0] === "--show=NAME"
+      ) {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (executable === LINUX_SWAP_EXECUTABLES.test) {
+        return await fixturePathTest(args);
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    inspectExecutable: async (executable) =>
+      creationOnly.has(executable)
+        ? undefined
+        : {
+            device: 1n,
+            inode: 2n,
+            size: 3n,
+            modifiedNanoseconds: 4n,
+            contentSha256: executable,
+          },
+  });
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
 });
 
 test("the swap transaction pins every utility and ignores workflow command injection", async () => {

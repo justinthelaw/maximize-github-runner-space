@@ -1,14 +1,25 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  assertTrustedUnixExecutable,
   clearCommandTerminationUnconfirmed,
   boundedOutputChunk,
   createElevatedInvocation,
   findCommandPath,
   inspectExecutable,
   runCommand,
+  runElevated,
   sameCommandFileIdentity,
   UnconfirmedCommandTerminationError,
 } from "../src/command.js";
@@ -57,6 +68,37 @@ test("elevation fails closed when passwordless sudo is unavailable", () => {
     ),
     undefined,
   );
+});
+
+test("elevation rejects writable executables and parent directories", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix trust validation is not applicable on Windows");
+    return;
+  }
+  const root = await mkdtemp("/tmp/maximize-space-elevated-trust-");
+  const executable = join(root, "payload");
+  try {
+    await writeFile(executable, "#!/bin/sh\nexit 0\n");
+    await chmod(executable, 0o777);
+    await assert.rejects(
+      async () =>
+        await runElevated(contextFor("linux"), executable, [], {
+          silent: true,
+        }),
+      /trusted elevated executable|writable parent directory/i,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Unix executable trust returns the protected canonical launch path", async (context) => {
+  if (process.platform === "win32") {
+    context.skip("Unix trust validation is not applicable on Windows");
+    return;
+  }
+  const canonical = await realpath("/bin/sh");
+  assert.equal(await assertTrustedUnixExecutable("/bin/sh"), canonical);
 });
 
 test("timeouts fail closed after attempting to terminate the process tree", async () => {

@@ -1282,6 +1282,40 @@ test("macOS Homebrew rejects fixed configuration files before any command", asyn
   ]);
 });
 
+test("macOS Homebrew preflights every privileged configuration utility", async () => {
+  let systemMutations = 0;
+  const identity = {
+    device: 1n,
+    inode: 2n,
+    size: 3n,
+    modifiedNanoseconds: 4n,
+    mode: 0o100755n,
+    userId: 0n,
+    groupId: 0n,
+    contentSha256: "a".repeat(64),
+  };
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
+    inspectBrewConfig: async () => undefined,
+    inspectBrewSystemExecutable: async (executable) =>
+      executable === "/bin/rmdir" ? undefined : identity,
+    runBrewConfigSystemUtility: async () => {
+      systemMutations += 1;
+    },
+  });
+  const operations = await adapter.operations(planFor("homebrew"));
+  const configuration = operations.find(
+    ({ id }) => id === "macos:brew:configuration",
+  );
+
+  assert.ok(configuration?.validate);
+  await assert.rejects(
+    async () => await configuration.validate?.(),
+    /untrusted macOS system executable.*rmdir/i,
+  );
+  assert.equal(systemMutations, 0);
+});
+
 test("macOS Homebrew rechecks fixed configuration files before package mutation", async () => {
   const config = "/etc/homebrew/brew.env";
   let inspections = 0;
@@ -1592,6 +1626,21 @@ test("macOS Java discovery distinguishes absence from inventory failure", async 
   );
 });
 
+test("macOS Java discovery bounds all inspected entries", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    readJavaDirectory: async () =>
+      Array.from({ length: 257 }, (_, index) => ({
+        name: `unrelated-${index}`,
+        isSymbolicLink: () => false,
+      })),
+  });
+
+  await assert.rejects(
+    async () => await adapter.operations(planFor("java")),
+    /Java directory inventory.*exceeded 256 inspected entries/,
+  );
+});
+
 test("macOS Homebrew requires package absence after a successful uninstall", async () => {
   let uninstallCalls = 0;
   let formulaInventories = 0;
@@ -1751,6 +1800,32 @@ test("macOS unsafe Xcode inventory fails complete-plan validation before package
   );
   assert.equal(packageRan, false);
   assert.equal((await inventoryFailure.run()).status, "failed");
+});
+
+test("macOS Xcode discovery bounds all inspected entries", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => ({
+      exitCode: 0,
+      stdout: "/Applications/Xcode.app/Contents/Developer\n",
+      stderr: "",
+    }),
+    resolveXcodePath: async (path) => path,
+    readXcodeApplications: async () =>
+      Array.from({ length: 257 }, (_, index) => ({
+        name: `unrelated-${index}`,
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+      })),
+  });
+  const failure = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:inventory",
+  );
+  assert.ok(failure?.validate);
+
+  await assert.rejects(
+    failure.validate,
+    /Xcode application inventory.*exceeded 256 inspected entries/,
+  );
 });
 
 test("macOS Xcode validation rejects a target selected after discovery", async () => {

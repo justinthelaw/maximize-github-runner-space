@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
-import { access, lstat, mkdir, mkdtemp, readdir } from "node:fs/promises";
-import { win32 } from "node:path";
+import { access, lstat, mkdir, mkdtemp, opendir } from "node:fs/promises";
+import { posix, win32 } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   assertCommandTerminationConfirmed,
   inspectExecutable,
@@ -14,10 +15,12 @@ import {
   createRemovePathOperation,
   removePathTarget,
   validateRemovePathTarget,
+  type RemovePathDependencies,
 } from "../operations.js";
 import {
   assertSafeDirectoryTarget,
   captureSafeRemovalBoundary,
+  type RemovalBoundarySnapshot,
 } from "../safety.js";
 import type {
   Adapter,
@@ -29,6 +32,7 @@ import type {
   OperationResult,
   RuntimeContext,
 } from "../types.js";
+import { listBoundedVersionedDirectoryEntries } from "../versioned-directories.js";
 
 const SUPPORTED = new Set<ComponentId>(
   COMPONENTS.filter((component) =>
@@ -37,7 +41,6 @@ const SUPPORTED = new Set<ComponentId>(
 );
 
 const MSI_ABSENT_EXIT_CODES = new Set([1605, 1614]);
-const MAX_VERSIONED_CHILDREN = 64;
 const VISUAL_STUDIO_OVERLAPS = [
   "android",
   "dotnet",
@@ -105,6 +108,12 @@ export function classifyPostgreSqlServiceInventory(
       };
     }
     byCanonicalName.set(name.toLowerCase(), name);
+    if (byCanonicalName.size > 16) {
+      return {
+        status: "unsafe",
+        detail: "PostgreSQL service inventory exceeded 16 services",
+      };
+    }
   }
 
   if (!sawServiceRecord) {
@@ -143,6 +152,11 @@ interface WindowsPathStats {
   readonly ino: bigint;
   readonly size: bigint;
   readonly mtimeNs: bigint;
+  readonly ctimeNs?: bigint;
+  readonly birthtimeNs?: bigint;
+  readonly mode?: bigint;
+  readonly uid?: bigint;
+  readonly gid?: bigint;
 }
 
 export interface WindowsPathProbe {
@@ -157,6 +171,7 @@ export interface WindowsPathIdentity {
   readonly size: bigint;
   readonly mtimeNs: bigint;
   readonly ctimeNs?: bigint;
+  readonly birthtimeNs?: bigint;
   readonly mode?: bigint;
   readonly uid?: bigint;
   readonly gid?: bigint;
@@ -173,6 +188,15 @@ export interface WindowsInventoryDependencies {
     args: readonly string[],
     options: CommandOptions,
   ) => Promise<CommandResult>;
+  readonly now?: () => number;
+  readonly inventoryBudget?: WindowsInventoryBudget;
+}
+
+export interface WindowsInventoryBudget {
+  run<T>(
+    description: string,
+    task: (remaining: () => number) => Promise<T>,
+  ): Promise<T>;
 }
 
 export interface WindowsDockerDependencies {
@@ -207,6 +231,13 @@ function windowsPathIdentity(stats: WindowsPathStats): WindowsPathIdentity {
     ino: stats.ino,
     size: stats.size,
     mtimeNs: stats.mtimeNs,
+    ...(stats.ctimeNs === undefined ? {} : { ctimeNs: stats.ctimeNs }),
+    ...(stats.birthtimeNs === undefined
+      ? {}
+      : { birthtimeNs: stats.birthtimeNs }),
+    ...(stats.mode === undefined ? {} : { mode: stats.mode }),
+    ...(stats.uid === undefined ? {} : { uid: stats.uid }),
+    ...(stats.gid === undefined ? {} : { gid: stats.gid }),
   };
 }
 
@@ -221,10 +252,26 @@ function sameWindowsPathIdentity(
     left.size === right.size &&
     left.mtimeNs === right.mtimeNs &&
     left.ctimeNs === right.ctimeNs &&
+    left.birthtimeNs === right.birthtimeNs &&
     left.mode === right.mode &&
     left.uid === right.uid &&
     left.gid === right.gid &&
     left.contentSha256 === right.contentSha256
+  );
+}
+
+function sameWindowsObjectIdentity(
+  left: WindowsPathIdentity | undefined,
+  right: WindowsPathIdentity | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return false;
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.gid === right.gid
   );
 }
 
@@ -241,51 +288,97 @@ function sameOptionalWindowsPathIdentity(
 interface WindowsServiceSnapshot extends WindowsServiceTarget {
   readonly status: "present" | "missing";
   readonly state: number;
+  readonly startType?: 2 | 3 | 4;
+  readonly startSetting?: WindowsServiceStartSetting;
   readonly executable?: string;
   readonly executableIdentity?: WindowsPathIdentity;
   readonly configuration?: string;
 }
+
+type WindowsServiceStartSetting =
+  "auto" | "delayed-auto" | "demand" | "disabled";
 
 export interface WindowsServiceControl {
   exists(): Promise<boolean>;
   inspectExecutable?(
     executable: string,
   ): Promise<WindowsPathIdentity | undefined>;
-  inventory(): Promise<CommandResult>;
-  query(serviceName: string): Promise<CommandResult>;
-  config?(serviceName: string): Promise<CommandResult>;
-  stop(serviceName: string): Promise<CommandResult>;
-  start?(serviceName: string): Promise<CommandResult>;
-  delete(serviceName: string): Promise<CommandResult>;
+  inventory(timeoutMs?: number): Promise<CommandResult>;
+  query(serviceName: string, timeoutMs?: number): Promise<CommandResult>;
+  config?(serviceName: string, timeoutMs?: number): Promise<CommandResult>;
+  stop(serviceName: string, timeoutMs?: number): Promise<CommandResult>;
+  configureStart?(
+    serviceName: string,
+    startType: WindowsServiceStartSetting,
+    timeoutMs?: number,
+  ): Promise<CommandResult>;
+  start?(serviceName: string, timeoutMs?: number): Promise<CommandResult>;
+  delete(serviceName: string, timeoutMs?: number): Promise<CommandResult>;
   wait?(milliseconds: number): Promise<void>;
+  now?(): number;
 }
 
-export interface WindowsDockerServiceLifecycle {
-  isRegistrationFinalized(): boolean;
-  finalizeRegistration(): void;
+export interface WindowsServiceCoordinatorOperation extends Operation {
+  readonly assertQuiesced: (options?: {
+    readonly allowMissingTransitions?: boolean;
+  }) => Promise<void>;
 }
 
-export function createWindowsDockerServiceLifecycle(): WindowsDockerServiceLifecycle {
-  let registrationFinalized = false;
+export function guardWindowsServiceOperation(
+  operation: Operation,
+  coordinator: WindowsServiceCoordinatorOperation,
+): Operation {
   return {
-    isRegistrationFinalized: () => registrationFinalized,
-    finalizeRegistration: () => {
-      registrationFinalized = true;
+    ...operation,
+    validateBeforeRun: async () => {
+      await operation.validateBeforeRun?.();
+      await coordinator.assertQuiesced({ allowMissingTransitions: true });
     },
   };
 }
+
+export interface WindowsServiceRegistrationLifecycle {
+  isRegistrationFinalized(component?: ComponentId): boolean;
+  finalizeRegistration(component?: ComponentId): void;
+}
+
+export type WindowsDockerServiceLifecycle = WindowsServiceRegistrationLifecycle;
+
+export function createWindowsServiceRegistrationLifecycle(): WindowsServiceRegistrationLifecycle {
+  const finalized = new Set<ComponentId>();
+  return {
+    isRegistrationFinalized: (component = "docker-engine") =>
+      finalized.has(component),
+    finalizeRegistration: (component = "docker-engine") => {
+      finalized.add(component);
+    },
+  };
+}
+
+export function createWindowsDockerServiceLifecycle(): WindowsDockerServiceLifecycle {
+  return createWindowsServiceRegistrationLifecycle();
+}
 export function windowsInstallerExitDisposition(
   exitCode: number,
-): "completed" | "restart-initiated" | "failed" {
-  if (exitCode === 0 || exitCode === 3010) return "completed";
+): "completed" | "restart-required" | "restart-initiated" | "failed" {
+  if (exitCode === 0) return "completed";
+  if (exitCode === 3010) return "restart-required";
   if (exitCode === 1641) return "restart-initiated";
   return "failed";
 }
 
-function restartInitiatedResult(executable: string): OperationResult {
+function restartResult(
+  executable: string,
+  disposition: "restart-required" | "restart-initiated",
+): OperationResult {
+  const exitCode = disposition === "restart-required" ? 3010 : 1641;
+  const detail =
+    disposition === "restart-required"
+      ? "because a system restart is required and immediate payload removal cannot be verified"
+      : "after initiating a system restart";
   return {
     status: "failed",
-    detail: `${executable} exited 1641 after initiating a system restart; refusing further cleanup`,
+    detail: `${executable} exited ${exitCode} ${detail}; refusing further cleanup`,
     abortAction: true,
   };
 }
@@ -501,6 +594,24 @@ async function inspectWindowsExecutable(
   }
 }
 
+export async function inspectWindowsServiceExecutable(
+  paths: WindowsPaths,
+  executable: string,
+  probe: WindowsPathProbe = NODE_WINDOWS_PATH_PROBE,
+): Promise<WindowsPathIdentity | undefined> {
+  try {
+    await assertWindowsDirectoryChain(
+      win32.dirname(executable),
+      `${paths.drive}\\`,
+      probe,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  return await inspectWindowsExecutable(executable, probe);
+}
+
 function failureDetail(
   stderr: string,
   executable: string,
@@ -524,7 +635,7 @@ function windowsServiceControl(paths: WindowsPaths): WindowsServiceControl {
   };
   return {
     inspectExecutable: async (executable) =>
-      await inspectWindowsExecutable(executable),
+      await inspectWindowsServiceExecutable(paths, executable),
     exists: async () => {
       try {
         await assertStableExecutable();
@@ -533,7 +644,7 @@ function windowsServiceControl(paths: WindowsPaths): WindowsServiceControl {
         return false;
       }
     },
-    inventory: async () => {
+    inventory: async (timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(
         paths.serviceControl,
@@ -541,51 +652,201 @@ function windowsServiceControl(paths: WindowsPaths): WindowsServiceControl {
         {
           env: paths.commandEnvironment,
           silent: true,
-          timeoutMs: 30_000,
+          timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
         },
       );
     },
-    query: async (serviceName) => {
+    query: async (serviceName, timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(paths.serviceControl, ["query", serviceName], {
         env: paths.commandEnvironment,
         silent: true,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
       });
     },
-    config: async (serviceName) => {
+    config: async (serviceName, timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(paths.serviceControl, ["qc", serviceName], {
         env: paths.commandEnvironment,
         silent: true,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
       });
     },
-    stop: async (serviceName) => {
+    stop: async (serviceName, timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(paths.serviceControl, ["stop", serviceName], {
         env: paths.commandEnvironment,
         silent: true,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
       });
     },
-    start: async (serviceName) => {
+    configureStart: async (serviceName, startType, timeoutMs = 30_000) => {
+      await assertStableExecutable();
+      return await runCommand(
+        paths.serviceControl,
+        ["config", serviceName, "start=", startType],
+        {
+          env: paths.commandEnvironment,
+          silent: true,
+          timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
+        },
+      );
+    },
+    start: async (serviceName, timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(paths.serviceControl, ["start", serviceName], {
         env: paths.commandEnvironment,
         silent: true,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
       });
     },
-    delete: async (serviceName) => {
+    delete: async (serviceName, timeoutMs = 30_000) => {
       await assertStableExecutable();
       return await runCommand(paths.serviceControl, ["delete", serviceName], {
         env: paths.commandEnvironment,
         silent: true,
-        timeoutMs: 30_000,
+        timeoutMs: Math.max(1, Math.min(30_000, Math.ceil(timeoutMs))),
       });
     },
   };
+}
+
+const WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS = 30_000;
+const WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS = 2 * 60_000;
+const WINDOWS_INVENTORY_TIMEOUT_MS = 2 * 60_000;
+
+function windowsInventoryClock(
+  dependencies: WindowsInventoryDependencies,
+): () => number {
+  return dependencies.now ?? (() => performance.now());
+}
+
+function windowsInventoryRemainingMilliseconds(
+  now: () => number,
+  deadline: number,
+  description: string,
+): number {
+  const remaining = Math.ceil(deadline - now());
+  if (remaining <= 0) {
+    throw new Error(
+      `${description} exceeded its two-minute aggregate deadline`,
+    );
+  }
+  return remaining;
+}
+
+export function createWindowsInventoryBudget(
+  dependencies: Pick<WindowsInventoryDependencies, "now"> = {},
+): WindowsInventoryBudget {
+  const now = windowsInventoryClock(dependencies);
+  let remainingMilliseconds = WINDOWS_INVENTORY_TIMEOUT_MS;
+  let active = false;
+  return {
+    run: async <T>(
+      description: string,
+      task: (remaining: () => number) => Promise<T>,
+    ): Promise<T> => {
+      if (active) {
+        throw new Error(`${description} attempted a nested inventory budget`);
+      }
+      const startedAt = now();
+      if (!Number.isFinite(startedAt) || remainingMilliseconds <= 0) {
+        throw new Error(
+          `${description} exceeded its two-minute aggregate deadline`,
+        );
+      }
+      const deadline = startedAt + remainingMilliseconds;
+      const remaining = (): number =>
+        windowsInventoryRemainingMilliseconds(now, deadline, description);
+      active = true;
+      try {
+        remaining();
+        const result = await task(remaining);
+        remaining();
+        return result;
+      } finally {
+        const elapsed = now() - startedAt;
+        remainingMilliseconds =
+          Number.isFinite(elapsed) && elapsed >= 0
+            ? Math.max(0, remainingMilliseconds - elapsed)
+            : 0;
+        active = false;
+      }
+    },
+  };
+}
+
+function windowsServiceClock(control: WindowsServiceControl): () => number {
+  return control.now ?? (() => performance.now());
+}
+
+function windowsServiceRemainingMilliseconds(
+  now: () => number,
+  deadline: number,
+  description: string,
+): number {
+  const remaining = Math.ceil(deadline - now());
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    throw new Error(`${description} did not complete within 30 seconds`);
+  }
+  return Math.min(WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS, remaining);
+}
+
+function windowsServiceCoordinationRemainingMilliseconds(
+  now: () => number,
+  deadline: number,
+  description: string,
+): number {
+  const remaining = Math.ceil(deadline - now());
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    throw new Error(
+      `${description} exceeded its two-minute aggregate deadline`,
+    );
+  }
+  return Math.min(WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS, remaining);
+}
+
+async function runWindowsDeadlineTask<T>(
+  remaining: () => number,
+  task: (timeoutMs: number) => Promise<T>,
+): Promise<T> {
+  const timeoutMs = remaining();
+  let result: T;
+  try {
+    result = await task(timeoutMs);
+  } catch (taskError) {
+    try {
+      remaining();
+    } catch (deadlineError) {
+      throw combinedWindowsTaskDeadlineError(taskError, deadlineError);
+    }
+    throw taskError;
+  }
+  remaining();
+  return result;
+}
+
+function combinedWindowsTaskDeadlineError(
+  taskError: unknown,
+  deadlineError: unknown,
+): Error {
+  const taskDetail =
+    taskError instanceof Error ? taskError.message : String(taskError);
+  const deadlineDetail =
+    deadlineError instanceof Error
+      ? deadlineError.message
+      : String(deadlineError);
+  const detail = `${taskDetail}; deadline: ${deadlineDetail}`;
+  const causes = new AggregateError([taskError, deadlineError], detail);
+  if (taskError instanceof UnconfirmedCommandTerminationError) {
+    const combined = new UnconfirmedCommandTerminationError(detail);
+    Object.defineProperty(combined, "cause", {
+      configurable: true,
+      value: causes,
+    });
+    return combined;
+  }
+  return causes;
 }
 
 function selectedFixedWindowsServices(
@@ -642,13 +903,6 @@ function sameWindowsPath(left: string, right: string): boolean {
   );
 }
 
-function isWindowsPathAtOrBelow(candidate: string, parent: string): boolean {
-  return (
-    sameWindowsPath(candidate, parent) ||
-    isStrictWindowsDescendant(candidate, parent)
-  );
-}
-
 function executableFromWindowsServiceCommandLine(commandLine: string): string {
   const value = commandLine.trim();
   if (value.startsWith('"')) {
@@ -680,23 +934,35 @@ export function parseAndValidateWindowsServiceExecutable(
   const executable = win32.normalize(
     executableFromWindowsServiceCommandLine(commandLine),
   );
+  const postgreSqlVersion = /^postgresql-x64-(\d+(?:\.\d+)*)$/i.exec(
+    serviceName,
+  )?.[1];
+  const nginxVersionRoot = win32.basename(win32.dirname(executable));
   const accepted =
     component === "docker-engine"
       ? sameWindowsPath(executable, win32.join(paths.system32, "dockerd.exe"))
       : component === "apache"
-        ? win32.basename(executable).toLowerCase() === "httpd.exe" &&
-          isWindowsPathAtOrBelow(
+        ? sameWindowsPath(
             executable,
-            win32.join(paths.drive, "tools", "Apache24"),
+            win32.join(paths.drive, "tools", "Apache24", "bin", "httpd.exe"),
           )
         : component === "nginx"
-          ? win32.basename(executable).toLowerCase() === "nginx.exe" &&
-            isWindowsPathAtOrBelow(executable, win32.join(paths.drive, "tools"))
+          ? /^nginx-\d+(?:\.\d+){1,3}$/i.test(nginxVersionRoot) &&
+            sameWindowsPath(
+              executable,
+              win32.join(paths.drive, "tools", nginxVersionRoot, "nginx.exe"),
+            )
           : component === "postgresql"
-            ? win32.basename(executable).toLowerCase() === "pg_ctl.exe" &&
-              isWindowsPathAtOrBelow(
+            ? postgreSqlVersion !== undefined &&
+              sameWindowsPath(
                 executable,
-                win32.join(paths.programFiles, "PostgreSQL"),
+                win32.join(
+                  paths.programFiles,
+                  "PostgreSQL",
+                  postgreSqlVersion,
+                  "bin",
+                  "pg_ctl.exe",
+                ),
               )
             : false;
   if (!accepted) {
@@ -715,20 +981,71 @@ function windowsServiceState(result: CommandResult): number | undefined {
   return state !== undefined && Number.isSafeInteger(state) ? state : undefined;
 }
 
+function windowsServiceStartConfiguration(output: string):
+  | {
+      readonly startType: 2 | 3 | 4;
+      readonly startSetting: WindowsServiceStartSetting;
+    }
+  | undefined {
+  const match =
+    /^\s*START_TYPE\s*:\s*([234])\s+([A-Z_]+)(?:\s+\(([^)]+)\))?\s*$/im.exec(
+      output,
+    );
+  if (match === null) return undefined;
+  const startType = Number(match[1]);
+  const label = match[2];
+  const qualifier = match[3];
+  if (startType === 2 && label === "AUTO_START") {
+    if (qualifier === undefined) return { startType, startSetting: "auto" };
+    if (qualifier === "DELAYED") {
+      return { startType, startSetting: "delayed-auto" };
+    }
+    return undefined;
+  }
+  if (startType === 3 && label === "DEMAND_START" && qualifier === undefined) {
+    return { startType, startSetting: "demand" };
+  }
+  if (startType === 4 && label === "DISABLED" && qualifier === undefined) {
+    return { startType, startSetting: "disabled" };
+  }
+  return undefined;
+}
+
+function windowsServiceStartType(output: string): 2 | 3 | 4 | undefined {
+  return windowsServiceStartConfiguration(output)?.startType;
+}
+
 function normalizedWindowsServiceConfiguration(output: string): string {
   return output.trim().replace(/\r\n/g, "\n");
+}
+
+function windowsServiceConfigurationWithoutStartType(output: string): string {
+  return normalizedWindowsServiceConfiguration(output)
+    .split("\n")
+    .filter((line) => !/^\s*START_TYPE\s*:/i.test(line))
+    .join("\n");
 }
 
 async function discoverWindowsServices(
   paths: WindowsPaths,
   plan: CleanupPlan,
   control: WindowsServiceControl,
+  deadline = windowsServiceClock(control)() +
+    WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
 ): Promise<readonly WindowsServiceSnapshot[]> {
-  if (!(await control.exists())) throw new Error("sc.exe is unavailable");
+  const now = windowsServiceClock(control);
+  const remaining = (description: string): number =>
+    windowsServiceCoordinationRemainingMilliseconds(now, deadline, description);
+  const serviceControlExists = await control.exists();
+  remaining("Windows service discovery");
+  if (!serviceControlExists) throw new Error("sc.exe is unavailable");
 
   const targets = [...selectedFixedWindowsServices(plan)];
   if (plan.enabled.has("postgresql")) {
-    const inventory = await control.inventory();
+    const inventory = await control.inventory(
+      remaining("Windows service discovery"),
+    );
+    remaining("Windows service discovery");
     assertCompleteWindowsCommandOutput(inventory, "Windows service inventory");
     if (inventory.exitCode !== 0) {
       throw windowsServiceFailure(paths, "PostgreSQL inventory", inventory);
@@ -748,7 +1065,11 @@ async function discoverWindowsServices(
 
   const snapshots: WindowsServiceSnapshot[] = [];
   for (const target of targets) {
-    const result = await control.query(target.serviceName);
+    const result = await control.query(
+      target.serviceName,
+      remaining("Windows service discovery"),
+    );
+    remaining("Windows service discovery");
     assertCompleteWindowsCommandOutput(
       result,
       `${target.serviceName} service query`,
@@ -774,6 +1095,8 @@ async function discoverWindowsServices(
     let executable: string | undefined;
     let executableIdentity: WindowsPathIdentity | undefined;
     let configuration: string | undefined;
+    let startType: 2 | 3 | 4 | undefined;
+    let startSetting: WindowsServiceStartSetting | undefined;
     if (
       control.config === undefined ||
       control.inspectExecutable === undefined
@@ -782,13 +1105,30 @@ async function discoverWindowsServices(
         `${target.serviceName}: service configuration and executable identity cannot be verified`,
       );
     }
-    const config = await control.config(target.serviceName);
+    const config = await control.config(
+      target.serviceName,
+      remaining("Windows service discovery"),
+    );
+    remaining("Windows service discovery");
     assertCompleteWindowsCommandOutput(
       config,
       `${target.serviceName} service configuration`,
     );
     if (config.exitCode !== 0) {
       throw windowsServiceFailure(paths, target.serviceName, config);
+    }
+    const startConfiguration = windowsServiceStartConfiguration(config.stdout);
+    if (startConfiguration === undefined) {
+      throw new Error(
+        `${target.serviceName}: sc.exe returned no supported service start type`,
+      );
+    }
+    startType = startConfiguration.startType;
+    startSetting = startConfiguration.startSetting;
+    if (state === 4 && startSetting === "disabled") {
+      throw new Error(
+        `${target.serviceName}: unsafe reactivation left a disabled service running`,
+      );
     }
     executable = parseAndValidateWindowsServiceExecutable(
       paths,
@@ -797,6 +1137,7 @@ async function discoverWindowsServices(
       config.stdout,
     );
     executableIdentity = await control.inspectExecutable(executable);
+    remaining("Windows service discovery");
     if (executableIdentity === undefined) {
       throw new Error(
         `${target.serviceName}: registered service executable is unavailable`,
@@ -807,11 +1148,14 @@ async function discoverWindowsServices(
       ...target,
       status: "present",
       state,
+      startType,
+      startSetting,
       ...(executable === undefined ? {} : { executable }),
       ...(executableIdentity === undefined ? {} : { executableIdentity }),
       ...(configuration === undefined ? {} : { configuration }),
     });
   }
+  remaining("Windows service discovery");
   return snapshots;
 }
 
@@ -828,6 +1172,8 @@ function sameWindowsServiceSnapshot(
         target.unregister === right[index]?.unregister &&
         target.status === right[index]?.status &&
         target.state === right[index]?.state &&
+        target.startType === right[index]?.startType &&
+        target.startSetting === right[index]?.startSetting &&
         target.executable === right[index]?.executable &&
         sameOptionalWindowsPathIdentity(
           target.executableIdentity,
@@ -838,20 +1184,121 @@ function sameWindowsServiceSnapshot(
   );
 }
 
+function sameQuiescedWindowsService(
+  expected: WindowsServiceSnapshot,
+  current: WindowsServiceSnapshot | undefined,
+): boolean {
+  if (
+    current === undefined ||
+    expected.component !== current.component ||
+    expected.serviceName !== current.serviceName ||
+    expected.unregister !== current.unregister ||
+    expected.status !== current.status
+  ) {
+    return false;
+  }
+  if (expected.status === "missing") return true;
+  return (
+    current.state === 1 &&
+    current.startSetting === "disabled" &&
+    expected.executable === current.executable &&
+    sameOptionalWindowsPathIdentity(
+      expected.executableIdentity,
+      current.executableIdentity,
+    ) &&
+    expected.configuration !== undefined &&
+    current.configuration !== undefined &&
+    windowsServiceConfigurationWithoutStartType(expected.configuration) ===
+      windowsServiceConfigurationWithoutStartType(current.configuration)
+  );
+}
+
+async function assertWindowsServicesQuiesced(
+  paths: WindowsPaths,
+  plan: CleanupPlan,
+  control: WindowsServiceControl,
+  expected: readonly WindowsServiceSnapshot[],
+  lifecycle?: WindowsServiceRegistrationLifecycle,
+  allowMissingTransitions = false,
+  deadline?: number,
+): Promise<void> {
+  const now = windowsServiceClock(control);
+  const current = await discoverWindowsServices(
+    paths,
+    plan,
+    control,
+    deadline ?? now() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+  );
+  const key = ({ component, serviceName }: WindowsServiceTarget): string =>
+    `${component}\0${serviceName.toLowerCase()}`;
+  const expectedByKey = new Map(
+    expected.map((target) => [key(target), target]),
+  );
+  const currentByKey = new Map(current.map((target) => [key(target), target]));
+  const unsafeExpected = expected.some((target) => {
+    const currentTarget = currentByKey.get(key(target));
+    if (lifecycle?.isRegistrationFinalized(target.component) === true) {
+      return currentTarget?.status === "present";
+    }
+    if (
+      allowMissingTransitions &&
+      target.status === "present" &&
+      (currentTarget === undefined || currentTarget.status === "missing")
+    ) {
+      return false;
+    }
+    return !sameQuiescedWindowsService(target, currentTarget);
+  });
+  const unexpectedCurrent = current.some(
+    (target) => !expectedByKey.has(key(target)),
+  );
+  if (unsafeExpected || unexpectedCurrent) {
+    throw new Error(
+      "Windows service inventory changed or reactivated, or lost its disabled latch",
+    );
+  }
+}
+
 async function stopWindowsService(
   paths: WindowsPaths,
   target: WindowsServiceSnapshot,
   control: WindowsServiceControl,
+  aggregateDeadline = windowsServiceClock(control)() +
+    WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+  aggregateDescription = "Windows service coordination",
 ): Promise<void> {
   if (target.status === "missing") return;
-  if (target.state === 1) return;
-  const stop = await control.stop(target.serviceName);
+  const now = windowsServiceClock(control);
+  const deadline = Math.min(
+    aggregateDeadline,
+    now() + WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS,
+  );
+  const description = `${target.serviceName} service stop`;
+  const remaining = (): number => {
+    windowsServiceCoordinationRemainingMilliseconds(
+      now,
+      aggregateDeadline,
+      aggregateDescription,
+    );
+    return windowsServiceRemainingMilliseconds(now, deadline, description);
+  };
+  const stop = await runWindowsDeadlineTask(
+    remaining,
+    async (timeoutMs) => await control.stop(target.serviceName, timeoutMs),
+  );
   if (isMissingWindowsService(stop)) return;
   if (stop.exitCode !== 0 && stop.exitCode !== 1062) {
     throw windowsServiceFailure(paths, target.serviceName, stop);
   }
+  const wait =
+    control.wait ??
+    (async (milliseconds: number) =>
+      await new Promise((resolve) => setTimeout(resolve, milliseconds)));
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    const status = await control.query(target.serviceName);
+    const status = await runWindowsDeadlineTask(
+      remaining,
+      async (timeoutMs) => await control.query(target.serviceName, timeoutMs),
+    );
     assertCompleteWindowsCommandOutput(
       status,
       `${target.serviceName} service query`,
@@ -862,7 +1309,10 @@ async function stopWindowsService(
     if (status.exitCode !== 0) {
       throw windowsServiceFailure(paths, target.serviceName, status);
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await runWindowsDeadlineTask(
+      remaining,
+      async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+    );
   }
   throw new Error(`${target.serviceName} did not stop within 30 seconds`);
 }
@@ -871,8 +1321,8 @@ export function createWindowsServiceCoordinator(
   paths: WindowsPaths,
   plan: CleanupPlan,
   control: WindowsServiceControl = windowsServiceControl(paths),
-  dockerLifecycle?: WindowsDockerServiceLifecycle,
-): Operation | undefined {
+  lifecycle?: WindowsServiceRegistrationLifecycle,
+): WindowsServiceCoordinatorOperation | undefined {
   const fixed = selectedFixedWindowsServices(plan);
   if (fixed.length === 0 && !plan.enabled.has("postgresql")) return undefined;
   const component = fixed[0]?.component ?? "postgresql";
@@ -881,28 +1331,172 @@ export function createWindowsServiceCoordinator(
     (async (milliseconds: number) =>
       await new Promise((resolve) => setTimeout(resolve, milliseconds)));
   let validated: readonly WindowsServiceSnapshot[] | undefined;
+  let quiescedExpected: readonly WindowsServiceSnapshot[] | undefined;
   let stoppedByAction: WindowsServiceSnapshot[] = [];
+  let disabledByAction: WindowsServiceSnapshot[] = [];
   let rollbackInFlight: Promise<void> | undefined;
   const validate = async (): Promise<void> => {
-    validated = await discoverWindowsServices(paths, plan, control);
+    const now = windowsServiceClock(control);
+    validated = await discoverWindowsServices(
+      paths,
+      plan,
+      control,
+      now() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+    );
   };
   const performRollback = async (): Promise<void> => {
     assertCommandTerminationConfirmed();
-    if (stoppedByAction.length === 0) return;
+    if (stoppedByAction.length === 0 && disabledByAction.length === 0) return;
     const pending = [...stoppedByAction];
+    const pendingDisabled = [...disabledByAction];
     const restored = new Set<WindowsServiceSnapshot>();
+    const startTypesRestored = new Set<WindowsServiceSnapshot>();
     const failures: string[] = [];
+    const rollbackNow = windowsServiceClock(control);
+    const rollbackDeadline =
+      rollbackNow() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS;
+    const rollbackRemaining = (): number =>
+      windowsServiceCoordinationRemainingMilliseconds(
+        rollbackNow,
+        rollbackDeadline,
+        "Windows service rollback",
+      );
+    const rollbackTask = async <T>(
+      task: (timeoutMs: number) => Promise<T>,
+    ): Promise<T> => await runWindowsDeadlineTask(rollbackRemaining, task);
+    for (const target of [...pendingDisabled].reverse()) {
+      assertCommandTerminationConfirmed();
+      try {
+        if (
+          target.component === "docker-engine" &&
+          lifecycle?.isRegistrationFinalized(target.component) === true
+        ) {
+          startTypesRestored.add(target);
+          continue;
+        }
+        if (
+          target.startType === undefined ||
+          target.startSetting === undefined ||
+          target.configuration === undefined ||
+          target.executable === undefined ||
+          target.executableIdentity === undefined ||
+          control.config === undefined ||
+          control.configureStart === undefined ||
+          control.inspectExecutable === undefined
+        ) {
+          throw new Error(
+            `${target.serviceName} start mode cannot be restored safely`,
+          );
+        }
+        const before = await rollbackTask(
+          async (timeoutMs) =>
+            await control.config?.(target.serviceName, timeoutMs),
+        );
+        if (before === undefined) {
+          throw new Error(`${target.serviceName} configuration is unavailable`);
+        }
+        assertCompleteWindowsCommandOutput(
+          before,
+          `${target.serviceName} rollback configuration`,
+        );
+        if (before.exitCode !== 0) {
+          throw windowsServiceFailure(paths, target.serviceName, before);
+        }
+        const beforeExecutable = parseAndValidateWindowsServiceExecutable(
+          paths,
+          target.component,
+          target.serviceName,
+          before.stdout,
+        );
+        if (
+          !sameWindowsPath(beforeExecutable, target.executable) ||
+          windowsServiceConfigurationWithoutStartType(before.stdout) !==
+            windowsServiceConfigurationWithoutStartType(target.configuration)
+        ) {
+          throw new Error(
+            `${target.serviceName} configuration changed before start-mode rollback`,
+          );
+        }
+        const beforeIdentity = await rollbackTask(
+          async () => await control.inspectExecutable?.(beforeExecutable),
+        );
+        if (
+          !sameWindowsPathIdentity(target.executableIdentity, beforeIdentity)
+        ) {
+          throw new Error(
+            `${target.serviceName} executable identity changed before start-mode rollback`,
+          );
+        }
+        const restoredStart = await rollbackTask(
+          async (timeoutMs) =>
+            await control.configureStart?.(
+              target.serviceName,
+              target.startSetting!,
+              timeoutMs,
+            ),
+        );
+        if (restoredStart === undefined) {
+          throw new Error(
+            `${target.serviceName} start mode cannot be restored safely`,
+          );
+        }
+        assertCompleteWindowsCommandOutput(
+          restoredStart,
+          `${target.serviceName} start-mode rollback`,
+        );
+        if (restoredStart.exitCode !== 0) {
+          throw windowsServiceFailure(paths, target.serviceName, restoredStart);
+        }
+        const after = await rollbackTask(
+          async (timeoutMs) =>
+            await control.config?.(target.serviceName, timeoutMs),
+        );
+        if (after === undefined) {
+          throw new Error(`${target.serviceName} configuration is unavailable`);
+        }
+        assertCompleteWindowsCommandOutput(
+          after,
+          `${target.serviceName} restored configuration`,
+        );
+        if (
+          after.exitCode !== 0 ||
+          windowsServiceStartType(after.stdout) !== target.startType ||
+          windowsServiceStartConfiguration(after.stdout)?.startSetting !==
+            target.startSetting ||
+          normalizedWindowsServiceConfiguration(after.stdout) !==
+            target.configuration
+        ) {
+          throw new Error(
+            `${target.serviceName} did not return to its original start mode`,
+          );
+        }
+        startTypesRestored.add(target);
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    const remainingDisabled = pendingDisabled.filter(
+      (target) => !startTypesRestored.has(target),
+    );
     for (const target of [...pending].reverse()) {
       assertCommandTerminationConfirmed();
       try {
         if (
           target.component === "docker-engine" &&
-          dockerLifecycle?.isRegistrationFinalized() === true
+          lifecycle?.isRegistrationFinalized(target.component) === true
         ) {
           restored.add(target);
           continue;
         }
-        const current = await control.query(target.serviceName);
+        if (remainingDisabled.includes(target)) {
+          throw new Error(
+            `${target.serviceName} start mode was not restored before restart`,
+          );
+        }
+        const current = await rollbackTask(
+          async (timeoutMs) =>
+            await control.query(target.serviceName, timeoutMs),
+        );
         assertCompleteWindowsCommandOutput(
           current,
           `${target.serviceName} rollback query`,
@@ -914,14 +1508,43 @@ export function createWindowsServiceCoordinator(
           throw windowsServiceFailure(paths, target.serviceName, current);
         }
         const currentState = windowsServiceState(current);
-        if (currentState === 4) {
-          restored.add(target);
-          continue;
-        }
-        if (currentState !== 1) {
+        if (currentState !== 1 && currentState !== 4) {
           throw new Error(
             `${target.serviceName} entered an unsafe state before restart`,
           );
+        }
+        if (target.state === 1) {
+          if (currentState === 4) {
+            await stopWindowsService(
+              paths,
+              { ...target, state: currentState },
+              control,
+              rollbackDeadline,
+              "Windows service rollback",
+            );
+            const stopped = await rollbackTask(
+              async (timeoutMs) =>
+                await control.query(target.serviceName, timeoutMs),
+            );
+            assertCompleteWindowsCommandOutput(
+              stopped,
+              `${target.serviceName} stopped-state rollback query`,
+            );
+            if (
+              isMissingWindowsService(stopped) ||
+              !isStoppedWindowsService(stopped)
+            ) {
+              throw new Error(
+                `${target.serviceName} did not return to its original stopped state`,
+              );
+            }
+          }
+          restored.add(target);
+          continue;
+        }
+        if (currentState === 4) {
+          restored.add(target);
+          continue;
         }
         if (control.start === undefined) {
           throw new Error(`${target.serviceName} could not be restarted`);
@@ -937,7 +1560,13 @@ export function createWindowsServiceCoordinator(
             `${target.serviceName} configuration and executable identity cannot be revalidated before restart`,
           );
         }
-        const configuration = await control.config(target.serviceName);
+        const configuration = await rollbackTask(
+          async (timeoutMs) =>
+            await control.config?.(target.serviceName, timeoutMs),
+        );
+        if (configuration === undefined) {
+          throw new Error(`${target.serviceName} configuration is unavailable`);
+        }
         assertCompleteWindowsCommandOutput(
           configuration,
           `${target.serviceName} rollback configuration`,
@@ -960,7 +1589,9 @@ export function createWindowsServiceCoordinator(
             `${target.serviceName} configuration changed before rollback`,
           );
         }
-        const executableIdentity = await control.inspectExecutable(executable);
+        const executableIdentity = await rollbackTask(
+          async () => await control.inspectExecutable?.(executable),
+        );
         if (
           !sameWindowsPathIdentity(
             target.executableIdentity,
@@ -972,14 +1603,39 @@ export function createWindowsServiceCoordinator(
           );
         }
 
-        const started = await control.start(target.serviceName);
+        const now = windowsServiceClock(control);
+        const deadline = Math.min(
+          rollbackDeadline,
+          now() + WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS,
+        );
+        const description = `${target.serviceName} service restart`;
+        const transitionRemaining = (): number => {
+          rollbackRemaining();
+          return windowsServiceRemainingMilliseconds(
+            now,
+            deadline,
+            description,
+          );
+        };
+        const started = await runWindowsDeadlineTask(
+          transitionRemaining,
+          async (timeoutMs) =>
+            await control.start?.(target.serviceName, timeoutMs),
+        );
+        if (started === undefined) {
+          throw new Error(`${target.serviceName} could not be restarted`);
+        }
         if (started.exitCode !== 0 && started.exitCode !== 1056) {
           throw windowsServiceFailure(paths, target.serviceName, started);
         }
 
         let running = false;
         for (let attempt = 0; attempt < 60; attempt += 1) {
-          const currentResult = await control.query(target.serviceName);
+          const currentResult = await runWindowsDeadlineTask(
+            transitionRemaining,
+            async (timeoutMs) =>
+              await control.query(target.serviceName, timeoutMs),
+          );
           assertCompleteWindowsCommandOutput(
             currentResult,
             `${target.serviceName} rollback query`,
@@ -1002,7 +1658,10 @@ export function createWindowsServiceCoordinator(
             break;
           }
           if (state !== 2 && state !== 3) break;
-          await wait(500);
+          await runWindowsDeadlineTask(
+            transitionRemaining,
+            async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+          );
         }
         if (!running) {
           throw new Error(
@@ -1014,10 +1673,16 @@ export function createWindowsServiceCoordinator(
         failures.push(error instanceof Error ? error.message : String(error));
       }
     }
-    stoppedByAction = pending.filter((target) => !restored.has(target));
+    const remainingStopped = pending.filter((target) => !restored.has(target));
     if (failures.length > 0) {
+      disabledByAction = remainingDisabled;
+      stoppedByAction = remainingStopped;
       throw new Error(failures.join("; "));
     }
+    rollbackRemaining();
+    disabledByAction = remainingDisabled;
+    stoppedByAction = remainingStopped;
+    quiescedExpected = undefined;
   };
   const rollback = async (): Promise<void> => {
     if (rollbackInFlight !== undefined) {
@@ -1045,7 +1710,22 @@ export function createWindowsServiceCoordinator(
       };
     }
   };
-  return createFunctionOperation({
+  const assertQuiesced = async (options?: {
+    readonly allowMissingTransitions?: boolean;
+  }): Promise<void> => {
+    if (quiescedExpected === undefined) {
+      throw new Error("Windows services have not completed safe quiescence");
+    }
+    await assertWindowsServicesQuiesced(
+      paths,
+      plan,
+      control,
+      quiescedExpected,
+      lifecycle,
+      options?.allowMissingTransitions === true,
+    );
+  };
+  const operation = createFunctionOperation({
     id: "windows:services:stop",
     component,
     description: "Stop selected Windows services before cleanup",
@@ -1053,51 +1733,100 @@ export function createWindowsServiceCoordinator(
     dedupeKey: "windows:services:stop",
     fatal: true,
     validate,
+    validateAfterPreflight: assertQuiesced,
+    validateAfterPreflightLast: true,
     rollback,
     run: async (): Promise<OperationResult> => {
-      if (stoppedByAction.length !== 0) {
+      if (stoppedByAction.length !== 0 || disabledByAction.length !== 0) {
         return await failWithRollback(
           "Windows service rollback state remained before execution",
         );
       }
       try {
-        validated ??= await discoverWindowsServices(paths, plan, control);
-        const immediate = await discoverWindowsServices(paths, plan, control);
+        const now = windowsServiceClock(control);
+        const deadline = now() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS;
+        validated ??= await discoverWindowsServices(
+          paths,
+          plan,
+          control,
+          deadline,
+        );
+        const immediate = await discoverWindowsServices(
+          paths,
+          plan,
+          control,
+          deadline,
+        );
         if (!sameWindowsServiceSnapshot(validated, immediate)) {
           return await failWithRollback(
             "Windows service inventory changed after plan validation",
           );
         }
         for (const target of immediate) {
-          if (target.status === "present" && target.state !== 1) {
+          if (target.status === "present") {
+            // Record restoration intent before any command. Disabling an
+            // originally stopped service can race an in-flight SCM start, and
+            // even a failed command can have changed service state.
             stoppedByAction.push(target);
           }
-          await stopWindowsService(paths, target, control);
+          if (target.status === "present" && target.startType !== 4) {
+            if (control.configureStart === undefined) {
+              return await failWithRollback(
+                `${target.serviceName} start mode cannot be disabled safely`,
+              );
+            }
+            // Record before the command: sc.exe can change the start mode and
+            // still report a failure or lose its output channel.
+            disabledByAction.push(target);
+            const coordinationRemaining = (): number =>
+              windowsServiceCoordinationRemainingMilliseconds(
+                now,
+                deadline,
+                "Windows service coordination",
+              );
+            const disabled = await runWindowsDeadlineTask(
+              coordinationRemaining,
+              async (timeoutMs) =>
+                await control.configureStart?.(
+                  target.serviceName,
+                  "disabled",
+                  timeoutMs,
+                ),
+            );
+            if (disabled === undefined) {
+              return await failWithRollback(
+                `${target.serviceName} start mode cannot be disabled safely`,
+              );
+            }
+            assertCompleteWindowsCommandOutput(
+              disabled,
+              `${target.serviceName} start-mode latch`,
+            );
+            if (disabled.exitCode !== 0) {
+              return await failWithRollback(
+                failureDetail(
+                  disabled.stderr || disabled.stdout,
+                  paths.serviceControl,
+                  disabled.exitCode,
+                ),
+              );
+            }
+          }
+          await stopWindowsService(paths, target, control, deadline);
         }
-        const stopped = await discoverWindowsServices(paths, plan, control);
-        if (
-          stopped.length !== immediate.length ||
-          stopped.some(
-            (target, index) =>
-              target.component !== immediate[index]?.component ||
-              target.serviceName !== immediate[index]?.serviceName ||
-              target.unregister !== immediate[index]?.unregister ||
-              target.executable !== immediate[index]?.executable ||
-              !sameOptionalWindowsPathIdentity(
-                target.executableIdentity,
-                immediate[index]?.executableIdentity,
-              ) ||
-              target.configuration !== immediate[index]?.configuration ||
-              (target.status === "present" && target.state !== 1),
-          )
-        ) {
-          return await failWithRollback(
-            "Windows service inventory changed or reactivated after stop",
-          );
-        }
-        // Preflight never unregisters a service. A later component-owned
-        // operation may remove registration only after its payload cleanup and
-        // postconditions have succeeded.
+        await assertWindowsServicesQuiesced(
+          paths,
+          plan,
+          control,
+          immediate,
+          lifecycle,
+          false,
+          deadline,
+        );
+        quiescedExpected = immediate;
+        // Preflight never unregisters a service. Docker owns its terminal
+        // registration transition; the package-phase finalizer removes exact
+        // Apache, Nginx, and PostgreSQL registrations after uninstallers run.
         return immediate.some(({ status }) => status === "present")
           ? { status: "removed" }
           : { status: "not-found" };
@@ -1105,6 +1834,404 @@ export function createWindowsServiceCoordinator(
         return await failWithRollback(
           error instanceof Error ? error.message : String(error),
         );
+      }
+    },
+  });
+  return Object.assign(operation, { assertQuiesced });
+}
+
+const WINDOWS_SERVICE_REGISTRATION_COMPONENTS = new Set<ComponentId>([
+  "apache",
+  "nginx",
+  "postgresql",
+]);
+
+const WINDOWS_SERVICE_GUARDED_COMPONENTS = new Set<ComponentId>([
+  "docker-engine",
+  ...WINDOWS_SERVICE_REGISTRATION_COMPONENTS,
+]);
+
+function windowsServiceRegistrationPlan(plan: CleanupPlan): CleanupPlan {
+  return {
+    ...plan,
+    enabled: new Set(
+      [...plan.enabled].filter((component) =>
+        WINDOWS_SERVICE_REGISTRATION_COMPONENTS.has(component),
+      ),
+    ),
+  };
+}
+
+async function currentPostgreSqlServiceNames(
+  paths: WindowsPaths,
+  control: WindowsServiceControl,
+  deadline = windowsServiceClock(control)() +
+    WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+): Promise<readonly string[]> {
+  const now = windowsServiceClock(control);
+  const remaining = (): number =>
+    windowsServiceCoordinationRemainingMilliseconds(
+      now,
+      deadline,
+      "Windows service registration cleanup",
+    );
+  const inventory = await runWindowsDeadlineTask(
+    remaining,
+    async (timeoutMs) => await control.inventory(timeoutMs),
+  );
+  assertCompleteWindowsCommandOutput(inventory, "Windows service inventory");
+  if (inventory.exitCode !== 0) {
+    throw windowsServiceFailure(paths, "PostgreSQL inventory", inventory);
+  }
+  const classified = classifyPostgreSqlServiceInventory(
+    `${inventory.stdout}\n${inventory.stderr}`,
+  );
+  if (classified.status === "unsafe") throw new Error(classified.detail);
+  remaining();
+  return classified.serviceNames;
+}
+
+async function assertWindowsServiceReadyForRegistrationDeletion(
+  paths: WindowsPaths,
+  expected: WindowsServiceSnapshot,
+  control: WindowsServiceControl,
+  aggregateDeadline = windowsServiceClock(control)() +
+    WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+): Promise<"missing" | "present"> {
+  const aggregateNow = windowsServiceClock(control);
+  const remaining = (): number =>
+    windowsServiceCoordinationRemainingMilliseconds(
+      aggregateNow,
+      aggregateDeadline,
+      "Windows service registration cleanup",
+    );
+  const current = await runWindowsDeadlineTask(
+    remaining,
+    async (timeoutMs) => await control.query(expected.serviceName, timeoutMs),
+  );
+  assertCompleteWindowsCommandOutput(
+    current,
+    `${expected.serviceName} service query`,
+  );
+  if (isMissingWindowsService(current)) return "missing";
+  if (isWindowsServiceDeletionPending(current)) {
+    const wait =
+      control.wait ??
+      (async (milliseconds: number) =>
+        await new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    const now = windowsServiceClock(control);
+    const deadline = Math.min(
+      aggregateDeadline,
+      now() + WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS,
+    );
+    const transitionRemaining =
+      (description: string): (() => number) =>
+      () => {
+        remaining();
+        return windowsServiceRemainingMilliseconds(now, deadline, description);
+      };
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      const description = `${expected.serviceName} service registration deletion`;
+      const taskRemaining = transitionRemaining(description);
+      await runWindowsDeadlineTask(
+        taskRemaining,
+        async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+      );
+      const pending = await runWindowsDeadlineTask(
+        taskRemaining,
+        async (timeoutMs) =>
+          await control.query(expected.serviceName, timeoutMs),
+      );
+      assertCompleteWindowsCommandOutput(
+        pending,
+        `${expected.serviceName} service deletion verification`,
+      );
+      if (isMissingWindowsService(pending)) return "missing";
+      if (!isWindowsServiceDeletionPending(pending)) {
+        throw new Error(
+          `${expected.serviceName}: pending service deletion changed state before completion`,
+        );
+      }
+    }
+    throw new Error(
+      `${expected.serviceName}: service remained marked for deletion after 30 seconds`,
+    );
+  }
+  if (current.exitCode !== 0) {
+    throw windowsServiceFailure(paths, expected.serviceName, current);
+  }
+  if (expected.status === "missing") {
+    throw new Error(
+      `${expected.serviceName}: service registration appeared after plan validation`,
+    );
+  }
+  if (!isStoppedWindowsService(current)) {
+    throw new Error(
+      `${expected.serviceName}: service reactivated before registration cleanup`,
+    );
+  }
+  if (
+    expected.configuration === undefined ||
+    expected.executable === undefined ||
+    expected.executableIdentity === undefined ||
+    control.config === undefined ||
+    control.inspectExecutable === undefined
+  ) {
+    throw new Error(
+      `${expected.serviceName}: validated service identity is unavailable`,
+    );
+  }
+  const configuration = await runWindowsDeadlineTask(
+    remaining,
+    async (timeoutMs) =>
+      await control.config?.(expected.serviceName, timeoutMs),
+  );
+  if (configuration === undefined) {
+    throw new Error(
+      `${expected.serviceName}: service configuration is unavailable`,
+    );
+  }
+  assertCompleteWindowsCommandOutput(
+    configuration,
+    `${expected.serviceName} service configuration`,
+  );
+  if (configuration.exitCode !== 0) {
+    throw windowsServiceFailure(paths, expected.serviceName, configuration);
+  }
+  const executable = parseAndValidateWindowsServiceExecutable(
+    paths,
+    expected.component,
+    expected.serviceName,
+    configuration.stdout,
+  );
+  if (windowsServiceStartType(configuration.stdout) !== 4) {
+    throw new Error(
+      `${expected.serviceName}: service lost its disabled latch before registration cleanup`,
+    );
+  }
+  if (
+    !sameWindowsPath(executable, expected.executable) ||
+    windowsServiceConfigurationWithoutStartType(configuration.stdout) !==
+      windowsServiceConfigurationWithoutStartType(expected.configuration)
+  ) {
+    throw new Error(
+      `${expected.serviceName}: service configuration changed after plan validation`,
+    );
+  }
+  const executableIdentity = await runWindowsDeadlineTask(
+    remaining,
+    async () => await control.inspectExecutable?.(executable),
+  );
+  if (
+    executableIdentity !== undefined &&
+    !sameWindowsPathIdentity(expected.executableIdentity, executableIdentity)
+  ) {
+    throw new Error(
+      `${expected.serviceName}: service executable changed after plan validation`,
+    );
+  }
+  return "present";
+}
+
+export function createWindowsServiceRegistrationCleanup(
+  paths: WindowsPaths,
+  plan: CleanupPlan,
+  control: WindowsServiceControl = windowsServiceControl(paths),
+  lifecycle?: WindowsServiceRegistrationLifecycle,
+): Operation | undefined {
+  const registrationPlan = windowsServiceRegistrationPlan(plan);
+  const fixed = selectedFixedWindowsServices(registrationPlan);
+  if (fixed.length === 0 && !registrationPlan.enabled.has("postgresql")) {
+    return undefined;
+  }
+  const component = fixed[0]?.component ?? "postgresql";
+  const wait =
+    control.wait ??
+    (async (milliseconds: number) =>
+      await new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let validated: readonly WindowsServiceSnapshot[] | undefined;
+
+  const validate = async (): Promise<void> => {
+    const now = windowsServiceClock(control);
+    validated = await discoverWindowsServices(
+      paths,
+      registrationPlan,
+      control,
+      now() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+    );
+  };
+
+  const preflightDeletion = async (
+    deadline = windowsServiceClock(control)() +
+      WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
+  ): Promise<readonly WindowsServiceSnapshot[]> => {
+    validated ??= await discoverWindowsServices(
+      paths,
+      registrationPlan,
+      control,
+      deadline,
+    );
+    let currentPostgreSqlNames: readonly string[] = [];
+    if (registrationPlan.enabled.has("postgresql")) {
+      currentPostgreSqlNames = await currentPostgreSqlServiceNames(
+        paths,
+        control,
+        deadline,
+      );
+      const expectedNames = new Set(
+        validated
+          .filter(({ component }) => component === "postgresql")
+          .map(({ serviceName }) => serviceName.toLowerCase()),
+      );
+      const unexpected = currentPostgreSqlNames.find(
+        (serviceName) => !expectedNames.has(serviceName.toLowerCase()),
+      );
+      if (unexpected !== undefined) {
+        throw new Error(
+          `PostgreSQL service inventory changed after plan validation: ${unexpected}`,
+        );
+      }
+    }
+    const currentPostgreSqlSet = new Set(
+      currentPostgreSqlNames.map((serviceName) => serviceName.toLowerCase()),
+    );
+    const present: WindowsServiceSnapshot[] = [];
+    for (const expected of validated) {
+      const status = await assertWindowsServiceReadyForRegistrationDeletion(
+        paths,
+        expected,
+        control,
+        deadline,
+      );
+      if (
+        status === "present" &&
+        expected.component === "postgresql" &&
+        !currentPostgreSqlSet.has(expected.serviceName.toLowerCase())
+      ) {
+        throw new Error(
+          `${expected.serviceName}: service inventory omitted a registered PostgreSQL service`,
+        );
+      }
+      if (status === "present") present.push(expected);
+    }
+    return present;
+  };
+
+  return createFunctionOperation({
+    id: "windows:services:unregister",
+    component,
+    description: "Remove selected stale Windows service registrations",
+    phase: "package",
+    dedupeKey: "windows:services:unregister",
+    validate,
+    run: async (): Promise<OperationResult> => {
+      try {
+        const now = windowsServiceClock(control);
+        const aggregateDeadline =
+          now() + WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS;
+        const remaining = (): number =>
+          windowsServiceCoordinationRemainingMilliseconds(
+            now,
+            aggregateDeadline,
+            "Windows service registration cleanup",
+          );
+        const present = await preflightDeletion(aggregateDeadline);
+        let removed = false;
+        for (const expected of present) {
+          assertCommandTerminationConfirmed();
+          const immediate =
+            await assertWindowsServiceReadyForRegistrationDeletion(
+              paths,
+              expected,
+              control,
+              aggregateDeadline,
+            );
+          if (immediate === "missing") continue;
+          const transitionNow = windowsServiceClock(control);
+          const description = `${expected.serviceName} service registration deletion`;
+          const deadline = Math.min(
+            aggregateDeadline,
+            transitionNow() + WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS,
+          );
+          const transitionRemaining = (): number => {
+            remaining();
+            return windowsServiceRemainingMilliseconds(
+              transitionNow,
+              deadline,
+              description,
+            );
+          };
+          const deletion = await runWindowsDeadlineTask(
+            transitionRemaining,
+            async (timeoutMs) =>
+              await control.delete(expected.serviceName, timeoutMs),
+          );
+          assertCompleteWindowsCommandOutput(
+            deletion,
+            `${expected.serviceName} service deletion`,
+          );
+          if (
+            deletion.exitCode !== 0 &&
+            !isMissingWindowsService(deletion) &&
+            !isWindowsServiceDeletionPending(deletion)
+          ) {
+            throw windowsServiceFailure(paths, expected.serviceName, deletion);
+          }
+
+          let absent = false;
+          for (let attempt = 0; attempt < 60; attempt += 1) {
+            const current = await runWindowsDeadlineTask(
+              transitionRemaining,
+              async (timeoutMs) =>
+                await control.query(expected.serviceName, timeoutMs),
+            );
+            assertCompleteWindowsCommandOutput(
+              current,
+              `${expected.serviceName} service deletion verification`,
+            );
+            if (isMissingWindowsService(current)) {
+              absent = true;
+              removed = true;
+              break;
+            }
+            if (
+              current.exitCode !== 0 &&
+              !isWindowsServiceDeletionPending(current)
+            ) {
+              throw windowsServiceFailure(paths, expected.serviceName, current);
+            }
+            await runWindowsDeadlineTask(
+              transitionRemaining,
+              async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+            );
+          }
+          if (!absent) {
+            throw new Error(
+              `${expected.serviceName}: service remained registered after deletion`,
+            );
+          }
+        }
+
+        const finalPresent = await preflightDeletion(aggregateDeadline);
+        remaining();
+        if (finalPresent.length !== 0) {
+          throw new Error(
+            `Windows service registration reappeared after cleanup: ${finalPresent
+              .map(({ serviceName }) => serviceName)
+              .join(", ")}`,
+          );
+        }
+        for (const component of WINDOWS_SERVICE_REGISTRATION_COMPONENTS) {
+          if (registrationPlan.enabled.has(component)) {
+            lifecycle?.finalizeRegistration(component);
+          }
+        }
+        return removed ? { status: "removed" } : { status: "not-found" };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
       }
     },
   });
@@ -1161,37 +2288,30 @@ function notFoundOperation(
   });
 }
 
-async function versionedDirectories(
+export async function listWindowsVersionedDirectories(
   parent: string,
   pattern: RegExp,
 ): Promise<readonly string[]> {
-  try {
-    const entries = await readdir(parent, { withFileTypes: true });
-    const selected = entries
-      .filter(
-        (entry) =>
-          (entry.isDirectory() || entry.isSymbolicLink()) &&
-          pattern.test(entry.name),
-      )
-      .map((entry) => win32.join(parent, entry.name))
-      .sort((left, right) => left.localeCompare(right));
-    if (selected.length > MAX_VERSIONED_CHILDREN) {
-      throw new Error(
-        `versioned directory inventory under '${parent}' exceeded ${MAX_VERSIONED_CHILDREN} entries`,
-      );
-    }
-    return selected;
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      ["ENOENT", "ENOTDIR"].includes(
-        (error as NodeJS.ErrnoException).code ?? "",
-      )
-    ) {
-      return [];
-    }
-    throw error;
+  const description = `versioned directory inventory under '${parent}'`;
+  if (process.platform !== "win32" && /^(?:[A-Za-z]:[\\/]|\\\\)/.test(parent)) {
+    return [];
   }
+  const hostPathStyle = process.platform === "win32" ? "win32" : "posix";
+  const normalizedParent =
+    hostPathStyle === "win32"
+      ? win32.normalize(parent)
+      : posix.normalize(parent);
+  const entries = await listBoundedVersionedDirectoryEntries(
+    normalizedParent,
+    pattern,
+    hostPathStyle,
+    description,
+  );
+  return entries.map(({ name }) =>
+    hostPathStyle === "win32"
+      ? win32.join(parent, name)
+      : posix.join(parent, name),
+  );
 }
 
 export async function listChocolateyPackages(
@@ -1201,78 +2321,89 @@ export async function listChocolateyPackages(
 ): Promise<WindowsChocolateyInventory> {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
-  const executableIdentity = await inspect(executable);
-  if (executableIdentity === undefined) {
-    throw new Error(`Chocolatey executable is unavailable: ${executable}`);
-  }
-  if (
-    dependencies.expectedInventoryExecutable !== undefined &&
-    !sameWindowsPathIdentity(
-      dependencies.expectedInventoryExecutable,
-      executableIdentity,
-    )
-  ) {
-    throw new Error("Chocolatey executable changed before package inventory");
-  }
-  const result = await execute(
-    executable,
-    // Chocolatey 2 made `list` local-only and removed --local-only. Hosted
-    // Windows images use Chocolatey 2+, so avoid the removed compatibility flag.
-    ["list", "--limit-output", "--no-color"],
-    {
-      env: environment,
-      silent: true,
-      timeoutMs: 2 * 60_000,
-    },
-  );
-  if (result.exitCode !== 0) {
-    throw new Error(
-      failureDetail(
-        result.stderr || result.stdout,
-        executable,
-        result.exitCode,
-      ),
-    );
-  }
-  if (result.stdoutTruncated === true || result.stderrTruncated === true) {
-    throw new Error(
-      "Chocolatey package inventory exceeded the safe output bound",
-    );
-  }
-  const currentExecutable = await inspect(executable);
-  if (!sameWindowsPathIdentity(executableIdentity, currentExecutable)) {
-    throw new Error(
-      "Chocolatey executable changed while reading package inventory",
-    );
-  }
-
-  const versions = new Map<string, string>();
-  for (const line of result.stdout.split(/\r?\n/)) {
-    if (line.trim() === "") continue;
-    const separator = line.indexOf("|");
-    if (separator === -1 || separator !== line.lastIndexOf("|")) {
-      throw new Error("Chocolatey returned an unsafe package inventory record");
+  const budget =
+    dependencies.inventoryBudget ?? createWindowsInventoryBudget(dependencies);
+  return await budget.run("Chocolatey package inventory", async (remaining) => {
+    const executableIdentity = await inspect(executable);
+    remaining();
+    if (executableIdentity === undefined) {
+      throw new Error(`Chocolatey executable is unavailable: ${executable}`);
     }
-    const name = line.slice(0, separator).trim().toLowerCase();
-    const version = line.slice(separator + 1).trim();
     if (
-      !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(name) ||
-      version === "" ||
-      version.length > 128
+      dependencies.expectedInventoryExecutable !== undefined &&
+      !sameWindowsPathIdentity(
+        dependencies.expectedInventoryExecutable,
+        executableIdentity,
+      )
     ) {
-      throw new Error("Chocolatey returned an unsafe package inventory record");
+      throw new Error("Chocolatey executable changed before package inventory");
     }
-    const existing = versions.get(name);
-    if (existing !== undefined && existing !== version) {
-      throw new Error(`Chocolatey returned conflicting versions for ${name}`);
+    const result = await execute(
+      executable,
+      // Chocolatey 2 made `list` local-only and removed --local-only. Hosted
+      // Windows images use Chocolatey 2+, so avoid the removed compatibility flag.
+      ["list", "--limit-output", "--no-color"],
+      {
+        env: environment,
+        silent: true,
+        timeoutMs: remaining(),
+      },
+    );
+    remaining();
+    if (result.exitCode !== 0) {
+      throw new Error(
+        failureDetail(
+          result.stderr || result.stdout,
+          executable,
+          result.exitCode,
+        ),
+      );
     }
-    versions.set(name, version);
-  }
-  return {
-    packages: new Set(versions.keys()),
-    versions,
-    executable: executableIdentity,
-  };
+    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+      throw new Error(
+        "Chocolatey package inventory exceeded the safe output bound",
+      );
+    }
+    const currentExecutable = await inspect(executable);
+    remaining();
+    if (!sameWindowsPathIdentity(executableIdentity, currentExecutable)) {
+      throw new Error(
+        "Chocolatey executable changed while reading package inventory",
+      );
+    }
+
+    const versions = new Map<string, string>();
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (line.trim() === "") continue;
+      const separator = line.indexOf("|");
+      if (separator === -1 || separator !== line.lastIndexOf("|")) {
+        throw new Error(
+          "Chocolatey returned an unsafe package inventory record",
+        );
+      }
+      const name = line.slice(0, separator).trim().toLowerCase();
+      const version = line.slice(separator + 1).trim();
+      if (
+        !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(name) ||
+        version === "" ||
+        version.length > 128
+      ) {
+        throw new Error(
+          "Chocolatey returned an unsafe package inventory record",
+        );
+      }
+      const existing = versions.get(name);
+      if (existing !== undefined && existing !== version) {
+        throw new Error(`Chocolatey returned conflicting versions for ${name}`);
+      }
+      versions.set(name, version);
+    }
+    return {
+      packages: new Set(versions.keys()),
+      versions,
+      executable: executableIdentity,
+    };
+  });
 }
 
 export interface WindowsChocolateyInventory {
@@ -1291,6 +2422,10 @@ export function createWindowsChocolateyOperation(
 ): Operation {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
+  const inventoryDependencies: WindowsInventoryDependencies = {
+    ...dependencies,
+    inventoryBudget: createWindowsInventoryBudget(dependencies),
+  };
   return createFunctionOperation({
     id: `windows:choco:${component}:${packageNames.join(",")}`,
     component,
@@ -1328,7 +2463,7 @@ export function createWindowsChocolateyOperation(
           paths.chocolatey,
           paths.chocolateyEnvironment,
           {
-            ...dependencies,
+            ...inventoryDependencies,
             expectedInventoryExecutable: installed.executable,
           },
         );
@@ -1364,8 +2499,11 @@ export function createWindowsChocolateyOperation(
           },
         );
         const disposition = windowsInstallerExitDisposition(result.exitCode);
-        if (disposition === "restart-initiated") {
-          return restartInitiatedResult(paths.chocolatey);
+        if (
+          disposition === "restart-required" ||
+          disposition === "restart-initiated"
+        ) {
+          return restartResult(paths.chocolatey, disposition);
         }
         if (disposition === "failed") {
           return {
@@ -1381,7 +2519,7 @@ export function createWindowsChocolateyOperation(
           paths.chocolatey,
           paths.chocolateyEnvironment,
           {
-            ...dependencies,
+            ...inventoryDependencies,
             expectedInventoryExecutable: installed.executable,
           },
         );
@@ -1408,23 +2546,40 @@ export const UNINSTALL_REGISTRY_ROOTS = Object.freeze([
 export function parseWindowsUninstallRecords(
   output: string,
 ): readonly WindowsUninstallRecord[] {
+  const classificationFields = new Set([
+    "displayname",
+    "displayversion",
+    "bundlecachepath",
+    "windowsinstaller",
+  ]);
   const records: WindowsUninstallRecord[] = [];
   let currentKey: string | undefined;
   let values = new Map<string, string>();
+  let valueTypes = new Map<string, string>();
   const flush = (): void => {
     if (currentKey === undefined) return;
     const displayName = values.get("displayname");
     const displayVersion = values.get("displayversion");
     const bundleCachePath = values.get("bundlecachepath");
     const windowsInstallerText = values.get("windowsinstaller");
-    const windowsInstaller =
-      windowsInstallerText === undefined
-        ? undefined
-        : /^0x[0-9a-f]+$/i.test(windowsInstallerText)
-          ? Number.parseInt(windowsInstallerText.slice(2), 16)
-          : /^\d+$/.test(windowsInstallerText)
-            ? Number.parseInt(windowsInstallerText, 10)
-            : undefined;
+    let windowsInstaller: number | undefined;
+    if (windowsInstallerText !== undefined) {
+      if (valueTypes.get("windowsinstaller") !== "DWORD") {
+        throw new Error(
+          `WindowsInstaller has an unsupported registry type in '${currentKey}'`,
+        );
+      }
+      windowsInstaller = /^0x[0-9a-f]+$/i.test(windowsInstallerText)
+        ? Number.parseInt(windowsInstallerText.slice(2), 16)
+        : /^\d+$/.test(windowsInstallerText)
+          ? Number.parseInt(windowsInstallerText, 10)
+          : undefined;
+      if (windowsInstaller === undefined) {
+        throw new Error(
+          `WindowsInstaller has an invalid registry value in '${currentKey}'`,
+        );
+      }
+    }
     records.push({
       registryKey: currentKey,
       ...(displayName === undefined ? {} : { displayName }),
@@ -1440,15 +2595,44 @@ export function parseWindowsUninstallRecords(
       flush();
       currentKey = trimmed;
       values = new Map<string, string>();
+      valueTypes = new Map<string, string>();
       continue;
     }
     if (currentKey === undefined) continue;
-    const value =
-      /^\s*([^\s]+)\s+REG_(?:SZ|EXPAND_SZ|DWORD|QWORD)\s+(.*?)\s*$/i.exec(line);
+    const value = /^\s*([^\s]+)\s+REG_([A-Z0-9_]+)\s+(.*?)\s*$/i.exec(line);
     const name = value?.[1];
-    const contents = value?.[2];
-    if (name !== undefined && contents !== undefined) {
-      values.set(name.toLowerCase(), contents);
+    const type = value?.[2];
+    const contents = value?.[3];
+    if (name !== undefined && type !== undefined && contents !== undefined) {
+      const normalizedName = name.toLowerCase();
+      if (!classificationFields.has(normalizedName)) continue;
+      if (values.has(normalizedName)) {
+        throw new Error(
+          `${name} has a duplicate registry value in '${currentKey}'`,
+        );
+      }
+      const normalizedType = type.toUpperCase();
+      if (
+        normalizedName === "windowsinstaller"
+          ? normalizedType !== "DWORD"
+          : normalizedType !== "SZ" && normalizedType !== "EXPAND_SZ"
+      ) {
+        throw new Error(
+          `${name} has an unsupported registry type in '${currentKey}'`,
+        );
+      }
+      values.set(normalizedName, contents);
+      valueTypes.set(normalizedName, normalizedType);
+      continue;
+    }
+    const malformedName = /^\s*([^\s]+)/.exec(line)?.[1];
+    if (
+      malformedName !== undefined &&
+      classificationFields.has(malformedName.toLowerCase())
+    ) {
+      throw new Error(
+        `${malformedName} has a malformed registry value in '${currentKey}'`,
+      );
     }
   }
   flush();
@@ -1501,44 +2685,73 @@ export async function listWindowsUninstallRecords(
 ): Promise<WindowsUninstallInventory> {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
-  const registryExecutable = await inspect(paths.reg);
-  if (registryExecutable === undefined) {
-    throw new Error(`reg.exe is unavailable at ${paths.reg}`);
-  }
-  const byKey = new Map<string, WindowsUninstallRecord>();
-  for (const root of UNINSTALL_REGISTRY_ROOTS) {
-    const result = await execute(paths.reg, ["query", root, "/s"], {
-      env: paths.commandEnvironment,
-      silent: true,
-      timeoutMs: 2 * 60_000,
-    });
-    if (isMissingRegistryValue(result)) continue;
-    if (result.exitCode !== 0) {
-      throw new Error(
-        failureDetail(
-          result.stderr || result.stdout,
-          paths.reg,
-          result.exitCode,
-        ),
-      );
-    }
-    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
-      throw new Error(
-        "uninstall registry inventory exceeded the safe output bound",
-      );
-    }
-    for (const record of parseWindowsUninstallRecords(result.stdout)) {
-      byKey.set(win32.normalize(record.registryKey).toLowerCase(), record);
-    }
-  }
-  const currentRegistryExecutable = await inspect(paths.reg);
-  if (!sameWindowsPathIdentity(registryExecutable, currentRegistryExecutable)) {
-    throw new Error("reg.exe changed while reading the installed product list");
-  }
-  return {
-    records: [...byKey.values()],
-    registryExecutable,
-  };
+  const budget =
+    dependencies.inventoryBudget ?? createWindowsInventoryBudget(dependencies);
+  return await budget.run(
+    "Windows uninstall registry inventory",
+    async (remaining) => {
+      const registryExecutable = await inspect(paths.reg);
+      remaining();
+      if (registryExecutable === undefined) {
+        throw new Error(`reg.exe is unavailable at ${paths.reg}`);
+      }
+      const byKey = new Map<string, WindowsUninstallRecord>();
+      for (const root of UNINSTALL_REGISTRY_ROOTS) {
+        remaining();
+        const result = await execute(paths.reg, ["query", root, "/s"], {
+          env: paths.commandEnvironment,
+          silent: true,
+          timeoutMs: remaining(),
+        });
+        remaining();
+        if (isMissingRegistryValue(result)) continue;
+        if (result.exitCode !== 0) {
+          throw new Error(
+            failureDetail(
+              result.stderr || result.stdout,
+              paths.reg,
+              result.exitCode,
+            ),
+          );
+        }
+        if (
+          result.stdoutTruncated === true ||
+          result.stderrTruncated === true
+        ) {
+          throw new Error(
+            "uninstall registry inventory exceeded the safe output bound",
+          );
+        }
+        for (const record of parseWindowsUninstallRecords(result.stdout)) {
+          const key = win32.normalize(record.registryKey).toLowerCase();
+          const existing = byKey.get(key);
+          if (
+            existing !== undefined &&
+            !sameWindowsUninstallRecord(existing, record)
+          ) {
+            throw new Error(
+              `uninstall registry returned conflicting records for '${record.registryKey}'`,
+            );
+          }
+          byKey.set(key, record);
+        }
+      }
+      remaining();
+      const currentRegistryExecutable = await inspect(paths.reg);
+      remaining();
+      if (
+        !sameWindowsPathIdentity(registryExecutable, currentRegistryExecutable)
+      ) {
+        throw new Error(
+          "reg.exe changed while reading the installed product list",
+        );
+      }
+      return {
+        records: [...byKey.values()],
+        registryExecutable,
+      };
+    },
+  );
 }
 
 export async function listMsiProducts(
@@ -1546,17 +2759,36 @@ export async function listMsiProducts(
   dependencies: WindowsInventoryDependencies = {},
 ): Promise<WindowsMsiInventory> {
   const inventory = await listWindowsUninstallRecords(paths, dependencies);
-  const byCode = new Map<string, MsiProduct>();
-  for (const record of inventory.records) {
-    const product = msiProductFromRecord(record);
-    if (product !== undefined) {
-      byCode.set(product.productCode.toLowerCase(), product);
-    }
-  }
   return {
-    products: [...byCode.values()],
+    products: msiProductsFromRecords(inventory.records),
     registryExecutable: inventory.registryExecutable,
   };
+}
+
+function msiProductsFromRecords(
+  records: readonly WindowsUninstallRecord[],
+): readonly MsiProduct[] {
+  const byCode = new Map<string, MsiProduct>();
+  for (const record of records) {
+    const product = msiProductFromRecord(record);
+    if (product !== undefined) {
+      const key = product.productCode.toLowerCase();
+      const existing = byCode.get(key);
+      if (
+        existing !== undefined &&
+        (win32.normalize(existing.registryKey).toLowerCase() !==
+          win32.normalize(product.registryKey).toLowerCase() ||
+          existing.displayName !== product.displayName ||
+          existing.windowsInstaller !== product.windowsInstaller)
+      ) {
+        throw new Error(
+          `uninstall registry returned conflicting MSI product code '${product.productCode}'`,
+        );
+      }
+      byCode.set(key, product);
+    }
+  }
+  return [...byCode.values()];
 }
 
 async function readExactUninstallRecord(
@@ -1567,46 +2799,59 @@ async function readExactUninstallRecord(
 ): Promise<WindowsUninstallRecord | undefined> {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
-  const before = await inspect(paths.reg);
-  if (!sameWindowsPathIdentity(expectedRegistryExecutable, before)) {
-    throw new Error("reg.exe changed before exact product verification");
-  }
-  const result = await execute(paths.reg, ["query", registryKey], {
-    env: paths.commandEnvironment,
-    silent: true,
-    timeoutMs: 30_000,
-  });
-  let record: WindowsUninstallRecord | undefined;
-  if (!isMissingRegistryValue(result)) {
-    if (result.exitCode !== 0) {
-      throw new Error(
-        failureDetail(
-          result.stderr || result.stdout,
-          paths.reg,
-          result.exitCode,
-        ),
-      );
-    }
-    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
-      throw new Error("exact product query exceeded the safe output bound");
-    }
-    const matches = parseWindowsUninstallRecords(result.stdout).filter(
-      ({ registryKey: candidate }) =>
-        win32.normalize(candidate).toLowerCase() ===
-        win32.normalize(registryKey).toLowerCase(),
-    );
-    if (matches.length !== 1) {
-      throw new Error(
-        `exact product query returned ${matches.length} matching records`,
-      );
-    }
-    record = matches[0];
-  }
-  const after = await inspect(paths.reg);
-  if (!sameWindowsPathIdentity(expectedRegistryExecutable, after)) {
-    throw new Error("reg.exe changed during exact product verification");
-  }
-  return record;
+  const budget =
+    dependencies.inventoryBudget ?? createWindowsInventoryBudget(dependencies);
+  return await budget.run(
+    "Windows exact uninstall inventory",
+    async (remaining) => {
+      const before = await inspect(paths.reg);
+      remaining();
+      if (!sameWindowsPathIdentity(expectedRegistryExecutable, before)) {
+        throw new Error("reg.exe changed before exact product verification");
+      }
+      const result = await execute(paths.reg, ["query", registryKey], {
+        env: paths.commandEnvironment,
+        silent: true,
+        timeoutMs: Math.min(30_000, remaining()),
+      });
+      remaining();
+      let record: WindowsUninstallRecord | undefined;
+      if (!isMissingRegistryValue(result)) {
+        if (result.exitCode !== 0) {
+          throw new Error(
+            failureDetail(
+              result.stderr || result.stdout,
+              paths.reg,
+              result.exitCode,
+            ),
+          );
+        }
+        if (
+          result.stdoutTruncated === true ||
+          result.stderrTruncated === true
+        ) {
+          throw new Error("exact product query exceeded the safe output bound");
+        }
+        const matches = parseWindowsUninstallRecords(result.stdout).filter(
+          ({ registryKey: candidate }) =>
+            win32.normalize(candidate).toLowerCase() ===
+            win32.normalize(registryKey).toLowerCase(),
+        );
+        if (matches.length !== 1) {
+          throw new Error(
+            `exact product query returned ${matches.length} matching records`,
+          );
+        }
+        record = matches[0];
+      }
+      const after = await inspect(paths.reg);
+      remaining();
+      if (!sameWindowsPathIdentity(expectedRegistryExecutable, after)) {
+        throw new Error("reg.exe changed during exact product verification");
+      }
+      return record;
+    },
+  );
 }
 
 function sameMsiProduct(left: MsiProduct, right: MsiProduct): boolean {
@@ -1630,6 +2875,10 @@ export function createWindowsMsiOperation(
 ): Operation {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
+  const inventoryDependencies: WindowsInventoryDependencies = {
+    ...dependencies,
+    inventoryBudget: createWindowsInventoryBudget(dependencies),
+  };
   let validatedMsiexec: WindowsPathIdentity | undefined;
   let msiexecValidationComplete = false;
   return createFunctionOperation({
@@ -1645,6 +2894,9 @@ export function createWindowsMsiOperation(
           pattern.test(product.displayName),
         ),
       );
+      if (selected.length > 16) {
+        throw new Error("Windows MSI inventory exceeded 16 products");
+      }
       if (selected.length !== 0 && inventory.registryExecutable === undefined) {
         throw new Error("reg.exe identity is unavailable for MSI products");
       }
@@ -1661,6 +2913,12 @@ export function createWindowsMsiOperation(
           pattern.test(product.displayName),
         ),
       );
+      if (selected.length > 16) {
+        return {
+          status: "failed",
+          detail: "Windows MSI inventory exceeded 16 products",
+        };
+      }
       if (selected.length === 0) return { status: "not-found" };
       if (inventory.registryExecutable === undefined) {
         return {
@@ -1712,7 +2970,7 @@ export function createWindowsMsiOperation(
             paths,
             product.registryKey,
             inventory.registryExecutable,
-            dependencies,
+            inventoryDependencies,
           );
           exact =
             record === undefined ? undefined : msiProductFromRecord(record);
@@ -1745,8 +3003,11 @@ export function createWindowsMsiOperation(
           },
         );
         const disposition = windowsInstallerExitDisposition(result.exitCode);
-        if (disposition === "restart-initiated") {
-          return restartInitiatedResult(paths.msiexec);
+        if (
+          disposition === "restart-required" ||
+          disposition === "restart-initiated"
+        ) {
+          return restartResult(paths.msiexec, disposition);
         }
         if (
           disposition === "failed" &&
@@ -1767,7 +3028,7 @@ export function createWindowsMsiOperation(
             paths,
             product.registryKey,
             inventory.registryExecutable,
-            dependencies,
+            inventoryDependencies,
           );
         } catch (error) {
           return {
@@ -1932,7 +3193,10 @@ export function executableUninstallOperation(options: {
   ) => Promise<CommandResult>;
   readonly removeInstallationRoot?: (
     target: string,
+    expectedBoundary?: RemovalBoundarySnapshot,
   ) => Promise<OperationResult>;
+  readonly captureInstallationBoundary?: typeof captureSafeRemovalBoundary;
+  readonly removalDependencies?: RemovePathDependencies;
 }): Operation {
   const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
   const inspectFile =
@@ -1951,8 +3215,13 @@ export function executableUninstallOperation(options: {
       }));
   const removeInstallationRoot =
     options.removeInstallationRoot ??
-    (async (target: string) =>
-      await removeExactTarget(options.context, target));
+    (async (target: string, expectedBoundary?: RemovalBoundarySnapshot) =>
+      await removeExactTarget(options.context, target, expectedBoundary));
+  const captureInstallationBoundary =
+    options.captureInstallationBoundary ??
+    (options.removeInstallationRoot === undefined
+      ? captureSafeRemovalBoundary
+      : undefined);
   const candidates = [
     ...new Map(
       options.candidates.map((candidate) => [
@@ -1963,6 +3232,26 @@ export function executableUninstallOperation(options: {
       ]),
     ).values(),
   ];
+  const residualRemovalOperations =
+    options.removeInstallationRoot === undefined
+      ? new Map(
+          candidates.map((candidate) => [
+            candidate.installationRoot,
+            createRemovePathOperation(
+              {
+                id: `windows:uninstall-residual:${options.component}:${candidate.installationRoot}`,
+                component: options.component,
+                description: `Remove residual ${options.component} installation root`,
+                target: candidate.installationRoot,
+                allowedParents: [win32.dirname(candidate.installationRoot)],
+                context: options.context,
+                phase: "package",
+              },
+              options.removalDependencies,
+            ),
+          ]),
+        )
+      : undefined;
   const inspectAll = async (): Promise<
     readonly WindowsExecutableUninstallSnapshot[]
   > =>
@@ -1986,6 +3275,25 @@ export function executableUninstallOperation(options: {
     dedupeKey: `windows:uninstall:${options.id}`,
     validate: async () => {
       validated = await inspectAll();
+      if (residualRemovalOperations !== undefined) {
+        for (const snapshot of validated) {
+          if (snapshot.status !== "root-absent") {
+            await residualRemovalOperations
+              .get(snapshot.candidate.installationRoot)
+              ?.validate?.();
+          }
+        }
+      }
+    },
+    validateAfterPreflight: async () => {
+      validated ??= await inspectAll();
+      if (residualRemovalOperations === undefined) return;
+      for (const snapshot of validated) {
+        if (snapshot.status === "root-absent") continue;
+        await residualRemovalOperations
+          .get(snapshot.candidate.installationRoot)
+          ?.validateAfterPreflight?.();
+      }
     },
     run: async (): Promise<OperationResult> => {
       try {
@@ -2021,8 +3329,11 @@ export function executableUninstallOperation(options: {
             const disposition = windowsInstallerExitDisposition(
               result.exitCode,
             );
-            if (disposition === "restart-initiated") {
-              return restartInitiatedResult(snapshot.candidate.executable);
+            if (
+              disposition === "restart-required" ||
+              disposition === "restart-initiated"
+            ) {
+              return restartResult(snapshot.candidate.executable, disposition);
             }
             if (disposition === "failed") {
               return {
@@ -2045,9 +3356,43 @@ export function executableUninstallOperation(options: {
             removed = true;
             continue;
           }
-          const residualRemoval = await removeInstallationRoot(
+          if (!sameWindowsObjectIdentity(snapshot.root, afterUninstall.root)) {
+            return {
+              status: "failed",
+              detail: `installation root changed after uninstall: '${snapshot.candidate.installationRoot}'`,
+            };
+          }
+          const plannedRemoval = residualRemovalOperations?.get(
             snapshot.candidate.installationRoot,
           );
+          const residualBoundary =
+            plannedRemoval !== undefined ||
+            captureInstallationBoundary === undefined
+              ? undefined
+              : await captureInstallationBoundary(
+                  snapshot.candidate.installationRoot,
+                  [win32.dirname(snapshot.candidate.installationRoot)],
+                  options.context,
+                );
+          if (
+            residualBoundary !== undefined &&
+            !boundaryEndsWithWindowsIdentity(
+              residualBoundary,
+              afterUninstall.root,
+            )
+          ) {
+            return {
+              status: "failed",
+              detail: `installation root changed before locked removal: '${snapshot.candidate.installationRoot}'`,
+            };
+          }
+          const residualRemoval =
+            plannedRemoval === undefined
+              ? await removeInstallationRoot(
+                  snapshot.candidate.installationRoot,
+                  residualBoundary,
+                )
+              : await plannedRemoval.run();
           if (residualRemoval.status === "failed") {
             return {
               status: "failed",
@@ -2140,146 +3485,180 @@ export async function listVisualStudioInstances(
   const vswhere = paths.vswhere;
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
-  const vswhereExecutable = await inspect(vswhere);
-  if (vswhereExecutable === undefined) {
-    throw new Error(`vswhere.exe is unavailable at ${vswhere}`);
-  }
-  if (
-    dependencies.expectedInventoryExecutable !== undefined &&
-    !sameWindowsPathIdentity(
-      dependencies.expectedInventoryExecutable,
-      vswhereExecutable,
-    )
-  ) {
-    throw new Error("vswhere.exe changed before Visual Studio inventory");
-  }
-  const result = await execute(
-    vswhere,
-    [
-      "-all",
-      "-prerelease",
-      "-products",
-      "*",
-      ...(requiredComponents.length === 0
-        ? []
-        : ["-requiresAny", "-requires", ...requiredComponents]),
-      "-format",
-      "json",
-      "-utf8",
-    ],
-    {
-      env: paths.commandEnvironment,
-      silent: true,
-      timeoutMs: 2 * 60_000,
-    },
-  );
-  if (result.exitCode !== 0) {
-    throw new Error(failureDetail(result.stderr, vswhere, result.exitCode));
-  }
-  if (result.stdoutTruncated === true || result.stderrTruncated === true) {
-    throw new Error("vswhere inventory exceeded the safe output bound");
-  }
+  const budget =
+    dependencies.inventoryBudget ?? createWindowsInventoryBudget(dependencies);
+  return await budget.run("Visual Studio inventory", async (remaining) => {
+    const vswhereExecutable = await inspect(vswhere);
+    remaining();
+    if (vswhereExecutable === undefined) {
+      throw new Error(`vswhere.exe is unavailable at ${vswhere}`);
+    }
+    if (
+      dependencies.expectedInventoryExecutable !== undefined &&
+      !sameWindowsPathIdentity(
+        dependencies.expectedInventoryExecutable,
+        vswhereExecutable,
+      )
+    ) {
+      throw new Error("vswhere.exe changed before Visual Studio inventory");
+    }
+    const result = await execute(
+      vswhere,
+      [
+        "-all",
+        "-prerelease",
+        "-products",
+        "*",
+        ...(requiredComponents.length === 0
+          ? []
+          : ["-requiresAny", "-requires", ...requiredComponents]),
+        "-format",
+        "json",
+        "-utf8",
+      ],
+      {
+        env: paths.commandEnvironment,
+        silent: true,
+        timeoutMs: remaining(),
+      },
+    );
+    remaining();
+    if (result.exitCode !== 0) {
+      throw new Error(failureDetail(result.stderr, vswhere, result.exitCode));
+    }
+    if (result.stdoutTruncated === true || result.stderrTruncated === true) {
+      throw new Error("vswhere inventory exceeded the safe output bound");
+    }
 
-  const parsed: unknown = JSON.parse(result.stdout);
-  if (!Array.isArray(parsed)) throw new Error("vswhere returned invalid JSON");
-  const roots = [
-    win32.join(paths.programFiles, "Microsoft Visual Studio"),
-    win32.join(paths.programFilesX86, "Microsoft Visual Studio"),
-  ];
-  const instances: VisualStudioInstance[] = [];
-  for (const [index, value] of parsed.entries()) {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    const parsed: unknown = JSON.parse(result.stdout);
+    if (!Array.isArray(parsed))
+      throw new Error("vswhere returned invalid JSON");
+    if (parsed.length > 256) {
+      throw new Error("vswhere inventory exceeded 256 raw records");
+    }
+    const roots = [
+      win32.join(paths.programFiles, "Microsoft Visual Studio"),
+      win32.join(paths.programFilesX86, "Microsoft Visual Studio"),
+    ];
+    const candidates: Omit<VisualStudioInstance, "installationIdentity">[] = [];
+    for (const [index, value] of parsed.entries()) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error(
+          `vswhere returned an unclassified Visual Studio record at index ${index}`,
+        );
+      }
+      const record = value as Record<string, unknown>;
+      const installationPath = record.installationPath;
+      const installationVersion = record.installationVersion;
+      const productId = record.productId;
+      if (
+        typeof productId === "string" &&
+        productId !== "Microsoft.VisualStudio.Product.Enterprise"
+      ) {
+        continue;
+      }
+      if (productId !== "Microsoft.VisualStudio.Product.Enterprise") {
+        throw new Error(
+          `vswhere returned an unclassified Visual Studio record at index ${index}`,
+        );
+      }
+      const definitionRoot =
+        typeof installationPath === "string"
+          ? roots.find((root) =>
+              isStrictWindowsDescendant(installationPath, root),
+            )
+          : undefined;
+      if (
+        typeof installationPath !== "string" ||
+        !win32.isAbsolute(installationPath) ||
+        definitionRoot === undefined ||
+        typeof installationVersion !== "string" ||
+        !/^(?:17|18)\./.test(installationVersion)
+      ) {
+        throw new Error(
+          `vswhere returned a malformed Visual Studio Enterprise record at index ${index}`,
+        );
+      }
+      const normalizedInstallationPath = win32.normalize(installationPath);
+      candidates.push({
+        installationPath: normalizedInstallationPath,
+        definitionRoot,
+        installationVersion,
+        productId,
+      });
+    }
+    const byPath = new Map<
+      string,
+      Omit<VisualStudioInstance, "installationIdentity">
+    >();
+    for (const candidate of candidates) {
+      const key = candidate.installationPath.toLowerCase();
+      if (byPath.has(key)) {
+        throw new Error(
+          `vswhere returned a duplicate Visual Studio instance: ${candidate.installationPath}`,
+        );
+      }
+      byPath.set(key, candidate);
+    }
+    if (byPath.size > 8) {
+      throw new Error("Visual Studio inventory exceeded 8 instances");
+    }
+    const instances: VisualStudioInstance[] = [];
+    for (const candidate of byPath.values()) {
+      remaining();
+      const installationIdentity = await assertWindowsDirectoryChain(
+        candidate.installationPath,
+        candidate.definitionRoot,
+        dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
+      );
+      remaining();
+      instances.push({ ...candidate, installationIdentity });
+    }
+    const currentVswhereExecutable = await inspect(vswhere);
+    remaining();
+    if (!sameWindowsPathIdentity(vswhereExecutable, currentVswhereExecutable)) {
       throw new Error(
-        `vswhere returned an unclassified Visual Studio record at index ${index}`,
+        "vswhere.exe changed while reading Visual Studio instances",
       );
     }
-    const record = value as Record<string, unknown>;
-    const installationPath = record.installationPath;
-    const installationVersion = record.installationVersion;
-    const productId = record.productId;
-    if (
-      typeof productId === "string" &&
-      productId !== "Microsoft.VisualStudio.Product.Enterprise"
-    ) {
-      continue;
-    }
-    if (productId !== "Microsoft.VisualStudio.Product.Enterprise") {
-      throw new Error(
-        `vswhere returned an unclassified Visual Studio record at index ${index}`,
-      );
-    }
-    const definitionRoot =
-      typeof installationPath === "string"
-        ? roots.find((root) =>
-            isStrictWindowsDescendant(installationPath, root),
-          )
-        : undefined;
-    if (
-      typeof installationPath !== "string" ||
-      !win32.isAbsolute(installationPath) ||
-      definitionRoot === undefined ||
-      typeof installationVersion !== "string" ||
-      !/^(?:17|18)\./.test(installationVersion)
-    ) {
-      throw new Error(
-        `vswhere returned a malformed Visual Studio Enterprise record at index ${index}`,
-      );
-    }
-    const normalizedInstallationPath = win32.normalize(installationPath);
-    const installationIdentity = await assertWindowsDirectoryChain(
-      normalizedInstallationPath,
-      definitionRoot,
-      dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
-    );
-    instances.push({
-      installationPath: normalizedInstallationPath,
-      definitionRoot,
-      installationIdentity,
-      installationVersion,
-      productId,
-    });
-  }
-  const byPath = new Map<string, VisualStudioInstance>();
-  for (const instance of instances) {
-    const key = instance.installationPath.toLowerCase();
-    if (byPath.has(key)) {
-      throw new Error(
-        `vswhere returned a duplicate Visual Studio instance: ${instance.installationPath}`,
-      );
-    }
-    byPath.set(key, instance);
-  }
-  if (byPath.size > 8) {
-    throw new Error("Visual Studio inventory exceeded 8 instances");
-  }
-  const currentVswhereExecutable = await inspect(vswhere);
-  if (!sameWindowsPathIdentity(vswhereExecutable, currentVswhereExecutable)) {
-    throw new Error(
-      "vswhere.exe changed while reading Visual Studio instances",
-    );
-  }
-  return {
-    instances: [...byPath.values()].sort((left, right) =>
-      left.installationPath.localeCompare(right.installationPath),
-    ),
-    vswhereExecutable,
-  };
+    return {
+      instances: instances.sort((left, right) =>
+        left.installationPath.localeCompare(right.installationPath),
+      ),
+      vswhereExecutable,
+    };
+  });
 }
 
 async function verifyVisualStudioInstance(
   instance: VisualStudioInstance,
   dependencies: WindowsVisualStudioDependencies = {},
 ): Promise<boolean> {
-  try {
-    const current = await assertWindowsDirectoryChain(
-      instance.installationPath,
-      instance.definitionRoot,
-      dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
-    );
-    return sameWindowsPathIdentity(instance.installationIdentity, current);
-  } catch {
-    return false;
-  }
+  const budget =
+    dependencies.inventoryBudget ?? createWindowsInventoryBudget(dependencies);
+  return await budget.run(
+    "Visual Studio instance verification",
+    async (remaining) => {
+      try {
+        const current = await assertWindowsDirectoryChain(
+          instance.installationPath,
+          instance.definitionRoot,
+          dependencies.pathProbe ?? NODE_WINDOWS_PATH_PROBE,
+        );
+        remaining();
+        return sameWindowsPathIdentity(instance.installationIdentity, current);
+      } catch (error) {
+        remaining();
+        if (
+          error instanceof Error &&
+          /two-minute aggregate deadline/.test(error.message)
+        ) {
+          throw error;
+        }
+        return false;
+      }
+    },
+  );
 }
 
 function sameVisualStudioInstance(
@@ -2299,6 +3678,23 @@ function sameVisualStudioInstance(
   );
 }
 
+function sameVisualStudioInstanceObject(
+  left: VisualStudioInstance,
+  right: VisualStudioInstance,
+): boolean {
+  return (
+    left.installationPath.toLowerCase() ===
+      right.installationPath.toLowerCase() &&
+    left.definitionRoot.toLowerCase() === right.definitionRoot.toLowerCase() &&
+    left.installationVersion === right.installationVersion &&
+    left.productId === right.productId &&
+    sameWindowsObjectIdentity(
+      left.installationIdentity,
+      right.installationIdentity,
+    )
+  );
+}
+
 function sameVisualStudioInstances(
   left: readonly VisualStudioInstance[],
   right: readonly VisualStudioInstance[],
@@ -2308,6 +3704,21 @@ function sameVisualStudioInstances(
     left.every((instance, index) => {
       const other = right[index];
       return other !== undefined && sameVisualStudioInstance(instance, other);
+    })
+  );
+}
+
+function sameVisualStudioInstanceObjects(
+  left: readonly VisualStudioInstance[],
+  right: readonly VisualStudioInstance[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((instance, index) => {
+      const other = right[index];
+      return (
+        other !== undefined && sameVisualStudioInstanceObject(instance, other)
+      );
     })
   );
 }
@@ -2336,6 +3747,10 @@ export function createWindowsVisualStudioOperation(
 ): Operation {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
+  const inventoryDependencies: WindowsVisualStudioDependencies = {
+    ...dependencies,
+    inventoryBudget: createWindowsInventoryBudget(dependencies),
+  };
   let validatedSetup: WindowsPathIdentity | undefined;
   let validatedInstances: readonly VisualStudioInstance[] | undefined;
   let validatedVswhereExecutable: WindowsPathIdentity | undefined;
@@ -2393,7 +3808,7 @@ export function createWindowsVisualStudioOperation(
       let expected = [...validatedInstances];
       for (const instance of validatedInstances) {
         const fresh = await listVisualStudioInstances(paths, {
-          ...dependencies,
+          ...inventoryDependencies,
           expectedInventoryExecutable: validatedVswhereExecutable,
         });
         if (
@@ -2410,7 +3825,9 @@ export function createWindowsVisualStudioOperation(
             detail: "Visual Studio instance inventory changed before uninstall",
           };
         }
-        if (!(await verifyVisualStudioInstance(instance, dependencies))) {
+        if (
+          !(await verifyVisualStudioInstance(instance, inventoryDependencies))
+        ) {
           return {
             status: "failed",
             detail: `Visual Studio installation path changed before uninstall: ${instance.installationPath}`,
@@ -2441,8 +3858,11 @@ export function createWindowsVisualStudioOperation(
           },
         );
         const disposition = windowsInstallerExitDisposition(result.exitCode);
-        if (disposition === "restart-initiated") {
-          return restartInitiatedResult(setup);
+        if (
+          disposition === "restart-required" ||
+          disposition === "restart-initiated"
+        ) {
+          return restartResult(setup, disposition);
         }
         if (disposition === "failed") {
           return {
@@ -2456,7 +3876,7 @@ export function createWindowsVisualStudioOperation(
             instance.installationPath.toLowerCase(),
         );
         const after = await listVisualStudioInstances(paths, {
-          ...dependencies,
+          ...inventoryDependencies,
           expectedInventoryExecutable: validatedVswhereExecutable,
         });
         if (
@@ -2467,7 +3887,7 @@ export function createWindowsVisualStudioOperation(
         ) {
           return changedVisualStudioInventoryExecutable();
         }
-        if (!sameVisualStudioInstances(expected, after.instances)) {
+        if (!sameVisualStudioInstanceObjects(expected, after.instances)) {
           return {
             status: "failed",
             detail: `Visual Studio instance remained registered or inventory changed after uninstall: ${instance.installationPath}`,
@@ -2501,6 +3921,10 @@ export function createWindowsSdkComponentOperation(
 ): Operation {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
+  const inventoryDependencies: WindowsVisualStudioDependencies = {
+    ...dependencies,
+    inventoryBudget: createWindowsInventoryBudget(dependencies),
+  };
   let validatedSetup: WindowsPathIdentity | undefined;
   let validatedInstances: readonly VisualStudioInstance[] | undefined;
   let validatedAllInstances: readonly VisualStudioInstance[] | undefined;
@@ -2519,7 +3943,7 @@ export function createWindowsSdkComponentOperation(
       const componentInventory = await listVisualStudioInstances(
         paths,
         {
-          ...dependencies,
+          ...inventoryDependencies,
           expectedInventoryExecutable: validatedVswhereExecutable,
         },
         WINDOWS_SDK_COMPONENTS,
@@ -2557,7 +3981,7 @@ export function createWindowsSdkComponentOperation(
         const componentInventory = await listVisualStudioInstances(
           paths,
           {
-            ...dependencies,
+            ...inventoryDependencies,
             expectedInventoryExecutable: validatedVswhereExecutable,
           },
           WINDOWS_SDK_COMPONENTS,
@@ -2583,7 +4007,7 @@ export function createWindowsSdkComponentOperation(
         const currentComponents = await listVisualStudioInstances(
           paths,
           {
-            ...dependencies,
+            ...inventoryDependencies,
             expectedInventoryExecutable: validatedVswhereExecutable,
           },
           WINDOWS_SDK_COMPONENTS,
@@ -2619,7 +4043,9 @@ export function createWindowsSdkComponentOperation(
               "Visual Studio setup executable changed after plan validation",
           };
         }
-        if (!(await verifyVisualStudioInstance(instance, dependencies))) {
+        if (
+          !(await verifyVisualStudioInstance(instance, inventoryDependencies))
+        ) {
           return {
             status: "failed",
             detail: `Visual Studio installation path changed before SDK removal: ${instance.installationPath}`,
@@ -2650,8 +4076,11 @@ export function createWindowsSdkComponentOperation(
           },
         );
         const disposition = windowsInstallerExitDisposition(result.exitCode);
-        if (disposition === "restart-initiated") {
-          return restartInitiatedResult(setup);
+        if (
+          disposition === "restart-required" ||
+          disposition === "restart-initiated"
+        ) {
+          return restartResult(setup, disposition);
         }
         if (disposition === "failed") {
           return {
@@ -2662,7 +4091,7 @@ export function createWindowsSdkComponentOperation(
         const residual = await listVisualStudioInstances(
           paths,
           {
-            ...dependencies,
+            ...inventoryDependencies,
             expectedInventoryExecutable: validatedVswhereExecutable,
           },
           WINDOWS_SDK_COMPONENTS,
@@ -2688,7 +4117,7 @@ export function createWindowsSdkComponentOperation(
           };
         }
         const preservedInventory = await listVisualStudioInstances(paths, {
-          ...dependencies,
+          ...inventoryDependencies,
           expectedInventoryExecutable: validatedVswhereExecutable,
         });
         if (
@@ -2710,14 +4139,14 @@ export function createWindowsSdkComponentOperation(
             detail: `Visual Studio instance disappeared during Windows SDK removal: ${instance.installationPath}`,
           };
         }
-        if (!sameVisualStudioInstance(instance, preservedInstance)) {
+        if (!sameVisualStudioInstanceObject(instance, preservedInstance)) {
           return {
             status: "failed",
             detail: `Visual Studio instance identity changed during Windows SDK removal: ${instance.installationPath}`,
           };
         }
         if (
-          !sameVisualStudioInstances(
+          !sameVisualStudioInstanceObjects(
             validatedAllInstances,
             preservedInventory.instances,
           )
@@ -2824,24 +4253,43 @@ export function createWindowsSdkBundleOperation(
 ): Operation {
   const inspect = dependencies.inspectExecutable ?? inspectWindowsExecutable;
   const execute = dependencies.runCommand ?? runCommand;
+  const inventoryDependencies: WindowsSdkBundleDependencies = {
+    ...dependencies,
+    inventoryBudget: createWindowsInventoryBudget(dependencies),
+  };
   let validated: readonly WindowsSdkBundleSnapshot[] | undefined;
   const inspectSelected = async (): Promise<
     readonly WindowsSdkBundleSnapshot[]
   > => {
-    const source = await inventory();
-    const snapshots: WindowsSdkBundleSnapshot[] = [];
-    for (const record of source.records) {
-      const snapshot = await inspectWindowsSdkBundle(
-        paths,
-        record,
-        dependencies,
-      );
-      if (snapshot !== undefined) snapshots.push(snapshot);
+    const budget = inventoryDependencies.inventoryBudget;
+    if (budget === undefined) {
+      throw new Error("Windows SDK bundle inventory budget is unavailable");
     }
-    if (snapshots.length > 16) {
-      throw new Error("Windows SDK bundle inventory exceeded 16 records");
-    }
-    return snapshots;
+    return await budget.run(
+      "Windows SDK bundle inventory",
+      async (remaining) => {
+        const source = await inventory();
+        remaining();
+        const selected = source.records.filter(
+          (record) => windowsSdkBundleKind(record.displayName) !== undefined,
+        );
+        if (selected.length > 16) {
+          throw new Error("Windows SDK bundle inventory exceeded 16 records");
+        }
+        const snapshots: WindowsSdkBundleSnapshot[] = [];
+        for (const record of selected) {
+          remaining();
+          const snapshot = await inspectWindowsSdkBundle(
+            paths,
+            record,
+            inventoryDependencies,
+          );
+          remaining();
+          if (snapshot !== undefined) snapshots.push(snapshot);
+        }
+        return snapshots;
+      },
+    );
   };
   return createFunctionOperation({
     id: "windows:windows-sdk:standalone-bundles",
@@ -2863,7 +4311,7 @@ export function createWindowsSdkBundleOperation(
             paths,
             snapshot.record.registryKey,
             source.registryExecutable,
-            dependencies,
+            inventoryDependencies,
           );
           if (
             currentRecord === undefined ||
@@ -2874,10 +4322,23 @@ export function createWindowsSdkBundleOperation(
               detail: `${snapshot.record.displayName ?? "Windows SDK bundle"} registry identity changed before uninstall`,
             };
           }
-          const immediate = await inspectWindowsSdkBundle(
-            paths,
-            currentRecord,
-            dependencies,
+          const budget = inventoryDependencies.inventoryBudget;
+          if (budget === undefined) {
+            throw new Error(
+              "Windows SDK bundle inventory budget is unavailable",
+            );
+          }
+          const immediate = await budget.run(
+            "Windows SDK bundle inventory",
+            async (remaining) => {
+              const snapshot = await inspectWindowsSdkBundle(
+                paths,
+                currentRecord,
+                inventoryDependencies,
+              );
+              remaining();
+              return snapshot;
+            },
           );
           if (
             immediate === undefined ||
@@ -2913,8 +4374,11 @@ export function createWindowsSdkBundleOperation(
             },
           );
           const disposition = windowsInstallerExitDisposition(result.exitCode);
-          if (disposition === "restart-initiated") {
-            return restartInitiatedResult(snapshot.executable);
+          if (
+            disposition === "restart-required" ||
+            disposition === "restart-initiated"
+          ) {
+            return restartResult(snapshot.executable, disposition);
           }
           if (disposition === "failed") {
             return {
@@ -2930,7 +4394,7 @@ export function createWindowsSdkBundleOperation(
             paths,
             snapshot.record.registryKey,
             source.registryExecutable,
-            dependencies,
+            inventoryDependencies,
           );
           if (residual !== undefined) {
             return {
@@ -2966,9 +4430,13 @@ export function createWindowsDockerPruneOperation(
     dependencies.inspectConfigDirectory ??
     (async (path: string): Promise<WindowsPathIdentity> => {
       const identity = await assertWindowsDirectoryChain(path, dockerTempRoot);
-      const entries = await readdir(path);
-      if (entries.length !== 0) {
-        throw new Error("isolated Docker configuration is not empty");
+      const directory = await opendir(path);
+      try {
+        if ((await directory.read()) !== null) {
+          throw new Error("isolated Docker configuration is not empty");
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
       }
       return identity;
     });
@@ -3025,6 +4493,9 @@ export function createWindowsDockerPruneOperation(
     description: "Prune unused Windows Docker data",
     phase: "system",
     dedupeKey: "windows:docker:prune",
+    // Engine removal deletes the same data root after safely stopping Docker.
+    // Do not schedule a redundant daemon call after that stop transition.
+    coveredBy: ["docker-engine"],
     validate: async () => {
       validated = await inspect(docker);
       validationComplete = true;
@@ -3230,15 +4701,40 @@ export function createWindowsToolCacheRecreateOperation(
 async function removeExactTarget(
   context: RuntimeContext,
   target: string,
+  expectedBoundary?: RemovalBoundarySnapshot,
 ): Promise<OperationResult> {
-  return await removePathTarget(target, [win32.dirname(target)], context);
+  return await removePathTarget(target, [win32.dirname(target)], context, {
+    ...(expectedBoundary === undefined ? {} : { expectedBoundary }),
+  });
+}
+
+function boundaryEndsWithWindowsIdentity(
+  boundary: RemovalBoundarySnapshot,
+  identity: WindowsPathIdentity,
+): boolean {
+  const target = boundary.entries.at(-1);
+  return (
+    boundary.targetExists &&
+    target !== undefined &&
+    target.device === identity.dev &&
+    target.inode === identity.ino &&
+    (identity.birthtimeNs === undefined ||
+      target.birthtimeNanoseconds === identity.birthtimeNs) &&
+    (identity.mode === undefined || target.mode === identity.mode) &&
+    (identity.uid === undefined || target.userId === identity.uid) &&
+    (identity.gid === undefined || target.groupId === identity.gid)
+  );
 }
 
 async function validateExactTarget(
   context: RuntimeContext,
   target: string,
-): Promise<void> {
-  await validateRemovePathTarget(target, [win32.dirname(target)], context);
+): Promise<RemovalBoundarySnapshot> {
+  return await captureSafeRemovalBoundary(
+    target,
+    [win32.dirname(target)],
+    context,
+  );
 }
 
 export function managedDirectoryUninstallOperation(options: {
@@ -3257,6 +4753,12 @@ export function managedDirectoryUninstallOperation(options: {
     executable: string,
     args: readonly string[],
   ) => Promise<CommandResult>;
+  readonly removeInstallationRoot?: (
+    target: string,
+    expectedBoundary?: RemovalBoundarySnapshot,
+  ) => Promise<OperationResult>;
+  readonly captureInstallationBoundary?: typeof captureSafeRemovalBoundary;
+  readonly removalDependencies?: RemovePathDependencies;
 }): Operation {
   const probe = options.probe ?? NODE_WINDOWS_PATH_PROBE;
   const inspectFile =
@@ -3273,7 +4775,31 @@ export function managedDirectoryUninstallOperation(options: {
         silent: true,
         timeoutMs: 30 * 60_000,
       }));
+  const removeInstallationRoot =
+    options.removeInstallationRoot ??
+    (async (target: string, expectedBoundary?: RemovalBoundarySnapshot) =>
+      await removeExactTarget(options.context, target, expectedBoundary));
+  const captureInstallationBoundary =
+    options.captureInstallationBoundary ??
+    (options.removeInstallationRoot === undefined
+      ? captureSafeRemovalBoundary
+      : undefined);
   const executable = win32.join(options.target, options.uninstaller);
+  const residualRemovalOperation =
+    options.removeInstallationRoot === undefined
+      ? createRemovePathOperation(
+          {
+            id: `windows:managed-residual:${options.component}:${options.id}`,
+            component: options.component,
+            description: `Remove residual ${options.component} installation root`,
+            target: options.target,
+            allowedParents: [win32.dirname(options.target)],
+            context: options.context,
+            phase: "package",
+          },
+          options.removalDependencies,
+        )
+      : undefined;
   type ManagedTargets =
     | { readonly status: "root-absent" }
     | {
@@ -3340,7 +4866,22 @@ export function managedDirectoryUninstallOperation(options: {
     dedupeKey: `path:${win32.normalize(options.target).toLowerCase()}`,
     validate: async () => {
       validatedState = await inspectManagedTargets();
+      if (
+        validatedState.status === "root-present" &&
+        residualRemovalOperation !== undefined
+      ) {
+        await residualRemovalOperation.validate?.();
+      }
     },
+    ...(residualRemovalOperation === undefined
+      ? {}
+      : {
+          validateAfterPreflight: async () => {
+            if (validatedState?.status === "root-present") {
+              await residualRemovalOperation.validateAfterPreflight?.();
+            }
+          },
+        }),
     run: async (): Promise<OperationResult> => {
       try {
         if (validatedState === undefined) {
@@ -3365,8 +4906,11 @@ export function managedDirectoryUninstallOperation(options: {
       if (validatedState.uninstaller !== undefined) {
         const result = await execute(executable, options.args);
         const disposition = windowsInstallerExitDisposition(result.exitCode);
-        if (disposition === "restart-initiated") {
-          return restartInitiatedResult(executable);
+        if (
+          disposition === "restart-required" ||
+          disposition === "restart-initiated"
+        ) {
+          return restartResult(executable, disposition);
         }
         if (disposition === "failed") {
           return {
@@ -3376,9 +4920,43 @@ export function managedDirectoryUninstallOperation(options: {
         }
       }
 
+      const afterUninstall = await inspectManagedTargets();
+      if (afterUninstall.status === "root-absent") {
+        return { status: "removed" };
+      }
+      if (
+        !sameWindowsObjectIdentity(validatedState.root, afterUninstall.root)
+      ) {
+        return {
+          status: "failed",
+          detail: `installation root changed after uninstall: '${options.target}'`,
+        };
+      }
+      const residualBoundary =
+        residualRemovalOperation !== undefined ||
+        captureInstallationBoundary === undefined
+          ? undefined
+          : await captureInstallationBoundary(
+              options.target,
+              [win32.dirname(options.target)],
+              options.context,
+            );
+      if (
+        residualBoundary !== undefined &&
+        !boundaryEndsWithWindowsIdentity(residualBoundary, afterUninstall.root)
+      ) {
+        return {
+          status: "failed",
+          detail: `installation root changed before locked removal: '${options.target}'`,
+        };
+      }
+
       // Some quiet uninstallers intentionally leave caches behind. The root is
       // fixed by the image definition, so remove only that exact residual tree.
-      const residual = await removeExactTarget(options.context, options.target);
+      const residual =
+        residualRemovalOperation === undefined
+          ? await removeInstallationRoot(options.target, residualBoundary)
+          : await residualRemovalOperation.run();
       return residual.status === "failed" ? residual : { status: "removed" };
     },
   });
@@ -3390,29 +4968,36 @@ function residualPathOperation(
   target: string,
   description: string,
 ): Operation {
-  return createFunctionOperation({
+  return createRemovePathOperation({
     id: `windows:residual:${component}:${target}`,
     component,
     description,
+    target,
+    allowedParents: [win32.dirname(target)],
+    context,
     phase: "system",
-    dedupeKey: `path:${win32.normalize(target).toLowerCase()}`,
-    validate: async () => await validateExactTarget(context, target),
-    run: async () => await removeExactTarget(context, target),
   });
 }
 
 export interface WindowsDockerEngineDependencies {
   readonly control?: WindowsServiceControl;
   readonly lifecycle?: WindowsDockerServiceLifecycle;
-  readonly validateTarget?: (target: string) => Promise<void>;
-  readonly removeTarget?: (target: string) => Promise<OperationResult>;
+  readonly createTargetOperation?: (target: string) => Operation;
+  readonly removeDockerData?: boolean;
+  readonly validateTarget?: (
+    target: string,
+  ) => Promise<RemovalBoundarySnapshot | undefined>;
+  readonly removeTarget?: (
+    target: string,
+    expectedBoundary?: RemovalBoundarySnapshot,
+  ) => Promise<OperationResult>;
 }
 
 function sameDockerServiceRegistrationIdentity(
   left: WindowsServiceSnapshot,
   right: WindowsServiceSnapshot,
 ): boolean {
-  return (
+  const sameRegistration =
     left.component === "docker-engine" &&
     right.component === "docker-engine" &&
     left.serviceName === "docker" &&
@@ -3422,14 +5007,23 @@ function sameDockerServiceRegistrationIdentity(
     sameOptionalWindowsPathIdentity(
       left.executableIdentity,
       right.executableIdentity,
-    ) &&
-    left.configuration === right.configuration
+    );
+  if (!sameRegistration || left.status === "missing") {
+    return sameRegistration;
+  }
+  return (
+    left.configuration !== undefined &&
+    right.configuration !== undefined &&
+    windowsServiceConfigurationWithoutStartType(left.configuration) ===
+      windowsServiceConfigurationWithoutStartType(right.configuration)
   );
 }
 
 async function inspectDockerServiceRegistration(
   paths: WindowsPaths,
   control: WindowsServiceControl,
+  deadline = windowsServiceClock(control)() +
+    WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS,
 ): Promise<WindowsServiceSnapshot> {
   const snapshots = await discoverWindowsServices(
     paths,
@@ -3440,6 +5034,7 @@ async function inspectDockerServiceRegistration(
       swapfileBytes: undefined,
     },
     control,
+    deadline,
   );
   const snapshot = snapshots[0];
   if (snapshot === undefined || snapshots.length !== 1) {
@@ -3467,8 +5062,13 @@ function assertDockerServiceReadyForPayloadMutation(
       "docker service configuration changed after plan validation",
     );
   }
-  if (current.status === "present" && current.state !== 1) {
-    throw new Error("docker service was not stopped before terminal cleanup");
+  if (
+    current.status === "present" &&
+    (current.state !== 1 || current.startType !== 4)
+  ) {
+    throw new Error(
+      "docker service was not stopped and disabled before terminal cleanup",
+    );
   }
 }
 
@@ -3484,20 +5084,74 @@ export function createWindowsDockerEngineOperation(
   const control = dependencies.control ?? windowsServiceControl(paths);
   const lifecycle =
     dependencies.lifecycle ?? createWindowsDockerServiceLifecycle();
+  const removeDockerData = dependencies.removeDockerData ?? true;
   const validateTarget =
     dependencies.validateTarget ??
     (async (target: string) => await validateExactTarget(context, target));
   const removeTarget =
     dependencies.removeTarget ??
-    (async (target: string) => await removeExactTarget(context, target));
+    (async (target: string, expectedBoundary?: RemovalBoundarySnapshot) =>
+      await removeExactTarget(context, target, expectedBoundary));
   const serviceExecutable = win32.join(paths.system32, "dockerd.exe");
+  const dockerData = win32.join(paths.programData, "docker");
   const payloadTargets = [
     win32.join(paths.system32, "docker.exe"),
     win32.join(paths.systemRoot, "SysWOW64", "docker.exe"),
-    win32.join(paths.programData, "docker", "cli-plugins"),
+    removeDockerData ? dockerData : win32.join(dockerData, "cli-plugins"),
   ];
   const targets = [...payloadTargets, serviceExecutable];
+  const createTargetOperation =
+    dependencies.createTargetOperation ??
+    (dependencies.validateTarget === undefined &&
+    dependencies.removeTarget === undefined
+      ? (target: string): Operation =>
+          createRemovePathOperation({
+            id: `windows:docker:locked-target:${target}`,
+            component: "docker-engine",
+            description: `Remove exact Windows Docker target ${target}`,
+            target,
+            allowedParents: [win32.dirname(target)],
+            context,
+            phase: "system",
+          })
+      : undefined);
+  const targetOperations =
+    createTargetOperation === undefined
+      ? undefined
+      : new Map(
+          targets.map((target) => [target, createTargetOperation(target)]),
+        );
   let validatedRegistration: WindowsServiceSnapshot | undefined;
+  let validatedTargets:
+    ReadonlyMap<string, RemovalBoundarySnapshot | undefined> | undefined;
+  const validateTargets = async (): Promise<
+    ReadonlyMap<string, RemovalBoundarySnapshot | undefined>
+  > => {
+    const snapshots = new Map<string, RemovalBoundarySnapshot | undefined>();
+    for (const target of targets) {
+      const operation = targetOperations?.get(target);
+      if (operation !== undefined) {
+        if (operation.validate === undefined) {
+          throw new Error(
+            `Windows Docker target has no locked-removal preflight: '${target}'`,
+          );
+        }
+        await operation.validate();
+        snapshots.set(target, undefined);
+      } else {
+        snapshots.set(target, await validateTarget(target));
+      }
+    }
+    return snapshots;
+  };
+  const removeValidatedTarget = async (
+    target: string,
+  ): Promise<OperationResult> => {
+    const operation = targetOperations?.get(target);
+    return operation === undefined
+      ? await removeTarget(target, validatedTargets?.get(target))
+      : await operation.run();
+  };
   return createFunctionOperation({
     id: "windows:docker:engine",
     component: "docker-engine",
@@ -3505,23 +5159,101 @@ export function createWindowsDockerEngineOperation(
     phase: "system",
     dedupeKey: "windows:docker:engine",
     validate: async () => {
-      for (const target of targets) {
-        await validateTarget(target);
-      }
+      validatedTargets = await validateTargets();
       validatedRegistration = await inspectDockerServiceRegistration(
         paths,
         control,
       );
     },
+    ...(targetOperations === undefined
+      ? {}
+      : {
+          validateAfterPreflight: async () => {
+            for (const operation of targetOperations.values()) {
+              await operation.validateAfterPreflight?.();
+            }
+          },
+        }),
     run: async (): Promise<OperationResult> => {
-      try {
-        validatedRegistration ??= await inspectDockerServiceRegistration(
-          paths,
-          control,
+      const serviceNow = windowsServiceClock(control);
+      let serviceBudgetMilliseconds = WINDOWS_SERVICE_COORDINATION_TIMEOUT_MS;
+      const withServiceBudget = async <T>(
+        description: string,
+        task: (deadline: number) => Promise<T>,
+      ): Promise<T> => {
+        const startedAt = serviceNow();
+        if (!Number.isFinite(startedAt) || serviceBudgetMilliseconds <= 0) {
+          throw new Error(
+            `${description} exceeded its two-minute aggregate deadline`,
+          );
+        }
+        const deadline = startedAt + serviceBudgetMilliseconds;
+        windowsServiceCoordinationRemainingMilliseconds(
+          serviceNow,
+          deadline,
+          description,
         );
-        const beforePayload = await inspectDockerServiceRegistration(
-          paths,
-          control,
+        let result: T | undefined;
+        let taskFailed = false;
+        let taskError: unknown;
+        try {
+          result = await task(deadline);
+        } catch (error) {
+          taskFailed = true;
+          taskError = error;
+        }
+        let deadlineFailed = false;
+        let deadlineError: unknown;
+        try {
+          windowsServiceCoordinationRemainingMilliseconds(
+            serviceNow,
+            deadline,
+            description,
+          );
+        } catch (error) {
+          deadlineFailed = true;
+          deadlineError = error;
+        }
+        try {
+          const completedAt = serviceNow();
+          const elapsed = completedAt - startedAt;
+          if (!Number.isFinite(elapsed) || elapsed < 0) {
+            throw new Error(`${description} observed an invalid service clock`);
+          }
+          serviceBudgetMilliseconds = Math.max(
+            0,
+            serviceBudgetMilliseconds - elapsed,
+          );
+          windowsServiceCoordinationRemainingMilliseconds(
+            () => completedAt,
+            deadline,
+            description,
+          );
+        } catch (error) {
+          serviceBudgetMilliseconds = 0;
+          deadlineFailed = true;
+          deadlineError = error;
+        }
+        if (taskFailed) {
+          if (deadlineFailed) {
+            throw combinedWindowsTaskDeadlineError(taskError, deadlineError);
+          }
+          throw taskError;
+        }
+        if (deadlineFailed) throw deadlineError;
+        return result as T;
+      };
+      try {
+        validatedTargets ??= await validateTargets();
+        validatedRegistration ??= await withServiceBudget(
+          "Windows Docker service discovery",
+          async (deadline) =>
+            await inspectDockerServiceRegistration(paths, control, deadline),
+        );
+        const beforePayload = await withServiceBudget(
+          "Windows Docker service discovery",
+          async (deadline) =>
+            await inspectDockerServiceRegistration(paths, control, deadline),
         );
         assertDockerServiceReadyForPayloadMutation(
           validatedRegistration,
@@ -3538,7 +5270,23 @@ export function createWindowsDockerEngineOperation(
       // Keep the service executable available for coordinator rollback until
       // the exact stopped registration is verified absent.
       for (const target of payloadTargets) {
-        const result = await removeTarget(target);
+        try {
+          const current = await withServiceBudget(
+            "Windows Docker service discovery",
+            async (deadline) =>
+              await inspectDockerServiceRegistration(paths, control, deadline),
+          );
+          assertDockerServiceReadyForPayloadMutation(
+            validatedRegistration,
+            current,
+          );
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+        const result = await removeValidatedTarget(target);
         if (result.status === "removed") removed = true;
         if (result.status === "failed") {
           return {
@@ -3552,81 +5300,131 @@ export function createWindowsDockerEngineOperation(
         if (validatedRegistration === undefined) {
           throw new Error("docker service validation state is unavailable");
         }
-        const immediate = await inspectDockerServiceRegistration(
-          paths,
-          control,
+        const immediate = await withServiceBudget(
+          "Windows Docker service discovery",
+          async (deadline) =>
+            await inspectDockerServiceRegistration(paths, control, deadline),
         );
         assertDockerServiceReadyForPayloadMutation(
           validatedRegistration,
           immediate,
         );
-        if (immediate.status === "missing") {
-          lifecycle.finalizeRegistration();
-        } else {
-          const deletion = await control.delete("docker");
-          assertCompleteWindowsCommandOutput(
-            deletion,
-            "docker service deletion",
-          );
-          if (
-            deletion.exitCode !== 0 &&
-            !isMissingWindowsService(deletion) &&
-            !isWindowsServiceDeletionPending(deletion)
-          ) {
-            return {
-              status: "failed",
-              detail: failureDetail(
-                deletion.stderr || deletion.stdout,
-                paths.serviceControl,
-                deletion.exitCode,
-              ),
-            };
-          }
-
-          const wait =
-            control.wait ??
-            (async (milliseconds: number) =>
-              await new Promise((resolve) =>
-                setTimeout(resolve, milliseconds),
-              ));
-          let registrationRemoved = false;
-          for (let attempt = 0; attempt < 60; attempt += 1) {
-            const current = await control.query("docker");
-            assertCompleteWindowsCommandOutput(
-              current,
-              "docker service deletion verification",
-            );
-            if (isMissingWindowsService(current)) {
-              lifecycle.finalizeRegistration();
-              registrationRemoved = true;
-              removed = true;
-              break;
-            }
-            if (isWindowsServiceDeletionPending(current)) {
-              await wait(500);
-              continue;
-            }
-            if (current.exitCode !== 0) {
-              return {
-                status: "failed",
-                detail: failureDetail(
-                  current.stderr || current.stdout,
-                  paths.serviceControl,
-                  current.exitCode,
-                ),
+        let registrationVerifiedAbsent = immediate.status === "missing";
+        if (!registrationVerifiedAbsent) {
+          let registrationAbsent = false;
+          const registrationFailure = await withServiceBudget(
+            "Windows Docker service cleanup",
+            async (serviceDeadline): Promise<string | undefined> => {
+              const serviceRemaining = (): number =>
+                windowsServiceCoordinationRemainingMilliseconds(
+                  serviceNow,
+                  serviceDeadline,
+                  "Windows Docker service cleanup",
+                );
+              const deadline = Math.min(
+                serviceDeadline,
+                serviceNow() + WINDOWS_SERVICE_TRANSITION_TIMEOUT_MS,
+              );
+              const transitionRemaining = (): number => {
+                serviceRemaining();
+                return windowsServiceRemainingMilliseconds(
+                  serviceNow,
+                  deadline,
+                  "docker service registration deletion",
+                );
               };
-            }
-            await wait(500);
+              const deletion = await runWindowsDeadlineTask(
+                transitionRemaining,
+                async (timeoutMs) => await control.delete("docker", timeoutMs),
+              );
+              assertCompleteWindowsCommandOutput(
+                deletion,
+                "docker service deletion",
+              );
+              if (
+                deletion.exitCode !== 0 &&
+                !isMissingWindowsService(deletion) &&
+                !isWindowsServiceDeletionPending(deletion)
+              ) {
+                return failureDetail(
+                  deletion.stderr || deletion.stdout,
+                  paths.serviceControl,
+                  deletion.exitCode,
+                );
+              }
+
+              const wait =
+                control.wait ??
+                (async (milliseconds: number) =>
+                  await new Promise((resolve) =>
+                    setTimeout(resolve, milliseconds),
+                  ));
+              for (let attempt = 0; attempt < 60; attempt += 1) {
+                const current = await runWindowsDeadlineTask(
+                  transitionRemaining,
+                  async (timeoutMs) => await control.query("docker", timeoutMs),
+                );
+                assertCompleteWindowsCommandOutput(
+                  current,
+                  "docker service deletion verification",
+                );
+                if (isMissingWindowsService(current)) {
+                  registrationAbsent = true;
+                  return undefined;
+                }
+                if (isWindowsServiceDeletionPending(current)) {
+                  await runWindowsDeadlineTask(
+                    transitionRemaining,
+                    async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+                  );
+                  continue;
+                }
+                if (current.exitCode !== 0) {
+                  return failureDetail(
+                    current.stderr || current.stdout,
+                    paths.serviceControl,
+                    current.exitCode,
+                  );
+                }
+                await runWindowsDeadlineTask(
+                  transitionRemaining,
+                  async (timeoutMs) => await wait(Math.min(500, timeoutMs)),
+                );
+              }
+              return "docker service remained registered after deletion";
+            },
+          );
+          if (registrationFailure !== undefined) {
+            return { status: "failed", detail: registrationFailure };
           }
-          if (!registrationRemoved) {
-            return {
-              status: "failed",
-              detail: "docker service remained registered after deletion",
-            };
+          if (registrationAbsent) {
+            registrationVerifiedAbsent = true;
+            removed = true;
           }
         }
 
-        const executableRemoval = await removeTarget(serviceExecutable);
+        if (!registrationVerifiedAbsent) {
+          return {
+            status: "failed",
+            detail: "docker service absence could not be verified",
+          };
+        }
+        const beforeExecutableRemoval = await withServiceBudget(
+          "Windows Docker service discovery",
+          async (deadline) =>
+            await inspectDockerServiceRegistration(paths, control, deadline),
+        );
+        if (beforeExecutableRemoval.status !== "missing") {
+          return {
+            status: "failed",
+            detail:
+              "docker service was recreated or remained registered before dockerd removal",
+          };
+        }
+        lifecycle.finalizeRegistration();
+
+        const executableRemoval =
+          await removeValidatedTarget(serviceExecutable);
         if (executableRemoval.status === "failed") {
           return {
             status: "failed",
@@ -3634,9 +5432,10 @@ export function createWindowsDockerEngineOperation(
           };
         }
         if (executableRemoval.status === "removed") removed = true;
-        const finalRegistration = await inspectDockerServiceRegistration(
-          paths,
-          control,
+        const finalRegistration = await withServiceBudget(
+          "Windows Docker service discovery",
+          async (deadline) =>
+            await inspectDockerServiceRegistration(paths, control, deadline),
         );
         if (finalRegistration.status !== "missing") {
           return {
@@ -3683,15 +5482,8 @@ export async function createWindowsAdapter(
   );
   const installedMsiProducts = lazyAsync(async () => {
     const inventory = await installedUninstallRecords();
-    const byCode = new Map<string, MsiProduct>();
-    for (const record of inventory.records) {
-      const product = msiProductFromRecord(record);
-      if (product !== undefined) {
-        byCode.set(product.productCode.toLowerCase(), product);
-      }
-    }
     return {
-      products: [...byCode.values()],
+      products: msiProductsFromRecords(inventory.records),
       registryExecutable: inventory.registryExecutable,
     };
   });
@@ -3744,6 +5536,25 @@ export async function createWindowsAdapter(
           expectedToolCache.toLowerCase()
           ? expectedToolCache
           : undefined;
+      const toolCacheComponents = [
+        "cached-tools",
+        "codeql",
+        "cached-go",
+        "cached-node",
+        "cached-python",
+        "cached-pypy",
+        "cached-ruby",
+        "haskell",
+        "java",
+      ] as const satisfies readonly ComponentId[];
+      if (
+        toolCache === undefined &&
+        toolCacheComponents.some((component) => plan.enabled.has(component))
+      ) {
+        throw new Error(
+          `RUNNER_TOOL_CACHE must be exactly '${expectedToolCache}' for selected Windows toolcache cleanup`,
+        );
+      }
       const localAppData = win32.join(normalizedHome, "AppData", "Local");
 
       addFixed(
@@ -3867,27 +5678,7 @@ export async function createWindowsAdapter(
         win32.join(paths.commonProgramFiles, "AzureCliExtensionDirectory"),
         "Remove Azure CLI extension cache",
       );
-      if (toolCache === undefined) {
-        const missingToolcacheComponents = [
-          "cached-tools",
-          "codeql",
-          "cached-go",
-          "cached-node",
-          "cached-python",
-          "cached-pypy",
-          "cached-ruby",
-          "java",
-        ] as const satisfies readonly ComponentId[];
-        for (const component of missingToolcacheComponents) {
-          operations.push(
-            notFoundOperation(
-              component,
-              `toolcache-${component}`,
-              `Locate hosted toolcache for ${component}`,
-            ),
-          );
-        }
-      } else {
+      if (toolCache !== undefined) {
         addFixed("cached-tools", toolCache, "Remove hosted toolcache");
         operations.push(
           createWindowsToolCacheRecreateOperation(context, toolCache),
@@ -4119,7 +5910,7 @@ export async function createWindowsAdapter(
       );
       if (plan.enabled.has("nginx")) {
         const toolsRoot = win32.join(paths.drive, "tools");
-        const nginxVersions = await versionedDirectories(
+        const nginxVersions = await listWindowsVersionedDirectories(
           toolsRoot,
           /^nginx-\d+(?:\.\d+){1,3}$/i,
         );
@@ -4150,8 +5941,8 @@ export async function createWindowsAdapter(
         const programRoot = win32.join(paths.programFiles, "PostgreSQL");
         const dataRoot = win32.join(paths.drive, "PostgreSQL");
         const [programVersions, dataVersions] = await Promise.all([
-          versionedDirectories(programRoot, /^\d+(?:\.\d+)*$/),
-          versionedDirectories(dataRoot, /^\d+(?:\.\d+)*$/),
+          listWindowsVersionedDirectories(programRoot, /^\d+(?:\.\d+)*$/),
+          listWindowsVersionedDirectories(dataRoot, /^\d+(?:\.\d+)*$/),
         ]);
         if (programVersions.length === 0 && dataVersions.length === 0) {
           operations.push(
@@ -4202,20 +5993,10 @@ export async function createWindowsAdapter(
         }),
       );
       operations.push(
-        createRemovePathOperation({
-          id: "windows:docker:data",
-          component: "docker-engine",
-          description: "Remove Windows Docker data",
-          target: win32.join(paths.programData, "docker"),
-          allowedParents: [paths.programData],
-          context,
-          blockedBy: ["docker-images"],
-        }),
-      );
-      operations.push(
         createWindowsDockerEngineOperation(context, paths, {
           control: serviceControl,
           lifecycle: dockerServiceLifecycle,
+          removeDockerData: !plan.skipped.has("docker-images"),
         }),
       );
 
@@ -4232,22 +6013,44 @@ export async function createWindowsAdapter(
         createWindowsSdkBundleOperation(paths, installedUninstallRecords),
       );
 
+      const serviceRegistrationCleanup =
+        createWindowsServiceRegistrationCleanup(
+          paths,
+          plan,
+          serviceControl,
+          dockerServiceLifecycle,
+        );
+      if (serviceRegistrationCleanup !== undefined) {
+        operations.push(serviceRegistrationCleanup);
+      }
+
       // Retaining Visual Studio while stripping one of its definition-owned
       // SDK/toolchain roots can leave the selected instance unusable.  A
       // `max` skip is a preservation request, so conservatively keep those
       // overlapping payloads with Visual Studio.  Custom mode has no skips and
       // can still remove any of the components independently.
-      if (plan.skipped.has("visual-studio")) {
-        const protectedComponents = new Set<ComponentId>([
-          "visual-studio",
-          ...VISUAL_STUDIO_OVERLAPS,
-        ]);
-        return operations.filter(
-          (operation) => !protectedComponents.has(operation.component),
-        );
-      }
+      const selectedOperations = plan.skipped.has("visual-studio")
+        ? operations.filter((operation) => {
+            const protectedComponents = new Set<ComponentId>([
+              "visual-studio",
+              ...VISUAL_STUDIO_OVERLAPS,
+            ]);
+            return !protectedComponents.has(operation.component);
+          })
+        : operations;
 
-      return operations;
+      if (serviceCoordinator === undefined) return selectedOperations;
+      return selectedOperations.map((operation) => {
+        if (
+          operation === serviceCoordinator ||
+          operation.id === "windows:services:unregister" ||
+          operation.phase === "preflight" ||
+          !WINDOWS_SERVICE_GUARDED_COMPONENTS.has(operation.component)
+        ) {
+          return operation;
+        }
+        return guardWindowsServiceOperation(operation, serviceCoordinator);
+      });
     },
   };
 }

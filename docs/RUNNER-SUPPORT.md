@@ -18,12 +18,13 @@ always reject it.
 | macOS arm64 VM              | Full, capability-aware | Uses the Apple Silicon Homebrew layout and preserves the selected Xcode.                                                   |
 
 "Full" means the runner family is supported; it does not mean every component
-is installed on every label. A safely confirmed-absent target reports
-`not-found` or `unsupported`. A missing required utility or incomplete
+is installed on every label. `not-found` means a target was safely confirmed
+absent. `unsupported` means the recognized runner cannot safely perform that
+operation, so its target can remain. A missing required utility or incomplete
 inventory fails closed.
 
-The pull-request, weekly, and manual compatibility sweep exercises these exact
-labels:
+The pull-request, merge-queue, weekly, and manual compatibility sweep exercises
+these exact labels:
 
 <!-- compatibility-labels:start -->
 
@@ -66,17 +67,58 @@ the action fail closed because user-cache paths would not be trustworthy.
 
 On Windows, `max` can remove PowerShell 7, the default shell for later workflow `run` steps. Protect `powershell`, use `custom`, or choose a remaining shell explicitly. Windows SDK cleanup handles both definition-listed Visual Studio components and registered standalone SDK/WDK bundles through their verified installers. Windows base-image Microsoft Edge is preserved; a directly selected `edge` operation reports unsupported, while broad browser cleanup has no separate Edge result. Its separately installed WebDriver can be removed.
 
-On macOS, Xcode cleanup removes unselected versioned Xcode applications while preserving the Xcode selected by `xcode-select`; it checks the selected and removable bundle identities before and after each removal. Homebrew cleanup verifies the architecture-specific executable, uses an empty root-owned read-only configuration directory, and does not recursively delete either Homebrew prefix or unknown packages installed by earlier workflow steps. A narrow component uninstalls only its exact package and does not run global Homebrew cleanup.
+Windows service cleanup binds each selected registration to its exact
+runner-image executable and configuration. It disables each service before it
+stops it, then checks the disabled, stopped state before service-owned payload
+operations. This blocks normal service recovery during cleanup. Before payload
+cleanup, rollback restores the original start modes and restarts only services
+that were running. Once payload cleanup starts, services stay disabled and
+stopped until their verified registrations are removed.
+
+Docker is rechecked before each payload target. Apache, Nginx, and PostgreSQL
+registrations are finalized after package cleanup. A new name, changed
+configuration, recreated registration, or reactivation stops the action. Each
+transition has a 30-second deadline. Service coordination and Windows command
+inventories use two-minute aggregate budgets. PostgreSQL discovery accepts at
+most 16 matching services. Locked descendant checks run after reversible
+service stops and before payload cleanup.
+
+On macOS, Xcode cleanup removes unselected versioned Xcode applications while
+preserving the Xcode selected by `xcode-select`. It checks the selected and
+removable bundle identities before and after each removal. Homebrew cleanup
+verifies the architecture-specific executable, uses an empty root-owned
+read-only configuration directory, and does not recursively delete either
+Homebrew prefix or unknown packages installed by earlier workflow steps. A
+narrow component uninstalls only its exact package and does not run global
+Homebrew cleanup.
 
 On Linux, Linuxbrew cleanup never runs `brew`. It removes only the exact
 `~/.cache/Homebrew` cache, while preserving the Linuxbrew
 prefix and every installed package. `swapfile-size` works only on a privileged
 VM. Container, macOS, and Windows requests fail before cleanup and leave
 existing swap unchanged. Apt finalization clears downloaded package archives
-but does not globally autoremove dependencies. See the
-[configuration reference](CONFIGURATION.md#swapfile-size) for accepted values.
+but does not globally autoremove dependencies. It rejects a selection above
+512 packages before elevation. Selected systemd units are stopped and
+runtime-masked before payload cleanup. If preflight fails, the action removes
+its masks and restarts only units that were originally active. Systemd
+inventory, coordination, and rollback each use a two-minute aggregate budget.
+See the [configuration reference](CONFIGURATION.md#swapfile-size) for accepted
+values.
 
-Docker image cleanup uses a fixed local-daemon endpoint and isolated client configuration. `docker system prune --volumes` removes unused anonymous volumes, not named volumes. Docker Engine cleanup is broader because it removes the runner's Docker data root; skip both `docker-engine` and `docker-images` when any existing Docker state must survive.
+Supported Unix images must provide `/usr/bin/python3`. Each elevated Unix
+executable is resolved to a root-owned regular file below root-owned,
+non-writable parents, and that canonical path is launched. For privileged
+recursive deletion, Linux uses the verified OS Python helper if the running
+Node binary is not trusted for elevation. Cleanup preserves this OS runtime. A
+separate cached Python toolcache can still be removed.
+
+Docker image cleanup uses a fixed local-daemon endpoint and isolated client
+configuration. `docker system prune --volumes` removes unused anonymous
+volumes, not named volumes. This retention applies only to pruning. Docker
+Engine cleanup in `custom` removes the whole runner data root, including named
+volumes. In `max`, skipping `docker-images` keeps that root, but not the engine;
+skip both components to keep usable Docker state. When Engine removal owns the
+data root, the separate prune is skipped.
 
 ## Safety and result semantics
 
@@ -90,31 +132,45 @@ before use.
 | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Invalid input, unsupported identity, unsafe plan, or incomplete required inventory | Fails before cleanup.                                                                      |
 | Any cleanup failure                                                                | Stops later operations and fails. Preflight-only failures roll back safe reversible state. |
-| Safely confirmed-absent target on a supported image                                | Reports `not-found` or `unsupported`.                                                      |
+| Safely confirmed-absent target on a supported image                                | Reports `not-found`.                                                                       |
+| Explicitly unavailable capability on a recognized image                            | Reports `unsupported`; the target can remain.                                              |
 
 Timeout handling attempts native process-tree termination, then stops because
 an escaped child cannot be ruled out. It does not start rollback commands after
 an unconfirmed termination; a service already stopped by that command can stay
 stopped until the ephemeral runner is discarded. Swap changes verify kernel
-state and use exact, atomically committed `fstab` content. On uncertain
-recovery, the action keeps any active swap and every backing file needed by a
-possible live entry.
+state and use exact, atomically committed `fstab` content. After an ambiguous
+exchange, it never exchanges again: a concurrent writer stays live and the
+original remains at the reported recovery path. The action also keeps any
+active swap and every backing file needed by a possible live entry.
 
 Once payload cleanup starts, stopped services remain stopped on failure. This
-avoids restarting a service from a partly removed installation. State-neutral
-housekeeping, such as deleting the action's private configuration directory,
-can still roll back safely.
+avoids restarting a service from a partly removed installation. Linux runtime
+masks also remain after payload cleanup starts. State-neutral housekeeping,
+such as deleting the action's private configuration directory, can still roll
+back safely.
 
 Unix recursive deletion uses no-follow directory handles so an ancestor swap
-cannot redirect traversal. It blocks device changes on Linux and macOS, plus
-same-device bind mounts on Linux. Windows recursive deletion locks the
-validated ancestors and target, removes each entry by native handle, and
-deletes reparse points without following them. Other concurrent changes can
-still invalidate package, service, installer, and swap transactions; those
-checks stop when detected. The action also trusts hosted-image package hooks,
-transitive installer code, vendor uninstallers, and children intentionally
-left running by a successful vendor launcher. It is not a sandbox or signed
-attestation.
+cannot redirect traversal. It rechecks each opened directory against its held
+parent before destructive steps. A detected move fails the operation; entries
+already removed cannot be restored. It blocks device changes
+on Linux and macOS, plus same-device bind mounts on Linux. Windows recursive
+deletion rejects reparse-point ancestors, opens every descendant with delete
+access during preflight, removes each entry by native handle, and deletes
+reparse points without following them. The fixed System32 Windows
+PowerShell launcher is identity-checked immediately before launch; its helper
+then locks and rechecks the Node validator. OS-protected executables and a
+root-owned Unix OS Python are trusted boundaries. Each recursive traversal has
+limits of 2,000,000 entries, depth 256, and 10 minutes of traversal work.
+Version discovery inspects at most 256 directory entries for 10 seconds and
+accepts at most 64 matching versions on Linux and Windows. Do not let another
+process write to, rename, or remount selected trees or their writable parents
+during cleanup. Those changes are outside the threat model. Concurrent
+privileged changes to protected files, mounts, Windows service registrations,
+or `xcode-select` are also outside it. The action also trusts hosted-image
+package hooks, transitive installer code, vendor uninstallers, and children
+intentionally left running by a successful vendor launcher. It is not a
+sandbox or signed attestation.
 
 ## Image drift and CI coverage
 
@@ -125,18 +181,22 @@ representative destructive smoke tests, and the exact-label compatibility sweep
 above. Ubuntu smoke creates disposable Docker container, image, network, and
 volume fixtures, verifies that pruning removes only the disposable state, keeps
 a named volume, and leaves no client-config directory. The Ubuntu quality job
-also creates a same-device bind mount and requires both Unix deletion helpers
-to reject it. Windows x64 and arm64
-jobs directly exercise locked-handle deletion with a path longer than 320
-characters and a junction that points outside the target. Windows smoke also
+also creates a same-device bind mount and requires each Unix deletion path to
+reject it. Windows x64 and arm64 jobs directly exercise validation and
+locked-handle deletion with a path longer than 320 characters, a nested
+junction, a final junction, and a redirected ancestor. macOS Intel and arm64
+jobs directly exercise no-follow directory-handle deletion. Windows smoke also
 verifies a registered GitHub CLI MSI uninstall; macOS smoke verifies a fixed
-Homebrew package uninstall. Each platform smoke records its image-provided
-runtimes before cleanup, then checks Bash, `/bin/sh`, Node.js, and optional
-Python and Perl on Unix, or PowerShell, `cmd.exe`, Node.js, and optional Python
-on Windows. Platform smokes install no test dependency. The Ubuntu `max` job
-requires positive measured reclamation and then re-executes `/bin/bash`,
-`/bin/sh`, and optional OS Python and Perl. Cached Node is intentionally
-removable by `max`, so Node is checked in the bounded platform smoke instead.
-The same exact-label sweep also runs
-weekly and on demand. Fast tests cover the full component registry without
-running every component against every image.
+Homebrew package uninstall. The dependency-free runtime smoke installs
+nothing. Local checks run Node.js, Bash, POSIX `sh`, and available OS Python,
+Perl, and `awk`. Hosted Unix checks record those exact runtime paths before
+cleanup and run them again afterward. Windows checks PowerShell, `cmd.exe`,
+Node.js, and Python when available. Present but broken Python runtimes fail the
+test. The Ubuntu `max` job also requires OS Python and positive reclamation.
+Cached Node is removable by `max`, so the bounded smoke checks Node separately.
+The same exact-label sweep also runs for merge-queue
+candidates, weekly, and on demand. Fast tests cover the full component registry without
+running every component against every image. A separate weekly and manual deep
+smoke runs the default `max` profile on representative Windows x64 and macOS
+arm64 images. It verifies positive reclamation, preserved OS runtimes, and the
+selected Xcode without adding that long destructive run to pull requests.

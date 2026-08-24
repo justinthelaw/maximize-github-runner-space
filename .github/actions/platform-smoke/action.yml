@@ -12,6 +12,16 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Run dependency-free runtime unit smoke on Unix
+      if: runner.os != 'Windows'
+      shell: bash
+      run: node scripts/runtime-smoke.mjs
+
+    - name: Run dependency-free runtime unit smoke on Windows
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: node scripts/runtime-smoke.mjs
+
     - name: Record dependency-free runtime paths on Unix
       if: runner.os != 'Windows'
       shell: bash
@@ -36,20 +46,13 @@ runs:
         "$node_runtime" -e 'if (process.version.length === 0) process.exit(1)'
         printf 'SMOKE_NODE_RUNTIME=%s\n' "$node_runtime" >>"$GITHUB_ENV"
 
-        python_runtime=""
-        for candidate_path in /usr/bin/python3 /usr/bin/python; do
-          if [[ -x "$candidate_path" ]] &&
-            "$candidate_path" -c 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)'
-          then
-            python_runtime="$candidate_path"
-            break
-          fi
-        done
-        if [[ -n "$python_runtime" ]]; then
+        python_runtime=/usr/bin/python3
+        if [[ -x "$python_runtime" ]]; then
+          "$python_runtime" -I -S -c 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)'
           printf 'SMOKE_PYTHON_PRESENT=1\nSMOKE_PYTHON_RUNTIME=%s\n' "$python_runtime" >>"$GITHUB_ENV"
         else
           printf 'SMOKE_PYTHON_PRESENT=0\n' >>"$GITHUB_ENV"
-          echo "::notice::No working image-provided Python runtime was available before cleanup."
+          echo "::notice::No OS Python runtime was available before cleanup."
         fi
 
         perl_runtime=/usr/bin/perl
@@ -60,6 +63,17 @@ runs:
         else
           printf 'SMOKE_PERL_PRESENT=0\n' >>"$GITHUB_ENV"
           echo "::notice::No working image-provided Perl runtime was available before cleanup."
+        fi
+
+        awk_runtime=/usr/bin/awk
+        if [[ -x "$awk_runtime" ]] &&
+          awk_value="$(printf '%s\n' runtime-ok | "$awk_runtime" '{print $1}')" &&
+          [[ "$awk_value" == runtime-ok ]]
+        then
+          printf 'SMOKE_AWK_PRESENT=1\nSMOKE_AWK_RUNTIME=%s\n' "$awk_runtime" >>"$GITHUB_ENV"
+        else
+          printf 'SMOKE_AWK_PRESENT=0\n' >>"$GITHUB_ENV"
+          echo "::notice::No working image-provided awk runtime was available before cleanup."
         fi
 
     - name: Record dependency-free runtime paths on Windows
@@ -87,23 +101,46 @@ runs:
         Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_NODE_RUNTIME=$($nodeRuntime.Source)" -Encoding utf8
 
         $pythonRuntime = $null
+        $pythonLauncher = $null
+        $pythonCandidateFound = $false
+        $pythonFailure = $null
+        $pythonCandidateCount = 0
+        $seenPythonCandidates = @{}
         foreach ($candidate in @('python3', 'python', 'py')) {
-          $command = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $command) { continue }
-          try {
-            & $command.Source -c 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)' 2>$null
-            if ($LASTEXITCODE -eq 0) {
-              $pythonRuntime = $command.Source
-              break
+          $commands = @(Get-Command $candidate -CommandType Application -All -ErrorAction SilentlyContinue)
+          foreach ($command in $commands) {
+            $candidateKey = $command.Source.ToLowerInvariant()
+            if ($seenPythonCandidates.ContainsKey($candidateKey)) { continue }
+            $seenPythonCandidates[$candidateKey] = $true
+            $pythonCandidateCount += 1
+            if ($pythonCandidateCount -gt 32) {
+              throw 'Python runtime discovery exceeded 32 candidates.'
             }
-          } catch {
-            continue
+            $pythonCandidateFound = $true
+            $launcher = if ($command.Name -ieq 'py.exe') { 'py' } else { 'direct' }
+            $pythonArguments = @()
+            if ($launcher -eq 'py') { $pythonArguments += '-3' }
+            $pythonArguments += @('-I', '-S', '-c', 'import hashlib, json, sys; sys.exit(len(hashlib.sha256(json.dumps({"status": "ok"}).encode()).hexdigest()) != 64)')
+            try {
+              & $command.Source @pythonArguments 2>$null
+              if ($LASTEXITCODE -eq 0) {
+                $pythonRuntime = $command.Source
+                $pythonLauncher = $launcher
+                break
+              }
+              $pythonFailure = "$($command.Source) exited $LASTEXITCODE"
+            } catch {
+              $pythonFailure = $_.Exception.Message
+            }
           }
+          if ($pythonRuntime) { break }
         }
         if ($pythonRuntime) {
           Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SMOKE_PYTHON_PRESENT=1' -Encoding utf8
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_PYTHON_RUNTIME=$pythonRuntime" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SMOKE_PYTHON_LAUNCHER=$pythonLauncher" -Encoding utf8
+        } elseif ($pythonCandidateFound) {
+          throw "Image-provided Python candidates were present but broken: $pythonFailure"
         } else {
           Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SMOKE_PYTHON_PRESENT=0' -Encoding utf8
           Write-Host '::notice::No working image-provided Python runtime was available before cleanup.'
@@ -304,9 +341,9 @@ runs:
         printf '%s' "$sh_value" >"${SMOKE_ROOT}/sh.txt"
 
         if [[ "$SMOKE_PYTHON_PRESENT" == 1 ]]; then
-          : "${SMOKE_PYTHON_RUNTIME:?Image Python disappeared after cleanup}"
+          : "${SMOKE_PYTHON_RUNTIME:?OS Python was not recorded before cleanup}"
           [[ -x "$SMOKE_PYTHON_RUNTIME" ]]
-          "$SMOKE_PYTHON_RUNTIME" - <<'PYTHON'
+          "$SMOKE_PYTHON_RUNTIME" -I -S - <<'PYTHON'
         import hashlib
         import json
         import os
@@ -343,6 +380,17 @@ runs:
           '
         elif [[ "$SMOKE_PERL_PRESENT" != 0 ]]; then
           echo "Invalid pre-cleanup Perl state: $SMOKE_PERL_PRESENT" >&2
+          exit 1
+        fi
+
+        if [[ "$SMOKE_AWK_PRESENT" == 1 ]]; then
+          : "${SMOKE_AWK_RUNTIME:?Image awk disappeared after cleanup}"
+          [[ -x "$SMOKE_AWK_RUNTIME" ]]
+          awk_value="$(printf '%s\n' runtime-ok | "$SMOKE_AWK_RUNTIME" '{print $1}')"
+          [[ "$awk_value" == runtime-ok ]]
+          printf '%s' "$awk_value" >"${SMOKE_ROOT}/awk.txt"
+        elif [[ "$SMOKE_AWK_PRESENT" != 0 ]]; then
+          echo "Invalid pre-cleanup awk state: $SMOKE_AWK_PRESENT" >&2
           exit 1
         fi
 
@@ -385,6 +433,12 @@ runs:
         else
           test ! -e "${SMOKE_ROOT}/perl.txt"
         fi
+        if [[ "$SMOKE_AWK_PRESENT" == 1 ]]; then
+          test -f "${SMOKE_ROOT}/awk.txt"
+          [[ "$(<"${SMOKE_ROOT}/awk.txt")" == runtime-ok ]]
+        else
+          test ! -e "${SMOKE_ROOT}/awk.txt"
+        fi
 
     - name: Exercise dependency-free Windows runtime smoke tests
       if: runner.os == 'Windows'
@@ -426,6 +480,9 @@ runs:
           if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
             throw 'The image Python runtime disappeared after cleanup.'
           }
+          if (@('direct', 'py') -notcontains $env:SMOKE_PYTHON_LAUNCHER) {
+            throw "Invalid Python launcher type: $env:SMOKE_PYTHON_LAUNCHER"
+          }
           $pythonProgram = @'
         import hashlib
         import json
@@ -440,7 +497,10 @@ runs:
         if len(hashlib.sha256(target.read_bytes()).hexdigest()) != 64:
             raise RuntimeError("Python SHA-256 smoke failed")
         '@
-          & $pythonPath -c $pythonProgram
+          $pythonArguments = @()
+          if ($env:SMOKE_PYTHON_LAUNCHER -eq 'py') { $pythonArguments += '-3' }
+          $pythonArguments += @('-I', '-S', '-c', $pythonProgram)
+          & $pythonPath @pythonArguments
           if ($LASTEXITCODE -ne 0) {
             throw "Python smoke failed with exit code $LASTEXITCODE."
           }

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { constants } from "node:fs";
-import { access, lstat, mkdir, readdir, realpath } from "node:fs/promises";
+import { constants, type Dirent } from "node:fs";
+import { access, lstat, mkdir, opendir, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 import {
   assertCommandTerminationConfirmed,
@@ -18,6 +18,7 @@ import {
   createRemovePathOperation,
 } from "../operations.js";
 import { assertSafeDirectoryTarget } from "../safety.js";
+import { listBoundedVersionedDirectoryEntries } from "../versioned-directories.js";
 import type {
   Adapter,
   Architecture,
@@ -41,6 +42,7 @@ const MACOS_BREW_CONFIG_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
 const MACOS_SUDO = "/usr/bin/sudo";
 const MACOS_MKDIR = "/bin/mkdir";
 const MACOS_RMDIR = "/bin/rmdir";
+const MAX_MACOS_DIRECTORY_INSPECTIONS = 256;
 
 const SUPPORTED = new Set<ComponentId>(
   COMPONENTS.filter((component) =>
@@ -284,6 +286,9 @@ export interface MacOSAdapterDependencies {
   readonly inspectBrewExecutable?: (
     executable: string,
   ) => Promise<CommandFileIdentity | undefined>;
+  readonly inspectBrewSystemExecutable?: (
+    executable: string,
+  ) => Promise<CommandFileIdentity | undefined>;
   readonly inspectBrewConfig?: BrewConfigProbe;
   /** Return an uncreated candidate; native code performs the atomic mkdir. */
   readonly createBrewConfigRoot?: BrewConfigRootCandidateFactory;
@@ -317,6 +322,41 @@ export type MacOSDirectoryReader = (
 
 export interface MacOSXcodeDirectoryEntry extends MacOSDirectoryEntry {
   isDirectory(): boolean;
+}
+
+async function readBoundedMacOSDirectory(
+  path: string,
+  description: string,
+): Promise<readonly Dirent[]> {
+  const entries = await listBoundedVersionedDirectoryEntries(
+    normalize(path),
+    /(?:)/,
+    "posix",
+    description,
+    MAX_MACOS_DIRECTORY_INSPECTIONS,
+  );
+  return entries.map(
+    ({ name, directory, symbolicLink }) =>
+      ({
+        name,
+        isDirectory: () => directory,
+        isSymbolicLink: () => symbolicLink,
+      }) as Dirent,
+  );
+}
+
+function boundedMacOSDirectoryEntries<T extends MacOSDirectoryEntry>(
+  entries: readonly T[],
+  description: string,
+): readonly T[] {
+  if (entries.length > MAX_MACOS_DIRECTORY_INSPECTIONS) {
+    throw new Error(
+      `${description} exceeded ${MAX_MACOS_DIRECTORY_INSPECTIONS} inspected entries`,
+    );
+  }
+  return [...entries].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  );
 }
 
 export interface MacOSXcodeBundleIdentity {
@@ -425,7 +465,15 @@ const NODE_BREW_CONFIG_ROOT_CANDIDATE: BrewConfigRootCandidateFactory = async (
 
 const NODE_BREW_CONFIG_ROOT_PROBE: BrewConfigRootProbe = {
   lstat: async (path) => await lstat(path),
-  readdir: async (path) => await readdir(path),
+  readdir: async (path) => {
+    const directory = await opendir(path);
+    try {
+      const entry = await directory.read();
+      return entry === null ? [] : [entry.name];
+    } finally {
+      await directory.close().catch(() => undefined);
+    }
+  },
 };
 
 export async function validateDefinitionBrewConfigRoot(
@@ -465,6 +513,7 @@ function assertTrustedMacOSSystemExecutable(
     identity === undefined ||
     identity.userId !== 0n ||
     identity.mode === undefined ||
+    (identity.mode & 0o170000n) !== 0o100000n ||
     (identity.mode & 0o022n) !== 0n
   ) {
     throw new Error(
@@ -1338,7 +1387,11 @@ async function xcodeOperations(
     dependencies.inspectXcodeBundleIdentity ?? inspectMacOSXcodeBundleIdentity;
   const readXcodeApplications =
     dependencies.readXcodeApplications ??
-    (async () => await readdir(APPLICATIONS_ROOT, { withFileTypes: true }));
+    (async () =>
+      await readBoundedMacOSDirectory(
+        APPLICATIONS_ROOT,
+        "Xcode application inventory",
+      ));
 
   let discoveredSelection: XcodeSelectionSnapshot;
   try {
@@ -1358,7 +1411,10 @@ async function xcodeOperations(
 
   let entries: readonly MacOSXcodeDirectoryEntry[];
   try {
-    entries = await readXcodeApplications();
+    entries = boundedMacOSDirectoryEntries(
+      await readXcodeApplications(),
+      "Xcode application inventory",
+    );
   } catch (error) {
     return [
       xcodeFailureOperation(
@@ -1670,9 +1726,14 @@ export async function createMacOSAdapter(
       : undefined);
   const inspectBrewConfig =
     dependencies.inspectBrewConfig ?? NODE_BREW_CONFIG_PROBE;
+  const inspectBrewSystemExecutable =
+    dependencies.inspectBrewSystemExecutable ??
+    (dependencies.runBrewConfigSystemUtility === undefined
+      ? inspectExecutable
+      : undefined);
   const createBrewConfigRootCandidate =
     dependencies.createBrewConfigRoot ?? NODE_BREW_CONFIG_ROOT_CANDIDATE;
-  const runBrewConfigSystemUtility =
+  const runBrewConfigSystemUtilityRaw =
     dependencies.runBrewConfigSystemUtility ??
     (async (
       executable: string,
@@ -1691,17 +1752,6 @@ export async function createMacOSAdapter(
         description,
       );
     });
-  const removeBrewConfigRoot =
-    dependencies.removeBrewConfigRoot ??
-    (async (path: string): Promise<void> => {
-      // The protected root must be empty. rmdir deliberately cannot recurse
-      // into an unexpected entry if configuration state changed.
-      await runBrewConfigSystemUtility(
-        MACOS_RMDIR,
-        [path],
-        "Homebrew configuration removal",
-      );
-    });
   const validateBrewConfigRoot =
     dependencies.validateBrewConfigRoot ??
     (async (path, requireEmpty) =>
@@ -1712,11 +1762,14 @@ export async function createMacOSAdapter(
       ));
   const readJavaDirectory =
     dependencies.readJavaDirectory ??
-    (async (path: string) => await readdir(path, { withFileTypes: true }));
+    (async (path: string) =>
+      await readBoundedMacOSDirectory(path, "Java directory inventory"));
   let brew: string | undefined;
   let createdBrewConfigRoot: string | undefined;
   let brewConfigRoot: string | undefined;
   let validatedBrewIdentity: CommandFileIdentity | undefined;
+  let validatedBrewSystemExecutables:
+    ReadonlyMap<string, CommandFileIdentity> | undefined;
   let brewInitialization: Promise<void> | undefined;
   const initializeBrew = async (): Promise<void> => {
     brewInitialization ??= (async () => {
@@ -1744,6 +1797,50 @@ export async function createMacOSAdapter(
       }
     }
   };
+  const validateBrewSystemExecutables = async (): Promise<void> => {
+    if (inspectBrewSystemExecutable === undefined) return;
+    const paths = [MACOS_SUDO, MACOS_MKDIR, MACOS_RMDIR] as const;
+    const current = new Map<string, CommandFileIdentity>();
+    for (const executable of paths) {
+      const identity = await inspectBrewSystemExecutable(executable);
+      assertTrustedMacOSSystemExecutable(executable, identity);
+      current.set(executable, identity);
+    }
+    if (validatedBrewSystemExecutables !== undefined) {
+      for (const executable of paths) {
+        if (
+          !sameCommandFileIdentity(
+            validatedBrewSystemExecutables.get(executable),
+            current.get(executable),
+          )
+        ) {
+          throw new Error(
+            `A trusted macOS system executable changed after plan validation: '${executable}'.`,
+          );
+        }
+      }
+    }
+    validatedBrewSystemExecutables ??= current;
+  };
+  const runBrewConfigSystemUtility: BrewConfigSystemUtilityRunner = async (
+    executable,
+    args,
+    description,
+  ) => {
+    await validateBrewSystemExecutables();
+    await runBrewConfigSystemUtilityRaw(executable, args, description);
+  };
+  const removeBrewConfigRoot =
+    dependencies.removeBrewConfigRoot ??
+    (async (path: string): Promise<void> => {
+      // The protected root must be empty. rmdir deliberately cannot recurse
+      // into an unexpected entry if configuration state changed.
+      await runBrewConfigSystemUtility(
+        MACOS_RMDIR,
+        [path],
+        "Homebrew configuration removal",
+      );
+    });
   const executeBrew: MacOSBrewRunner = async (
     executable,
     args,
@@ -1767,6 +1864,7 @@ export async function createMacOSAdapter(
   const validateBrewConfiguration = async (): Promise<void> => {
     if (brew === undefined) return;
     await verifyBrewExecutable();
+    await validateBrewSystemExecutables();
     validatedBrewConfig = await findBrewConfig(
       context.architecture,
       inspectBrewConfig,
@@ -2139,8 +2237,9 @@ export async function createMacOSAdapter(
 
       if (plan.enabled.has("java")) {
         try {
-          const javaLinks = await readJavaDirectory(
-            "/Library/Java/JavaVirtualMachines",
+          const javaLinks = boundedMacOSDirectoryEntries(
+            await readJavaDirectory("/Library/Java/JavaVirtualMachines"),
+            "Java directory inventory",
           );
           for (const entry of javaLinks) {
             if (
