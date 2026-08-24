@@ -1161,6 +1161,7 @@ test(
     await writeFile(lockedChild, "preserve locked child");
     const powershell =
       "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const powershellPath = `'${lockedChild.replace(/'/g, "''")}'`;
     const holder = spawn(
       powershell,
       [
@@ -1168,8 +1169,7 @@ test(
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$ErrorActionPreference='Stop'; $stream=[IO.File]::Open($args[0],[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 600 } finally { $stream.Dispose() }",
-        lockedChild,
+        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 600 } finally { $stream.Dispose() }`,
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
