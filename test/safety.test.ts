@@ -1214,10 +1214,9 @@ test(
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); [Console]::In.ReadLine() | Out-Null } finally { $stream.Dispose() }`,
-        lockedChild,
+        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 30 } finally { $stream.Dispose() }`,
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"] },
     );
     holder.on("error", (error) => {
       if ((error as NodeJS.ErrnoException).code !== "EPERM") {
@@ -1225,21 +1224,21 @@ test(
       }
     });
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
-    let holderReleased = false;
+    let holderReleasePromise: Promise<void> | undefined;
     const terminateHolder = async (): Promise<void> => {
-      if (holderReleased) return;
-      holderReleased = true;
-      if (holder.exitCode === null) {
-        holder.stdin.end("\\n");
-      }
-      const holderCloseTimeout = new Promise<never>((_, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error("Windows lock holder did not terminate")),
-          10_000,
-        );
-        timer.unref();
-      });
-      await Promise.race([holderExitPromise, holderCloseTimeout]);
+      holderReleasePromise ??= (async () => {
+        if (holder.exitCode === null) {
+          const holderCloseTimeout = new Promise<never>((_, reject) => {
+            const timer = setTimeout(
+              () => reject(new Error("Windows lock holder did not terminate")),
+              45_000,
+            );
+            timer.unref();
+          });
+          await Promise.race([holderExitPromise, holderCloseTimeout]);
+        }
+      })();
+      await holderReleasePromise;
     };
     testContext.after(terminateHolder);
     holder.stderr.setEncoding("utf8");
