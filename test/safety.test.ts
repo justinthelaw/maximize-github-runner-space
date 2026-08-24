@@ -1180,11 +1180,15 @@ test(
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
     const terminateHolder = (): void => {
       if (holder.pid !== undefined) {
-        spawnSync(
-          "C:\\Windows\\System32\\taskkill.exe",
-          ["/pid", String(holder.pid), "/t", "/f"],
-          { stdio: "ignore", timeout: 10_000, windowsHide: true },
-        );
+        try {
+          spawnSync(
+            "C:\\Windows\\System32\\taskkill.exe",
+            ["/pid", String(holder.pid), "/t", "/f"],
+            { stdio: "ignore", timeout: 10_000, windowsHide: true },
+          );
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+        }
       }
       if (!holder.killed) {
         try {
