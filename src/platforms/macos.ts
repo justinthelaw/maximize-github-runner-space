@@ -855,6 +855,13 @@ function matchingInstalledPackages(
   );
 }
 
+function isProtectedTrustStoreFailure(result: CommandResult): boolean {
+  return (
+    result.exitCode !== 0 &&
+    /Refusing to write insecure trust store:/i.test(result.stderr)
+  );
+}
+
 function brewPackageOperation(
   executable: string | undefined,
   state: BrewState,
@@ -896,7 +903,8 @@ function brewPackageOperation(
         silent: false,
         timeoutMs: 10 * 60_000,
       });
-      if (result.exitCode !== 0) {
+      const protectedTrustStoreFailure = isProtectedTrustStoreFailure(result);
+      if (result.exitCode !== 0 && !protectedTrustStoreFailure) {
         return {
           status: "failed",
           detail:
@@ -920,7 +928,12 @@ function brewPackageOperation(
           detail: `${remaining.join(", ")} remained installed after Homebrew reported success`,
         };
       }
-      return { status: "removed", detail: matches.join(", ") };
+      return {
+        status: "removed",
+        detail: protectedTrustStoreFailure
+          ? `${matches.join(", ")} (Homebrew trust-store cleanup was unavailable after removal)`
+          : matches.join(", "),
+      };
     },
   });
 }
@@ -1001,7 +1014,9 @@ function removeDefinitionHomebrewPackagesOperation(
             environment(),
             { silent: false, timeoutMs: 15 * 60_000 },
           );
-          if (result.exitCode !== 0) {
+          const protectedTrustStoreFailure =
+            isProtectedTrustStoreFailure(result);
+          if (result.exitCode !== 0 && !protectedTrustStoreFailure) {
             return {
               status: "failed",
               detail: (

@@ -1080,7 +1080,7 @@ test("Windows helper preflight validates every distinct deletion target", async 
 
 test(
   "Windows hosted smoke removes a target through native locked handles",
-  { skip: process.platform !== "win32" },
+  { skip: process.platform !== "win32", timeout: 180_000 },
   async (testContext) => {
     const root = await mkdtemp(join(tmpdir(), "maximize-space-windows-lock-"));
     testContext.after(

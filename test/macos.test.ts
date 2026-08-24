@@ -549,6 +549,57 @@ test("macOS narrow Homebrew cleanup uninstalls only its package and releases con
   assert.deepEqual(removedConfigRoots, [configRoot]);
 });
 
+test("macOS Homebrew accepts a protected trust-store error after package removal", async () => {
+  const formulae = new Set(["homebrew/core/gh"]);
+  let uninstallCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
+    executeBrew: async (_executable, args) => {
+      if (args.join(" ") === "list --formula --full-name") {
+        return {
+          exitCode: 0,
+          stdout: `${[...formulae].join("\n")}\n`,
+          stderr: "",
+        };
+      }
+      if (args.join(" ") === "list --cask --full-name") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "uninstall") {
+        uninstallCalls += 1;
+        formulae.clear();
+        return {
+          exitCode: 1,
+          stdout: "Uninstalling gh...",
+          stderr:
+            "Error: Refusing to write insecure trust store: trust store directory /private/tmp/config/homebrew is not owned by the current user.",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+    inspectBrewConfig: async () => undefined,
+    createBrewConfigRoot: async () => testBrewConfigRoot("c"),
+    validateBrewConfigRoot: async () => undefined,
+    removeBrewConfigRoot: async () => undefined,
+  });
+  const operations = await adapter.operations(planFor("gh-cli"));
+  const configuration = operations.find(
+    ({ id }) => id === "macos:brew:configuration",
+  );
+  const packageOperation = operations.find(
+    ({ id }) => id === "brew:formula:gh:gh-cli",
+  );
+  assert.ok(configuration?.validate);
+  assert.ok(packageOperation);
+
+  await configuration.validate();
+  assert.equal((await configuration.run()).status, "removed");
+  const result = await packageOperation.run();
+  assert.equal(result.status, "removed", result.detail ?? "");
+  assert.match(result.detail ?? "", /trust-store cleanup was unavailable/);
+  assert.equal(uninstallCalls, 1);
+});
+
 test("macOS broad Homebrew cleanup still runs native cleanup and releases configuration", async () => {
   const configRoot = testBrewConfigRoot("2");
   const commands: string[][] = [];
