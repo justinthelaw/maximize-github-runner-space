@@ -39,6 +39,7 @@ const MACOS_BREW_TEMP = "/private/tmp";
 const MACOS_BREW_CONFIG_PREFIX = `${MACOS_BREW_TEMP}/maximize-github-runner-space-homebrew-`;
 const MACOS_BREW_CONFIG_TOKEN_BYTES = 16;
 const MACOS_BREW_CONFIG_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
+const MACOS_BREW_USER_CONFIG_DIRECTORY = "homebrew";
 const MACOS_SUDO = "/usr/bin/sudo";
 const MACOS_MKDIR = "/bin/mkdir";
 const MACOS_RMDIR = "/bin/rmdir";
@@ -468,21 +469,30 @@ const NODE_BREW_CONFIG_ROOT_PROBE: BrewConfigRootProbe = {
   readdir: async (path) => {
     const directory = await opendir(path);
     try {
-      const entry = await directory.read();
-      return entry === null ? [] : [entry.name];
+      const entries: string[] = [];
+      // A second entry is enough to distinguish the one expected protected
+      // Homebrew child from an unexpected directory payload without making
+      // this preflight an unbounded inventory operation.
+      for (let index = 0; index < 2; index += 1) {
+        const entry = await directory.read();
+        if (entry === null) break;
+        entries.push(entry.name);
+      }
+      return entries;
     } finally {
       await directory.close().catch(() => undefined);
     }
   },
 };
 
-export async function validateDefinitionBrewConfigRoot(
+function brewUserConfigDirectory(path: string): string {
+  return join(path, MACOS_BREW_USER_CONFIG_DIRECTORY);
+}
+
+function assertProtectedBrewConfigDirectory(
   path: string,
-  requireEmpty: boolean,
-  probe: BrewConfigRootProbe = NODE_BREW_CONFIG_ROOT_PROBE,
-): Promise<void> {
-  checkedBrewConfigRoot(path);
-  const stat = await probe.lstat(path);
+  stat: BrewConfigRootStats,
+): void {
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error(
       `Refusing non-directory Homebrew configuration target '${path}'.`,
@@ -498,9 +508,37 @@ export async function validateDefinitionBrewConfigRoot(
       `Refusing writable Homebrew configuration directory permissions '${path}'.`,
     );
   }
-  if (requireEmpty && (await probe.readdir(path)).length !== 0) {
+}
+
+export async function validateDefinitionBrewConfigRoot(
+  path: string,
+  requireEmpty: boolean,
+  probe: BrewConfigRootProbe = NODE_BREW_CONFIG_ROOT_PROBE,
+  allowProtectedHomebrewChild = false,
+): Promise<void> {
+  checkedBrewConfigRoot(path);
+  const stat = await probe.lstat(path);
+  assertProtectedBrewConfigDirectory(path, stat);
+  if (!requireEmpty) return;
+
+  const entries = await probe.readdir(path);
+  if (entries.length === 0) return;
+  if (
+    !allowProtectedHomebrewChild ||
+    entries.length !== 1 ||
+    entries[0] !== MACOS_BREW_USER_CONFIG_DIRECTORY
+  ) {
     throw new Error(
       `Refusing non-empty Homebrew configuration directory '${path}'.`,
+    );
+  }
+
+  const userConfigPath = brewUserConfigDirectory(path);
+  const userConfigStat = await probe.lstat(userConfigPath);
+  assertProtectedBrewConfigDirectory(userConfigPath, userConfigStat);
+  if ((await probe.readdir(userConfigPath)).length !== 0) {
+    throw new Error(
+      `Refusing non-empty Homebrew user configuration directory '${userConfigPath}'.`,
     );
   }
 }
@@ -690,11 +728,9 @@ function brewEnvironment(configRoot: string | undefined): NodeJS.ProcessEnv {
     TERM: "dumb",
     TMPDIR: MACOS_BREW_TEMP,
     USER: "runner",
-    // Homebrew otherwise derives `$XDG_CONFIG_HOME/homebrew` and tries to
-    // create that child directory. The isolated root is already created and
-    // protected by the root-owned preflight, so pin the exact config path.
-    HOMEBREW_CONFIG_HOME: configRoot,
-    // Homebrew otherwise loads a workflow-created ~/.homebrew/brew.env. Its
+    // Homebrew derives `$XDG_CONFIG_HOME/homebrew`; prepareBrewEnvironment
+    // creates that exact child root-owned and non-writable before Brew runs.
+    // It otherwise loads a workflow-created ~/.homebrew/brew.env. Its
     // bin/brew bootstrap also consults PATH and several HOMEBREW_* executable
     // overrides before it filters the environment, so pass an allowlist rather
     // than inheriting arbitrary workflow state.
@@ -1763,6 +1799,7 @@ export async function createMacOSAdapter(
         path,
         requireEmpty,
         NODE_BREW_CONFIG_ROOT_PROBE,
+        true,
       ));
   const readJavaDirectory =
     dependencies.readJavaDirectory ??
@@ -1837,8 +1874,24 @@ export async function createMacOSAdapter(
   const removeBrewConfigRoot =
     dependencies.removeBrewConfigRoot ??
     (async (path: string): Promise<void> => {
-      // The protected root must be empty. rmdir deliberately cannot recurse
-      // into an unexpected entry if configuration state changed.
+      // Homebrew derives a protected child beneath XDG_CONFIG_HOME. Remove
+      // that exact child first, then the root; rmdir deliberately cannot
+      // recurse into an unexpected entry if configuration state changed.
+      try {
+        await NODE_BREW_CONFIG_ROOT_PROBE.lstat(brewUserConfigDirectory(path));
+        await runBrewConfigSystemUtility(
+          MACOS_RMDIR,
+          [brewUserConfigDirectory(path)],
+          "Homebrew user configuration removal",
+        );
+      } catch (error) {
+        if (!(
+          error instanceof Error &&
+          (error as NodeJS.ErrnoException).code === "ENOENT"
+        )) {
+          throw error;
+        }
+      }
       await runBrewConfigSystemUtility(
         MACOS_RMDIR,
         [path],
@@ -1916,6 +1969,11 @@ export async function createMacOSAdapter(
           "Homebrew configuration directory creation",
         );
         createdBrewConfigRoot = configRoot;
+        await runBrewConfigSystemUtility(
+          MACOS_MKDIR,
+          ["-m", "0555", brewUserConfigDirectory(configRoot)],
+          "Homebrew user configuration directory creation",
+        );
         await validateBrewConfigRoot(configRoot, true);
         brewConfigRoot = configRoot;
       } catch (error) {

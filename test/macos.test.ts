@@ -439,7 +439,6 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
     const expectedEnvironmentKeys = [
       "CI",
       "HOME",
-      "HOMEBREW_CONFIG_HOME",
       "HOMEBREW_NO_ANALYTICS",
       "HOMEBREW_NO_AUTOREMOVE",
       "HOMEBREW_NO_AUTO_UPDATE",
@@ -463,7 +462,6 @@ test("macOS Homebrew commands use a trusted environment and preserve unknown pac
       assert.equal(call.environment.PATH, "/usr/bin:/bin:/usr/sbin:/sbin");
       assert.equal(call.environment.TMPDIR, "/private/tmp");
       assert.equal(call.environment.XDG_CONFIG_HOME, configRoot);
-      assert.equal(call.environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(call.environment.HOMEBREW_BREW_FILE, undefined);
       assert.equal(call.environment.HOMEBREW_PATH, undefined);
       assert.equal(call.environment.HOMEBREW_FORCE_BREW_WRAPPER, undefined);
@@ -828,7 +826,13 @@ test("macOS atomically creates and revalidates isolated Homebrew configuration b
       assert.ok(["/bin/mkdir", "/bin/rmdir"].includes(executable));
       assert.deepEqual(
         args,
-        executable === "/bin/mkdir" ? ["-m", "0555", configRoot] : [configRoot],
+        executable === "/bin/mkdir"
+          ? [
+              "-m",
+              "0555",
+              args[2] === configRoot ? configRoot : `${configRoot}/homebrew`,
+            ]
+          : [configRoot],
       );
       events.push(`utility:${executable}:${args.join(" ")}`);
       if (executable === "/bin/mkdir") created = true;
@@ -859,7 +863,7 @@ test("macOS atomically creates and revalidates isolated Homebrew configuration b
   assert.equal((await cleanup.run()).status, "removed");
   assert.deepEqual(events.slice(0, 2), [
     `utility:/bin/mkdir:-m 0555 ${configRoot}`,
-    "validate:sealed",
+    `utility:/bin/mkdir:-m 0555 ${configRoot}/homebrew`,
   ]);
   assert.equal(
     events.some((event) => /chown|chmod/.test(event)),
@@ -1021,7 +1025,10 @@ test("macOS never invokes Brew or removes a configuration root that fails post-m
   const result = await configuration.run();
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /unsafe root-owned directory/);
-  assert.deepEqual(utilities, [`/bin/mkdir:-m 0555 ${configRoot}`]);
+  assert.deepEqual(utilities, [
+    `/bin/mkdir:-m 0555 ${configRoot}`,
+    `/bin/mkdir:-m 0555 ${configRoot}/homebrew`,
+  ]);
   const packageResult = await packages.run();
   assert.equal(packageResult.status, "failed");
   assert.match(
@@ -1038,7 +1045,6 @@ test("macOS releases its isolated configuration when Homebrew cleanup fails", as
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async (_executable, args, environment) => {
       assert.equal(environment.XDG_CONFIG_HOME, configRoot);
-      assert.equal(environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(environment.HOMEBREW_XDG_CONFIG_HOME, undefined);
       assert.deepEqual(args, ["cleanup", "--prune=all", "-s"]);
       return { exitCode: 23, stdout: "", stderr: "simulated cleanup failure" };
@@ -1180,7 +1186,6 @@ test("macOS broad Homebrew cleanup preserves protected owners while removing own
     resolveBrewExecutable: async () => BREW_PATHS.arm64.executable,
     executeBrew: async (_executable, args, environment) => {
       assert.equal(environment.XDG_CONFIG_HOME, configRoot);
-      assert.equal(environment.HOMEBREW_CONFIG_HOME, configRoot);
       assert.equal(environment.HOMEBREW_XDG_CONFIG_HOME, undefined);
       commands.push([...args]);
       if (args.join(" ") === "list --formula --full-name") {
@@ -1505,6 +1510,35 @@ test("macOS validates isolated Homebrew configuration ownership, mode, and empti
     },
   };
   await validateDefinitionBrewConfigRoot(path, true, validProbe);
+
+  const userConfigPath = join(path, "homebrew");
+  const protectedChildProbe: BrewConfigRootProbe = {
+    lstat: async (observed) => {
+      assert.ok(observed === path || observed === userConfigPath);
+      return directoryStats;
+    },
+    readdir: async (observed) => {
+      if (observed === path) return ["homebrew"];
+      assert.equal(observed, userConfigPath);
+      return [];
+    },
+  };
+  await validateDefinitionBrewConfigRoot(path, true, protectedChildProbe, true);
+  await assert.rejects(
+    validateDefinitionBrewConfigRoot(
+      path,
+      true,
+      {
+        ...protectedChildProbe,
+        lstat: async (observed) =>
+          observed === userConfigPath
+            ? { ...directoryStats, mode: 0o40755 }
+            : directoryStats,
+      },
+      true,
+    ),
+    /writable.*permissions/,
+  );
 
   await assert.rejects(
     validateDefinitionBrewConfigRoot(path, true, {
