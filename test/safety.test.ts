@@ -436,6 +436,50 @@ test("Windows removal uses the locked boundary helper instead of raw recursive r
   assert.equal(rawRemovalCalled, false);
 });
 
+test("Windows final links unlink without following their destination", async () => {
+  const target = "C:\\tools\\payload-link";
+  const boundary = {
+    targetExists: true,
+    entries: [
+      {
+        path: "C:\\tools",
+        device: 1n,
+        inode: 10n,
+        mode: 0o40755n,
+      },
+      {
+        path: target,
+        device: 1n,
+        inode: 11n,
+        mode: 0o120777n,
+      },
+    ],
+  };
+  let exists = true;
+  let unlinkCalled = false;
+  let lockedRemovalCalled = false;
+  const result = await removePathTarget(
+    target,
+    ["C:\\tools"],
+    { ...contextFor("windows"), workspace: undefined },
+    {
+      inspect: async () => ({ exists, isLink: true }),
+      boundary: async () => boundary,
+      unlink: async () => {
+        unlinkCalled = true;
+        exists = false;
+      },
+      windowsLockedRemove: async () => {
+        lockedRemovalCalled = true;
+      },
+    },
+  );
+
+  assert.equal(result.status, "removed");
+  assert.equal(unlinkCalled, true);
+  assert.equal(lockedRemovalCalled, false);
+});
+
 test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores workflow command configuration", async () => {
   const target = "C:\\tools\\payload";
   const runtimeExecutable =

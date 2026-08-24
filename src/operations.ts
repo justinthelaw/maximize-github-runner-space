@@ -2758,7 +2758,14 @@ export async function removePathTarget(
 
   let privilegedAttempted = false;
   try {
-    if (context.platform === "windows") {
+    if (context.platform === "windows" && inspected.isLink) {
+      // A final junction/symlink is removed as a directory entry. The native
+      // locked traversal helper intentionally opens ordinary targets with
+      // DELETE sharing constraints; Windows can block that handle open for a
+      // reparse point even though unlinking the final entry is safe and never
+      // follows its destination.
+      await unlinkTarget(target);
+    } else if (context.platform === "windows") {
       await windowsLockedRemove(target, immediateBoundary, context);
     } else if (
       context.platform === "macos" &&
