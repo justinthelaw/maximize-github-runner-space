@@ -1206,13 +1206,6 @@ test(
           killer.on("close", finish);
         });
       }
-      if (!holder.killed && holder.exitCode === null) {
-        try {
-          holder.kill();
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
-        }
-      }
     };
     testContext.after(terminateHolder);
     holder.stderr.setEncoding("utf8");
