@@ -1184,8 +1184,29 @@ test(
       }
     });
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
-    const terminateHolder = (): void => {
-      if (!holder.killed) {
+    const terminateHolder = async (): Promise<void> => {
+      if (holder.pid !== undefined && holder.exitCode === null) {
+        await new Promise<void>((resolve) => {
+          const killer = spawn(
+            "C:\\Windows\\System32\\taskkill.exe",
+            ["/pid", String(holder.pid), "/t", "/f"],
+            { stdio: "ignore", windowsHide: true },
+          );
+          let finished = false;
+          let timer: NodeJS.Timeout | undefined;
+          const finish = (): void => {
+            if (finished) return;
+            finished = true;
+            if (timer !== undefined) clearTimeout(timer);
+            resolve();
+          };
+          timer = setTimeout(finish, 10_000);
+          timer.unref();
+          killer.on("error", finish);
+          killer.on("close", finish);
+        });
+      }
+      if (!holder.killed && holder.exitCode === null) {
         try {
           holder.kill();
         } catch (error) {
