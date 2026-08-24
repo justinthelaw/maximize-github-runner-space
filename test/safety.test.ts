@@ -1166,6 +1166,7 @@ test(
     const powershell =
       "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
     const powershellPath = `'${lockedChild.replace(/'/g, "''")}'`;
+    let holderStderr = "";
     const holder = spawn(
       powershell,
       [
@@ -1177,6 +1178,11 @@ test(
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
+    holder.on("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code !== "EPERM") {
+        holderStderr += `${holderStderr === "" ? "" : "\n"}${error.message}`;
+      }
+    });
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
     const terminateHolder = (): void => {
       if (holder.pid !== undefined) {
@@ -1199,7 +1205,6 @@ test(
       }
     };
     testContext.after(terminateHolder);
-    let holderStderr = "";
     holder.stderr.setEncoding("utf8");
     holder.stderr.on("data", (chunk: string) => {
       holderStderr += chunk;
