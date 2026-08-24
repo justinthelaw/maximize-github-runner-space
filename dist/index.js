@@ -916,6 +916,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
 
 public static class LockedRemovalNative {
@@ -1017,7 +1018,7 @@ public static class LockedRemovalNative {
         return @"\\?\" + path;
     }
 
-    private static SafeFileHandle Open(string path, uint access, uint shareMode) {
+    private static SafeFileHandle OpenCore(string path, uint access, uint shareMode) {
         SafeFileHandle handle = CreateFileW(
             Extended(path), access, shareMode, IntPtr.Zero, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
@@ -1027,6 +1028,24 @@ public static class LockedRemovalNative {
             throw new Win32Exception(error, "Could not lock Windows cleanup path '" + path + "'");
         }
         return handle;
+    }
+
+    private static SafeFileHandle Open(string path, uint access, uint shareMode) {
+        return OpenCore(path, access, shareMode);
+    }
+
+    private static SafeFileHandle OpenTargetWithTimeout(string path) {
+        Task<SafeFileHandle> task = Task.Run(() => OpenCore(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ));
+        if (!task.Wait(5000)) {
+            throw new TimeoutException("Timed out while opening locked Windows cleanup path '" + path + "'");
+        }
+        try {
+            return task.GetAwaiter().GetResult();
+        } catch (Exception error) {
+            throw error is AggregateException aggregate && aggregate.InnerException != null
+                ? aggregate.InnerException
+                : error;
+        }
     }
 
     private static SafeFileHandle Open(string path, uint access) {
@@ -1053,7 +1072,7 @@ public static class LockedRemovalNative {
     }
 
     public static SafeFileHandle OpenTarget(string path) {
-        return Open(path, FILE_READ_ATTRIBUTES | DELETE);
+        return OpenTargetWithTimeout(path);
     }
 
     public static SafeFileHandle OpenSharedTarget(string path) {

@@ -559,6 +559,10 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
   assert.match(helperSource, /FindFirstFileW/);
   assert.match(helperSource, /FindNextFileW/);
   assert.match(helperSource, /FirstChild/);
+  assert.match(
+    helperSource,
+    /OpenTargetWithTimeout[\s\S]*?Task\.Run[\s\S]*?Wait\(5000\)/,
+  );
   assert.doesNotMatch(helperSource, /EnumerateFileSystemEntries/);
   assert.doesNotMatch(helperSource, /IEnumerable<string> Children/);
   assert.match(helperSource, /AssertExecutable/);
