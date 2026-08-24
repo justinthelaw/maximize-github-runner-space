@@ -1042,7 +1042,8 @@ public static class LockedRemovalNative {
         try {
             return task.GetAwaiter().GetResult();
         } catch (Exception error) {
-            if (error is AggregateException aggregate && aggregate.InnerException != null) {
+            AggregateException aggregate = error as AggregateException;
+            if (aggregate != null && aggregate.InnerException != null) {
                 throw aggregate.InnerException;
             }
             throw;
