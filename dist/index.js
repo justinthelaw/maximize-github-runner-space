@@ -916,7 +916,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
-using System.Threading.Tasks;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 public static class LockedRemovalNative {
@@ -1035,19 +1035,41 @@ public static class LockedRemovalNative {
     }
 
     private static SafeFileHandle OpenTargetWithTimeout(string path) {
-        Task<SafeFileHandle> task = Task.Run(() => OpenCore(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ));
-        if (!task.Wait(5000)) {
+        object sync = new object();
+        SafeFileHandle opened = null;
+        Exception failure = null;
+        bool timedOut = false;
+        Thread worker = new Thread(() => {
+            SafeFileHandle candidate = null;
+            try {
+                candidate = OpenCore(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ);
+                lock (sync) {
+                    if (timedOut) {
+                        candidate.Dispose();
+                    } else {
+                        opened = candidate;
+                    }
+                }
+            } catch (Exception error) {
+                lock (sync) {
+                    if (!timedOut) failure = error;
+                }
+                if (candidate != null) candidate.Dispose();
+            }
+        });
+        worker.IsBackground = true;
+        worker.Start();
+        if (!worker.Join(5000)) {
+            lock (sync) {
+                timedOut = true;
+                if (opened != null) opened.Dispose();
+                opened = null;
+            }
             throw new TimeoutException("Timed out while opening locked Windows cleanup path '" + path + "'");
         }
-        try {
-            return task.GetAwaiter().GetResult();
-        } catch (Exception error) {
-            AggregateException aggregate = error as AggregateException;
-            if (aggregate != null && aggregate.InnerException != null) {
-                throw aggregate.InnerException;
-            }
-            throw;
-        }
+        if (failure != null) throw failure;
+        if (opened == null) throw new IOException("Windows cleanup path open returned no handle");
+        return opened;
     }
 
     private static SafeFileHandle Open(string path, uint access) {
