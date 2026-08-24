@@ -1186,7 +1186,13 @@ test(
           { stdio: "ignore", timeout: 10_000, windowsHide: true },
         );
       }
-      if (!holder.killed) holder.kill();
+      if (!holder.killed) {
+        try {
+          holder.kill();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+        }
+      }
     };
     testContext.after(terminateHolder);
     let holderStderr = "";
