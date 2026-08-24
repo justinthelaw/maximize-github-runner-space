@@ -1159,17 +1159,20 @@ test(
     const lockedChild = join(lockedTarget, "locked-child");
     await mkdir(lockedTarget);
     await writeFile(lockedChild, "preserve locked child");
-    const holderScript = [
-      "const fs = require('node:fs');",
-      "const fd = fs.openSync(process.argv[1], 'r');",
-      "process.stdout.write('LOCKED\\n');",
-      "process.stdin.setEncoding('utf8');",
-      "process.stdin.once('data', () => { fs.closeSync(fd); process.exit(0); });",
-      "process.stdin.resume();",
-    ].join(" ");
-    const holder = spawn(process.execPath, ["-e", holderScript, lockedChild], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const powershell =
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const holder = spawn(
+      powershell,
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$ErrorActionPreference='Stop'; $stream=[IO.File]::Open($args[0],[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 600 } finally { $stream.Dispose() }",
+        lockedChild,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
     testContext.after(() => {
       if (!holder.killed) holder.kill();
@@ -1193,9 +1196,9 @@ test(
         /lock|sharing violation|used by another process/i,
       );
     } finally {
-      holder.stdin.end("\n");
+      if (!holder.killed) holder.kill();
       const [holderExit] = await holderExitPromise;
-      assert.equal(holderExit, 0);
+      assert.notEqual(holderExit, undefined);
     }
     assert.equal(await readFile(lockedChild, "utf8"), "preserve locked child");
 
