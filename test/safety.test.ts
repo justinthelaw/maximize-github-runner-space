@@ -1201,11 +1201,14 @@ test(
 
     const lockedTarget = join(root, "locked-payload");
     const lockedChild = join(lockedTarget, "locked-child");
+    const releaseSignal = join(root, "release-lock-holder");
     await mkdir(lockedTarget);
     await writeFile(lockedChild, "preserve locked child");
+    await writeFile(releaseSignal, "hold");
     const powershell =
       "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
     const powershellPath = `'${lockedChild.replace(/'/g, "''")}'`;
+    const releasePath = `'${releaseSignal.replace(/'/g, "''")}'`;
     let holderStderr = "";
     const holder = spawn(
       powershell,
@@ -1214,7 +1217,7 @@ test(
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 30 } finally { $stream.Dispose() }`,
+        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); while (Test-Path -LiteralPath ${releasePath}) { Start-Sleep -Milliseconds 100 } } finally { $stream.Dispose() }`,
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -1231,13 +1234,14 @@ test(
           const holderCloseTimeout = new Promise<never>((_, reject) => {
             const timer = setTimeout(
               () => reject(new Error("Windows lock holder did not terminate")),
-              45_000,
+              20_000,
             );
             timer.unref();
           });
           await Promise.race([holderExitPromise, holderCloseTimeout]);
         }
       })();
+      await rm(releaseSignal, { force: true });
       await holderReleasePromise;
     };
     testContext.after(terminateHolder);
