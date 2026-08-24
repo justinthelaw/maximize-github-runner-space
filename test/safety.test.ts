@@ -1170,9 +1170,10 @@ test(
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); Start-Sleep -Seconds 600 } finally { $stream.Dispose() }`,
+        `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${powershellPath},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try { [Console]::Out.WriteLine('LOCKED'); [Console]::Out.Flush(); [Console]::In.ReadLine() | Out-Null } finally { $stream.Dispose() }`,
+        lockedChild,
       ],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["pipe", "pipe", "pipe"] },
     );
     holder.on("error", (error) => {
       if ((error as NodeJS.ErrnoException).code !== "EPERM") {
@@ -1180,28 +1181,21 @@ test(
       }
     });
     const holderExitPromise = once(holder, "close") as Promise<[number]>;
+    let holderReleased = false;
     const terminateHolder = async (): Promise<void> => {
-      if (holder.pid !== undefined && holder.exitCode === null) {
-        await new Promise<void>((resolve) => {
-          const killer = spawn(
-            "C:\\Windows\\System32\\taskkill.exe",
-            ["/pid", String(holder.pid), "/f"],
-            { stdio: "ignore", windowsHide: true },
-          );
-          let finished = false;
-          let timer: NodeJS.Timeout | undefined;
-          const finish = (): void => {
-            if (finished) return;
-            finished = true;
-            if (timer !== undefined) clearTimeout(timer);
-            resolve();
-          };
-          timer = setTimeout(finish, 10_000);
-          timer.unref();
-          killer.on("error", finish);
-          killer.on("close", finish);
-        });
+      if (holderReleased) return;
+      holderReleased = true;
+      if (holder.exitCode === null) {
+        holder.stdin.end("\\n");
       }
+      const holderCloseTimeout = new Promise<never>((_, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("Windows lock holder did not terminate")),
+          10_000,
+        );
+        timer.unref();
+      });
+      await Promise.race([holderExitPromise, holderCloseTimeout]);
     };
     testContext.after(terminateHolder);
     holder.stderr.setEncoding("utf8");
@@ -1249,18 +1243,8 @@ test(
         /lock|sharing violation|used by another process/i,
       );
     } finally {
-      terminateHolder();
-      const holderCloseTimeout = new Promise<never>((_, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error("Windows lock holder did not terminate")),
-          10_000,
-        );
-        timer.unref();
-      });
-      const [holderExit] = await Promise.race([
-        holderExitPromise,
-        holderCloseTimeout,
-      ]);
+      await terminateHolder();
+      const [holderExit] = await holderExitPromise;
       assert.notEqual(holderExit, undefined);
     }
     assert.equal(await readFile(lockedChild, "utf8"), "preserve locked child");
