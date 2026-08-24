@@ -1337,7 +1337,10 @@ public static class LockedRemovalNative {
     }
 
     private static SafeFileHandle OpenTargetWithTimeout(string path) {
-        return OpenTargetWithTimeout(path, FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ);
+        return OpenTargetWithTimeout(
+            path,
+            FILE_READ_ATTRIBUTES | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
     }
 
     private static SafeFileHandle Open(string path, uint access, uint shareMode) {

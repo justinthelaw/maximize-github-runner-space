@@ -1129,11 +1129,8 @@ test(
       context,
     });
     assert.ok(operation.validate);
-    console.error("windows-native-smoke: before initial validate");
     await operation.validate();
-    console.error("windows-native-smoke: after initial validate");
     const result = await operation.run();
-    console.error("windows-native-smoke: after initial run");
 
     assert.equal(result.status, "removed", result.detail ?? "removal failed");
     await assert.rejects(async () => await access(target));
@@ -1152,7 +1149,6 @@ test(
       [root],
       context,
     );
-    console.error("windows-native-smoke: after ancestor check");
     assert.equal(ancestorResult.status, "failed");
     assert.equal(
       await readFile(join(ancestorTarget, "sentinel"), "utf8"),
@@ -1230,7 +1226,6 @@ test(
     ])) as [Buffer];
     if (readinessTimer !== undefined) clearTimeout(readinessTimer);
     assert.match(holderReady.toString("utf8"), /LOCKED/);
-    console.error("windows-native-smoke: holder ready");
     const lockedOperation = createRemovePathOperation({
       id: "windows-native-locked-child-preflight",
       component: "vcpkg",
@@ -1242,13 +1237,11 @@ test(
     assert.ok(lockedOperation.validate);
     assert.ok(lockedOperation.validateAfterPreflight);
     await lockedOperation.validate();
-    console.error("windows-native-smoke: after locked validate");
     try {
       await assert.rejects(
         async () => await lockedOperation.validateAfterPreflight?.(),
         /lock|sharing violation|used by another process/i,
       );
-      console.error("windows-native-smoke: after locked preflight");
     } finally {
       await terminateHolder();
       const [holderExit] = await holderExitPromise;
@@ -1285,7 +1278,6 @@ test(
       async () => await boundedOperation.validateAfterPreflight?.(),
       /traversal exceeded 2 entries/i,
     );
-    console.error("windows-native-smoke: after bounded preflight");
     assert.equal((await readdir(boundedTarget)).length, 4);
 
     const mountvol = "C:\\Windows\\System32\\mountvol.exe";
@@ -1326,7 +1318,6 @@ test(
         await readFile(join(mountedFixture, "sentinel"), "utf8"),
         "preserve mounted data",
       );
-      console.error("windows-native-smoke: after mount check");
     } finally {
       const unmounted = spawnSync(mountvol, [mountedAncestor, "/D"], {
         encoding: "utf8",
@@ -1353,7 +1344,6 @@ test(
       await readFile(join(outside, "sentinel"), "utf8"),
       "preserve me",
     );
-    console.error("windows-native-smoke: complete");
   },
 );
 
