@@ -334,7 +334,7 @@ test("Linux apt cleanup fails when a successful purge leaves a selected package 
   assert.match(result.detail ?? "", /openjdk-17-jdk remained installed/);
 });
 
-test("unprivileged Linux apt cleanup fails before residual filesystem work", async () => {
+test("unprivileged Linux apt cleanup is unsupported before residual filesystem work", async () => {
   const identity: CommandFileIdentity = {
     device: 1n,
     inode: 2n,
@@ -358,8 +358,11 @@ test("unprivileged Linux apt cleanup fails before residual filesystem work", asy
 
   await operation.validate();
   const result = await operation.run();
-  assert.equal(result.status, "failed");
-  assert.match(result.detail ?? "", /passwordless sudo.*required/i);
+  assert.equal(result.status, "unsupported");
+  assert.match(
+    result.detail ?? "",
+    /apt cleanup unavailable.*passwordless sudo/i,
+  );
 });
 
 test("Linux apt cleanup requires its complete executable inventory before mutation", async () => {
@@ -968,6 +971,29 @@ test("Linux apt finalization reports an executable removed after validation", as
   const result = await operation.run();
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /changed after plan validation/);
+});
+
+test("unprivileged Linux apt finalization is unsupported", async () => {
+  let elevated = false;
+  const operation = createLinuxAptFinalizeOperation(
+    {
+      ...contextFor("linux"),
+      hasPasswordlessSudo: false,
+    },
+    () => true,
+    {
+      inspectExecutable: async () => LINUX_TEST_IDENTITY,
+      runElevated: async () => {
+        elevated = true;
+        return commandResult("");
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "unsupported");
+  assert.equal(elevated, false);
 });
 
 test("Linux apt finalization cleans archives without global autoremove", async () => {

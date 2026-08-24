@@ -729,3 +729,46 @@ test("filesystem deadline rejects an operation that completes after expiry", asy
     /filesystem cleanup exceeded its aggregate deadline/,
   );
 });
+
+test("package work does not consume the aggregate filesystem deadline", async () => {
+  let now = 0;
+  const executionOrder: string[] = [];
+  const filesystem = createFunctionOperation({
+    id: "filesystem-after-package",
+    component: "java",
+    description: "filesystem-after-package",
+    phase: "filesystem",
+    validate: async () => {
+      now = 10;
+    },
+    run: async () => {
+      executionOrder.push("filesystem-after-package");
+      now = 1_010;
+      return { status: "removed" };
+    },
+  });
+  const packageOperation = createFunctionOperation({
+    id: "long-package",
+    component: "dotnet",
+    description: "long-package",
+    phase: "package",
+    validate: async () => {
+      now = 900;
+    },
+    run: async () => {
+      executionOrder.push("long-package");
+      now = 1_000;
+      return { status: "removed" };
+    },
+  });
+
+  const results = await executeOperations([filesystem, packageOperation], {
+    now: () => now,
+    filesystemTimeoutMs: 25,
+  });
+  assert.equal(results.length, 2);
+  assert.deepEqual(executionOrder, [
+    "long-package",
+    "filesystem-after-package",
+  ]);
+});

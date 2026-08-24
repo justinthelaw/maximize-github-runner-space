@@ -119,6 +119,8 @@ interface FilesystemCleanupBudget {
   readonly run: <T>(
     task: (execution: OperationExecutionContext) => Promise<T>,
   ) => Promise<T>;
+  readonly pause: () => void;
+  readonly resume: () => void;
 }
 
 function createFilesystemCleanupBudget(
@@ -136,8 +138,9 @@ function createFilesystemCleanupBudget(
       `filesystem cleanup timeout must be an integer from 1 to ${MAX_FILESYSTEM_CLEANUP_TIMEOUT_MS}`,
     );
   }
-  let startedAt: number | undefined;
-  let deadline: number | undefined;
+  let activeSince: number | undefined;
+  let activeElapsed = 0;
+  let active = true;
   let lastNow: number | undefined;
   const readNow = (): number => {
     const current = now();
@@ -150,14 +153,14 @@ function createFilesystemCleanupBudget(
     lastNow = current;
     return current;
   };
+  const elapsedAt = (current: number): number =>
+    activeElapsed +
+    (active && activeSince !== undefined ? current - activeSince : 0);
   const execution: OperationExecutionContext = {
     remainingMs: () => {
       const current = readNow();
-      if (startedAt === undefined || deadline === undefined) {
-        startedAt = current;
-        deadline = current + timeoutMs;
-      }
-      const remaining = deadline - current;
+      if (active && activeSince === undefined) activeSince = current;
+      const remaining = timeoutMs - elapsedAt(current);
       if (remaining <= 0) throw new FilesystemCleanupDeadlineError();
       return Math.max(1, Math.floor(remaining));
     },
@@ -170,6 +173,21 @@ function createFilesystemCleanupBudget(
       const result = await task(execution);
       execution.remainingMs();
       return result;
+    },
+    pause: () => {
+      if (!active) return;
+      const current = readNow();
+      if (activeSince !== undefined) {
+        activeElapsed += current - activeSince;
+        activeSince = undefined;
+      }
+      active = false;
+    },
+    resume: () => {
+      if (active) return;
+      const current = readNow();
+      active = true;
+      activeSince = current;
     },
   };
 }
@@ -3296,6 +3314,8 @@ export async function executeOperations(
   };
   const validationFailures: string[] = [];
   for (const operation of operations) {
+    if (operation.phase === "filesystem") filesystemBudget.resume();
+    else filesystemBudget.pause();
     if (operation.validate === undefined) continue;
     try {
       await runFilesystemTask(operation, async (execution) => {
@@ -3318,6 +3338,11 @@ export async function executeOperations(
     );
   }
 
+  // Filesystem validation happens before package mutations so the plan is
+  // still fail-closed. Pause the filesystem clock while those package (and
+  // other non-filesystem) phases run; only filesystem validation/traversal
+  // work consumes the aggregate budget.
+  filesystemBudget.pause();
   const results: OperationResult[] = [];
   const resultsById = new Map<string, OperationResult>();
   const reversible: Operation[] = [];
@@ -3344,6 +3369,8 @@ export async function executeOperations(
   };
   try {
     for (const phase of PHASES) {
+      if (phase === "filesystem") filesystemBudget.resume();
+      else filesystemBudget.pause();
       const phaseOperations = operations.filter(
         (operation) => operation.phase === phase,
       );

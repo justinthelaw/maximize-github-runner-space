@@ -832,43 +832,43 @@ export function createLinuxAptBatchOperation(
     always: true,
     fatal: true,
     validate: async () => {
-      validated = await inspectLinuxAptExecutables(dependencies);
-      if (specifications.length > 0) {
-        for (const [name, identity] of Object.entries(validated)) {
-          if (identity === undefined) {
-            const executable =
-              name === "aptGet"
-                ? "apt-get"
-                : name === "dpkgQuery"
-                  ? "dpkg-query"
-                  : name;
-            throw new Error(`${executable} executable is unavailable`);
-          }
-        }
-        const query = await commands.runCommand(
-          LINUX_PACKAGE_EXECUTABLES.dpkgQuery,
-          ["-W", "-f=${binary:Package}\\n"],
-          { env: environment, silent: true },
-        );
-        if (query.exitCode !== 0 || query.stdoutTruncated === true) {
-          throw new Error(
-            query.stderr.trim() ||
-              (query.stdoutTruncated === true
-                ? "dpkg package inventory exceeded the safe output bound"
-                : "dpkg database unavailable"),
-          );
-        }
-        selectInstalled(query.stdout);
-        validatedInventory = query.stdout;
+      if (specifications.length === 0 || !context.hasPasswordlessSudo) {
+        return;
       }
+      validated = await inspectLinuxAptExecutables(dependencies);
+      for (const [name, identity] of Object.entries(validated)) {
+        if (identity === undefined) {
+          const executable =
+            name === "aptGet"
+              ? "apt-get"
+              : name === "dpkgQuery"
+                ? "dpkg-query"
+                : name;
+          throw new Error(`${executable} executable is unavailable`);
+        }
+      }
+      const query = await commands.runCommand(
+        LINUX_PACKAGE_EXECUTABLES.dpkgQuery,
+        ["-W", "-f=${binary:Package}\\n"],
+        { env: environment, silent: true },
+      );
+      if (query.exitCode !== 0 || query.stdoutTruncated === true) {
+        throw new Error(
+          query.stderr.trim() ||
+            (query.stdoutTruncated === true
+              ? "dpkg package inventory exceeded the safe output bound"
+              : "dpkg database unavailable"),
+        );
+      }
+      selectInstalled(query.stdout);
+      validatedInventory = query.stdout;
     },
     run: async () => {
       if (specifications.length === 0) return { status: "not-found" };
-      if (context.isContainer && !context.hasPasswordlessSudo) {
+      if (!context.hasPasswordlessSudo) {
         return {
-          status: "failed",
-          detail:
-            "passwordless sudo is required before selected apt-backed components can be cleaned",
+          status: "unsupported",
+          detail: "apt cleanup unavailable without passwordless sudo",
         };
       }
       const current = await inspectLinuxAptExecutables(dependencies);
@@ -1838,12 +1838,13 @@ export function createLinuxAptFinalizeOperation(
     phase: "package",
     always: true,
     validate: async () => {
+      if (!context.hasPasswordlessSudo) return;
       validated = await commands.inspectExecutable(
         LINUX_PACKAGE_EXECUTABLES.aptGet,
       );
     },
     run: async () => {
-      if (context.isContainer && !context.hasPasswordlessSudo) {
+      if (!context.hasPasswordlessSudo) {
         return { status: "unsupported", detail: "apt cleanup unavailable" };
       }
       if (!isDirty()) return { status: "not-found" };

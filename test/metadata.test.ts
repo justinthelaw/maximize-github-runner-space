@@ -217,6 +217,14 @@ test("platform smoke covers dependency-free image runtimes", async () => {
   assert.match(action, /raise RuntimeError\("Python JSON round trip failed"\)/);
   assert.match(action, /bash_runtime=\/bin\/bash/);
   assert.match(action, /sh_runtime=\/bin\/sh/);
+  assert.match(
+    action,
+    /if: runner\.os != 'Windows' && inputs\.remove-azcopy == 'true'/,
+  );
+  assert.match(
+    action,
+    /if: runner\.os == 'Windows' && inputs\.remove-azcopy == 'true'/,
+  );
   const unixRuntimeSection = action.slice(
     unixRuntimeIndex,
     windowsRuntimeIndex,
