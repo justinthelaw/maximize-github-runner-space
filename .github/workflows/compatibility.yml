@@ -95,3 +95,4 @@ jobs:
         with:
           expected-platform: ${{ matrix.platform }}
           expected-architecture: ${{ matrix.architecture }}
+          remove-azcopy: ${{ matrix.runner != 'ubuntu-slim' }}

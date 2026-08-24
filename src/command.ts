@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, open, realpath, stat } from "node:fs/promises";
-import { delimiter, dirname, isAbsolute, join, parse } from "node:path";
+import { delimiter, dirname, isAbsolute, join, parse, posix } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { CommandResult, RuntimeContext } from "./types.js";
 
@@ -17,6 +17,61 @@ export interface CommandOptions {
 interface CommandInvocation {
   readonly executable: string;
   readonly args: readonly string[];
+}
+
+interface BigIntFileStats {
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+  readonly mode: bigint;
+  readonly uid: bigint;
+  readonly gid: bigint;
+  isSymbolicLink(): boolean;
+  isFile(): boolean;
+}
+
+function metadataCommandFileIdentity(
+  metadata: BigIntFileStats,
+): CommandFileIdentity {
+  return {
+    device: metadata.dev,
+    inode: metadata.ino,
+    size: metadata.size,
+    modifiedNanoseconds: metadata.mtimeNs,
+    changedNanoseconds: metadata.ctimeNs,
+    mode: metadata.mode,
+    userId: metadata.uid,
+    groupId: metadata.gid,
+  };
+}
+
+async function inspectUnreadableMacOSSudo(): Promise<
+  CommandFileIdentity | undefined
+> {
+  const before = (await lstat(UNIX_SUDO_EXECUTABLE, {
+    bigint: true,
+  })) as unknown as BigIntFileStats;
+  if (before.isSymbolicLink() || !before.isFile()) return undefined;
+  await access(UNIX_SUDO_EXECUTABLE, constants.X_OK);
+  const after = (await lstat(UNIX_SUDO_EXECUTABLE, {
+    bigint: true,
+  })) as unknown as BigIntFileStats;
+  const beforeIdentity = metadataCommandFileIdentity(before);
+  return sameCommandFileIdentity(
+    beforeIdentity,
+    metadataCommandFileIdentity(after),
+  )
+    ? beforeIdentity
+    : undefined;
+}
+
+export interface UnixExecutableTrustDependencies {
+  readonly platform?: NodeJS.Platform;
+  readonly resolve?: typeof realpath;
+  readonly inspect?: typeof inspectExecutable;
+  readonly inspectMacOSSudo?: () => Promise<CommandFileIdentity | undefined>;
 }
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
@@ -88,7 +143,7 @@ export function trustedUnixCommandEnvironment(
   context: RuntimeContext,
 ): NodeJS.ProcessEnv {
   return {
-    HOME: context.home,
+    HOME: posix.normalize(context.home),
     USER: "runner",
     LOGNAME: "runner",
     PATH: TRUSTED_UNIX_PATH,
@@ -200,16 +255,34 @@ export function sameCommandFileIdentity(
 
 export async function assertTrustedUnixExecutable(
   executable: string,
+  dependencies: UnixExecutableTrustDependencies = {},
 ): Promise<string> {
   try {
-    if (process.platform === "win32") {
+    const platform = dependencies.platform ?? process.platform;
+    const resolve = dependencies.resolve ?? realpath;
+    const inspect = dependencies.inspect ?? inspectExecutable;
+    const inspectMacOSSudo =
+      dependencies.inspectMacOSSudo ?? inspectUnreadableMacOSSudo;
+    if (platform === "win32") {
       throw new Error("Unix executable trust validation ran on Windows");
     }
-    const resolved = await realpath(executable);
+    const resolved = await resolve(executable);
     if (!isAbsolute(resolved)) {
       throw new Error("resolved path is not absolute");
     }
-    const before = await inspectExecutable(resolved);
+    let before: CommandFileIdentity | undefined;
+    try {
+      before = await inspect(resolved);
+    } catch (error) {
+      if (
+        platform !== "darwin" ||
+        resolved !== UNIX_SUDO_EXECUTABLE ||
+        (error as NodeJS.ErrnoException).code !== "EACCES"
+      ) {
+        throw error;
+      }
+      before = await inspectMacOSSudo();
+    }
     if (
       before === undefined ||
       before.userId !== 0n ||
@@ -239,7 +312,19 @@ export async function assertTrustedUnixExecutable(
       parent = dirname(parent);
     }
 
-    const immediate = await inspectExecutable(resolved);
+    let immediate: CommandFileIdentity | undefined;
+    try {
+      immediate = await inspect(resolved);
+    } catch (error) {
+      if (
+        platform !== "darwin" ||
+        resolved !== UNIX_SUDO_EXECUTABLE ||
+        (error as NodeJS.ErrnoException).code !== "EACCES"
+      ) {
+        throw error;
+      }
+      immediate = await inspectMacOSSudo();
+    }
     if (!sameCommandFileIdentity(before, immediate)) {
       throw new Error(
         `resolved path changed immediately before launch: ${resolved}`,
@@ -528,7 +613,6 @@ export async function runCommand(
         });
       }, 2_500);
     }, options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS);
-    timeout.unref();
 
     child.on("error", (error) => {
       finalizeCapturedOutput();

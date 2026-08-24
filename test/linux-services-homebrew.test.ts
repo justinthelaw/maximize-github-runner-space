@@ -19,6 +19,7 @@ import {
   createLinuxHomebrewCleanupOperation,
   createLinuxServiceStopOperation,
   LINUX_PACKAGE_EXECUTABLES,
+  linuxPackageCommandEnvironment,
   linuxSystemCommandEnvironment,
   validateLinuxDockerConfigMetadata,
   type LinuxSystemctl,
@@ -44,6 +45,15 @@ function commandResult(
 ): CommandResult {
   return { exitCode, stdout, stderr };
 }
+
+test("Linux system and package environments canonicalize the runner home", () => {
+  const context = {
+    ...contextFor("linux"),
+    home: "/home/runner/link/..",
+  };
+  assert.equal(linuxSystemCommandEnvironment(context).HOME, "/home/runner");
+  assert.equal(linuxPackageCommandEnvironment(context).HOME, "/home/runner");
+});
 
 const LINUX_TEST_IDENTITY = {
   device: 1n,
@@ -254,6 +264,49 @@ test("Linux apt cleanup uses fixed executables and a trusted environment", async
     assert.equal(call.environment?.APT_CONFIG, "/dev/null");
     assert.equal(call.environment?.LD_PRELOAD, undefined);
   }
+});
+
+test("PostgreSQL apt cleanup includes the package owning the pg_config diversion", async () => {
+  let purgeArguments: readonly string[] | undefined;
+  let inventoryReads = 0;
+  const operation = createLinuxAptBatchOperation(
+    contextFor("linux"),
+    planFor("postgresql"),
+    () => undefined,
+    {
+      inspectExecutable: async () => LINUX_TEST_IDENTITY,
+      runCommand: async () => {
+        inventoryReads += 1;
+        return commandResult(
+          inventoryReads <= 2
+            ? "postgresql-16\npostgresql-common\nlibpq-dev\n"
+            : "",
+        );
+      },
+      runElevated: async (_context, _executable, args) => {
+        purgeArguments = args;
+        return commandResult("");
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  assert.equal((await operation.run()).status, "removed");
+  assert.deepEqual(purgeArguments, [
+    "-o",
+    "Dir::Etc::main=/dev/null",
+    "-o",
+    "Dir::Etc::parts=/dev/null",
+    "-o",
+    "Dir::Bin::dpkg=/usr/bin/dpkg",
+    "purge",
+    "-y",
+    "--no-install-recommends",
+    "postgresql-16",
+    "postgresql-common",
+    "libpq-dev",
+  ]);
 });
 
 test("Linux apt cleanup fails when a successful purge leaves a selected package installed", async () => {

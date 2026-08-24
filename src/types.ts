@@ -43,6 +43,11 @@ export interface CommandResult {
 
 export type OperationPhase = "preflight" | "filesystem" | "package" | "system";
 
+export interface OperationExecutionContext {
+  /** Remaining milliseconds in the shared filesystem cleanup budget. */
+  readonly remainingMs: () => number;
+}
+
 export interface OperationResult {
   readonly status: "removed" | "not-found" | "unsupported" | "failed";
   readonly detail?: string;
@@ -69,16 +74,20 @@ export interface Operation {
   /** Abort the action when the operation cannot preserve its state contract. */
   readonly fatal?: boolean;
   /** Read-only complete-plan validation, run before any operation mutates state. */
-  readonly validate?: () => Promise<void>;
+  readonly validate?: (execution?: OperationExecutionContext) => Promise<void>;
   /**
    * Read-only validation that must run after reversible preflight transitions
    * (such as service stops) but before package or payload mutation.
    */
-  readonly validateAfterPreflight?: () => Promise<void>;
+  readonly validateAfterPreflight?: (
+    execution?: OperationExecutionContext,
+  ) => Promise<void>;
   /** Run this post-preflight validator after ordinary post-preflight checks. */
   readonly validateAfterPreflightLast?: boolean;
   /** Read-only guard run immediately before this operation can mutate state. */
-  readonly validateBeforeRun?: () => Promise<void>;
+  readonly validateBeforeRun?: (
+    execution?: OperationExecutionContext,
+  ) => Promise<void>;
   /** Restore reversible preflight state when a later operation fails. */
   readonly rollback?: () => Promise<void>;
   /**
@@ -87,7 +96,7 @@ export interface Operation {
    * false so they cannot revive a damaged installation.
    */
   readonly rollbackAfterPayloadMutation?: boolean;
-  run(): Promise<OperationResult>;
+  run(execution?: OperationExecutionContext): Promise<OperationResult>;
 }
 
 export interface Adapter {

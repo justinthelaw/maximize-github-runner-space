@@ -1733,7 +1733,7 @@ export function createWindowsServiceCoordinator(
     dedupeKey: "windows:services:stop",
     fatal: true,
     validate,
-    validateAfterPreflight: assertQuiesced,
+    validateAfterPreflight: async () => await assertQuiesced(),
     validateAfterPreflightLast: true,
     rollback,
     run: async (): Promise<OperationResult> => {

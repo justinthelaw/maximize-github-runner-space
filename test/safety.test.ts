@@ -9,6 +9,7 @@ import {
   lstat,
   readdir,
   readFile,
+  realpath,
   rename,
   rm,
   symlink,
@@ -586,12 +587,12 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
     helperSource,
     /OpenExecutable\(\[string\]\$spec\.runtimeExecutable\)[\s\S]*?Assert-LockedExecutable[\s\S]*?\$validator\.Start\(\)/,
   );
-  assert.match(helperSource, /StandardInput\.WriteAsync\(\$jsonInput\)/);
+  assert.match(helperSource, /StandardInput\.Write\(\$jsonInput\)/);
   assert.match(
     helperSource,
     /\$validatorDeadline = \[Diagnostics\.Stopwatch\]::StartNew\(\)/,
   );
-  assert.doesNotMatch(helperSource, /StandardInput\.Write\(\$jsonInput\)/);
+  assert.doesNotMatch(helperSource, /StandardInput\.WriteAsync\(\$jsonInput\)/);
   assert.match(
     helperSource,
     /\$validator = \$null[\s\S]*?\$validatorStarted = \$false[\s\S]*?finally \{[\s\S]*?\$validatorStarted -and -not \$validator\.HasExited[\s\S]*?\$validator\.Kill\(\)[\s\S]*?WaitForExit\(5000\)[\s\S]*?\$validator\.Dispose\(\)/,
@@ -616,7 +617,7 @@ test("Windows locked removal pins Node, verifies fixed PowerShell, and ignores w
   assert.notEqual(validatorProbe.exitCode, 0);
   assert.doesNotMatch(validatorProbe.stderr, /SyntaxError/);
   assert.equal(invocation.options.cwd, "C:\\Windows\\System32");
-  assert.equal(invocation.options.timeoutMs, 22 * 60_000);
+  assert.equal(invocation.options.timeoutMs, 12 * 60_000);
   assert.equal(invocation.options.silent, true);
   const commandEnvironment = invocation.options.env;
   assert.equal(commandEnvironment?.BASH_ENV, undefined);
@@ -1896,6 +1897,37 @@ test("privileged Node removal supervisor adds grace to default and custom traver
   }
 });
 
+test("privileged Unix fallback uses the remaining aggregate filesystem budget", async (testContext) => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-aggregate-supervisor-"),
+  );
+  testContext.after(
+    async () => await rm(root, { recursive: true, force: true }),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "payload");
+  await mkdir(target, { recursive: true });
+  let observedTimeout: number | undefined;
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    { ...contextFor("linux"), workspace: undefined },
+    {
+      execution: { remainingMs: () => 5_000 },
+      remove: async () => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      },
+      elevate: async (_context, _executable, _args, options) => {
+        observedTimeout = options?.timeoutMs;
+        return { exitCode: 1, stdout: "", stderr: "simulated helper failure" };
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(observedTimeout, 5_000);
+});
+
 test("every Unix remover checks its deadline immediately before destructive mutation", async () => {
   const source = await readFile(
     join(process.cwd(), "src", "operations.ts"),
@@ -2151,7 +2183,9 @@ test(
   "macOS native privileged removal deletes a root-owned tree without following links",
   { skip: process.platform !== "darwin" },
   async (testContext) => {
-    const root = await mkdtemp(join(tmpdir(), "maximize-space-macos-native-"));
+    const root = await mkdtemp(
+      join(await realpath(tmpdir()), "maximize-space-macos-native-"),
+    );
     const uid = process.getuid?.();
     const gid = process.getgid?.();
     assert.notEqual(uid, undefined);

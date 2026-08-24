@@ -21,6 +21,8 @@ import {
   runCommand,
   runElevated,
   sameCommandFileIdentity,
+  trustedUnixCommandEnvironment,
+  type CommandFileIdentity,
   UnconfirmedCommandTerminationError,
 } from "../src/command.js";
 import { contextFor } from "./helpers.js";
@@ -56,6 +58,25 @@ test("elevated Unix commands never resolve sudo through workflow PATH", () => {
   } finally {
     process.env.PATH = originalPath;
   }
+});
+
+test("trusted Unix environments canonicalize the runner home", () => {
+  const environment = trustedUnixCommandEnvironment({
+    ...contextFor("linux"),
+    home: "/home/runner/link/..",
+  });
+  assert.equal(environment.HOME, "/home/runner");
+  const invocation = createElevatedInvocation(
+    {
+      ...contextFor("linux"),
+      home: "/home/runner/link/..",
+    },
+    "/usr/bin/systemctl",
+    ["stop", "docker.service"],
+    1001,
+  );
+  assert.equal(invocation?.args.includes("HOME=/home/runner"), true);
+  assert.equal(invocation?.args.includes("HOME=/home/runner/link/.."), false);
 });
 
 test("elevation fails closed when passwordless sudo is unavailable", () => {
@@ -99,6 +120,51 @@ test("Unix executable trust returns the protected canonical launch path", async 
   }
   const canonical = await realpath("/bin/sh");
   assert.equal(await assertTrustedUnixExecutable("/bin/sh"), canonical);
+});
+
+test("Darwin trust accepts only an unreadable fixed sudo identity", async () => {
+  const identity: CommandFileIdentity = {
+    device: 1n,
+    inode: 2n,
+    size: 3n,
+    modifiedNanoseconds: 4n,
+    changedNanoseconds: 5n,
+    mode: 0o100555n,
+    userId: 0n,
+    groupId: 0n,
+  };
+  let inspections = 0;
+  assert.equal(
+    await assertTrustedUnixExecutable("/usr/bin/sudo", {
+      platform: "darwin",
+      inspect: async () => {
+        const error = Object.assign(new Error("permission denied"), {
+          code: "EACCES",
+        });
+        throw error;
+      },
+      inspectMacOSSudo: async () => {
+        inspections += 1;
+        return identity;
+      },
+    }),
+    "/usr/bin/sudo",
+  );
+  assert.equal(inspections, 2);
+
+  await assert.rejects(
+    async () =>
+      await assertTrustedUnixExecutable("/usr/bin/sudo", {
+        platform: "linux",
+        inspect: async () => {
+          throw Object.assign(new Error("permission denied"), {
+            code: "EACCES",
+          });
+        },
+        inspectMacOSSudo: async () => identity,
+      }),
+    /Untrusted elevated executable/,
+  );
 });
 
 test("timeouts fail closed after attempting to terminate the process tree", async () => {

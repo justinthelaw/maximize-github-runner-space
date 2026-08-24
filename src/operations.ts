@@ -37,6 +37,7 @@ import type {
   CommandResult,
   ComponentId,
   Operation,
+  OperationExecutionContext,
   OperationPhase,
   OperationResult,
   RuntimeContext,
@@ -83,6 +84,7 @@ export interface RemovePathDependencies {
   readonly unlink?: typeof unlink;
   readonly elevate?: typeof runElevated;
   readonly traversalLimits?: RemovalTraversalLimits;
+  readonly execution?: OperationExecutionContext;
 }
 
 export interface RemovalTraversalLimits {
@@ -96,6 +98,81 @@ export interface RemovalTraversalLimits {
 const MAX_REMOVAL_ENTRIES = 2_000_000;
 const MAX_REMOVAL_DEPTH = 256;
 const MAX_REMOVAL_TIMEOUT_MS = 10 * 60_000;
+const MAX_FILESYSTEM_CLEANUP_TIMEOUT_MS = 10 * 60_000;
+
+export interface ExecuteOperationsOptions {
+  /** Test-only monotonic clock override. */
+  readonly now?: () => number;
+  /** Test-only override for the aggregate filesystem budget. */
+  readonly filesystemTimeoutMs?: number;
+}
+
+class FilesystemCleanupDeadlineError extends Error {
+  override readonly name = "FilesystemCleanupDeadlineError";
+
+  constructor() {
+    super("filesystem cleanup exceeded its aggregate deadline");
+  }
+}
+
+interface FilesystemCleanupBudget {
+  readonly run: <T>(
+    task: (execution: OperationExecutionContext) => Promise<T>,
+  ) => Promise<T>;
+}
+
+function createFilesystemCleanupBudget(
+  options: ExecuteOperationsOptions,
+): FilesystemCleanupBudget {
+  const now = options.now ?? (() => performance.now());
+  const timeoutMs =
+    options.filesystemTimeoutMs ?? MAX_FILESYSTEM_CLEANUP_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > MAX_FILESYSTEM_CLEANUP_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `filesystem cleanup timeout must be an integer from 1 to ${MAX_FILESYSTEM_CLEANUP_TIMEOUT_MS}`,
+    );
+  }
+  let startedAt: number | undefined;
+  let deadline: number | undefined;
+  let lastNow: number | undefined;
+  const readNow = (): number => {
+    const current = now();
+    if (!Number.isFinite(current)) {
+      throw new Error("filesystem cleanup clock returned a non-finite value");
+    }
+    if (lastNow !== undefined && current < lastNow) {
+      throw new Error("filesystem cleanup clock moved backwards");
+    }
+    lastNow = current;
+    return current;
+  };
+  const execution: OperationExecutionContext = {
+    remainingMs: () => {
+      const current = readNow();
+      if (startedAt === undefined || deadline === undefined) {
+        startedAt = current;
+        deadline = current + timeoutMs;
+      }
+      const remaining = deadline - current;
+      if (remaining <= 0) throw new FilesystemCleanupDeadlineError();
+      return Math.max(1, Math.floor(remaining));
+    },
+  };
+  return {
+    run: async <T>(
+      task: (context: OperationExecutionContext) => Promise<T>,
+    ) => {
+      execution.remainingMs();
+      const result = await task(execution);
+      execution.remainingMs();
+      return result;
+    },
+  };
+}
 
 class RemovalTraversalLimitError extends Error {
   override readonly name = "RemovalTraversalLimitError";
@@ -129,6 +206,18 @@ function normalizedRemovalTraversalLimits(
     }
   }
   return normalized;
+}
+
+function boundedRemovalTraversalLimits(
+  limits: RemovalTraversalLimits = {},
+  execution?: OperationExecutionContext,
+): RemovalTraversalLimits {
+  if (execution === undefined) return limits;
+  const normalized = normalizedRemovalTraversalLimits(limits);
+  return {
+    ...limits,
+    timeoutMs: Math.min(normalized.timeoutMs, execution.remainingMs()),
+  };
 }
 
 const PRIVILEGED_ANCHORED_REMOVE_SOURCE = String.raw`
@@ -1053,7 +1142,9 @@ $script:TraversalClock = $null
 
 function Reset-Traversal {
  $script:TraversalEntries=0L
- $script:TraversalClock=[Diagnostics.Stopwatch]::StartNew()
+ if ($null -eq $script:TraversalClock) {
+  $script:TraversalClock=[Diagnostics.Stopwatch]::StartNew()
+ }
 }
 
 function Assert-Traversal {
@@ -1485,14 +1576,7 @@ try {
         $validator.StartInfo = $startInfo
         if (-not $validator.Start()) { throw 'Could not start the pinned Node boundary validator' }
         $validatorStarted = $true
-        $write = $validator.StandardInput.WriteAsync($jsonInput)
-        if (-not $write.Wait((Get-ValidatorRemainingMilliseconds))) {
-            throw 'Pinned Node boundary validation timed out while writing input'
-        }
-        $flush = $validator.StandardInput.FlushAsync()
-        if (-not $flush.Wait((Get-ValidatorRemainingMilliseconds))) {
-            throw 'Pinned Node boundary validation timed out while flushing input'
-        }
+        $validator.StandardInput.Write($jsonInput)
         $validator.StandardInput.Close()
         if (-not $validator.WaitForExit((Get-ValidatorRemainingMilliseconds))) {
             throw 'Pinned Node boundary validation timed out'
@@ -1699,6 +1783,7 @@ async function removeLockedWindowsPath(
     | "currentRuntimeExecutable"
     | "expectedWindowsRemovalRuntime"
     | "traversalLimits"
+    | "execution"
   >,
   mode: "structure" | "locks" | "remove" = "remove",
 ): Promise<void> {
@@ -1737,12 +1822,18 @@ async function removeLockedWindowsPath(
     throw new Error("current Node executable changed before Windows removal");
   }
   const run = dependencies.commandRunner ?? runCommand;
-  const limits = normalizedRemovalTraversalLimits(dependencies.traversalLimits);
-  const traversalPasses = mode === "remove" ? 2 : mode === "locks" ? 1 : 0;
-  const helperTimeoutMs =
+  const boundedLimits = boundedRemovalTraversalLimits(
+    dependencies.traversalLimits,
+    dependencies.execution,
+  );
+  const limits = normalizedRemovalTraversalLimits(boundedLimits);
+  const traversalPasses = mode === "remove" || mode === "locks" ? 1 : 0;
+  const helperTimeoutMs = Math.min(
     WINDOWS_BOUNDARY_VALIDATOR_TIMEOUT_MS +
-    traversalPasses * limits.timeoutMs +
-    WINDOWS_REMOVAL_HELPER_GRACE_MS;
+      traversalPasses * limits.timeoutMs +
+      WINDOWS_REMOVAL_HELPER_GRACE_MS,
+    dependencies.execution?.remainingMs() ?? Number.MAX_SAFE_INTEGER,
+  );
 
   const serialized = JSON.stringify({
     target: win32.normalize(target),
@@ -1825,6 +1916,7 @@ async function preflightWindowsRemovalHelper(
     );
   const cacheable =
     process.platform === "win32" &&
+    dependencies.execution === undefined &&
     dependencies.commandRunner === undefined &&
     dependencies.inspectExecutable === undefined &&
     dependencies.hostPlatform === undefined &&
@@ -1986,7 +2078,12 @@ async function runPrivilegedPythonAnchoredRemoval(
   resolve: ResolveExecutable,
   expectedRuntime?: PrivilegedPythonRuntime,
   traversalLimits: RemovalTraversalLimits = {},
+  execution?: OperationExecutionContext,
 ): Promise<CommandResult> {
+  const boundedLimits = boundedRemovalTraversalLimits(
+    traversalLimits,
+    execution,
+  );
   const runtime =
     expectedRuntime ?? (await capturePrivilegedPythonRuntime(inspect, resolve));
   const immediatePython = await inspect(runtime.executable);
@@ -1999,10 +2096,12 @@ async function runPrivilegedPythonAnchoredRemoval(
     runtime.executable,
     ["-I", "-S", "-c", PRIVILEGED_PYTHON_ANCHORED_REMOVE_SOURCE],
     {
-      input: serializedRemovalBoundary(target, boundary, traversalLimits),
+      input: serializedRemovalBoundary(target, boundary, boundedLimits),
       silent: true,
-      timeoutMs:
-        normalizedRemovalTraversalLimits(traversalLimits).timeoutMs + 60_000,
+      timeoutMs: Math.min(
+        normalizedRemovalTraversalLimits(boundedLimits).timeoutMs + 60_000,
+        execution?.remainingMs() ?? Number.MAX_SAFE_INTEGER,
+      ),
     },
   );
   if (result.terminationUnconfirmed === true) {
@@ -2018,7 +2117,11 @@ async function runLocalNodeAnchoredRemoval(
   boundary: RemovalBoundarySnapshot,
   dependencies: RemovePathDependencies,
 ): Promise<void> {
-  const limits = normalizedRemovalTraversalLimits(dependencies.traversalLimits);
+  const boundedLimits = boundedRemovalTraversalLimits(
+    dependencies.traversalLimits,
+    dependencies.execution,
+  );
+  const limits = normalizedRemovalTraversalLimits(boundedLimits);
   // This child is unprivileged. Launch the already-running action runtime by
   // its concrete executable path; elevation performs the stricter trust check
   // separately before crossing a privilege boundary.
@@ -2029,13 +2132,12 @@ async function runLocalNodeAnchoredRemoval(
     runtime,
     ["--input-type=module", "--eval", PRIVILEGED_ANCHORED_REMOVE_SOURCE],
     {
-      input: serializedRemovalBoundary(
-        target,
-        boundary,
-        dependencies.traversalLimits,
-      ),
+      input: serializedRemovalBoundary(target, boundary, boundedLimits),
       silent: true,
-      timeoutMs: limits.timeoutMs + 60_000,
+      timeoutMs: Math.min(
+        limits.timeoutMs + 60_000,
+        dependencies.execution?.remainingMs() ?? Number.MAX_SAFE_INTEGER,
+      ),
     },
   );
   if (result.terminationUnconfirmed === true) {
@@ -2478,6 +2580,11 @@ export async function removePathTarget(
   context: RuntimeContext,
   dependencies: RemovePathDependencies = {},
 ): Promise<OperationResult> {
+  const execution = dependencies.execution;
+  const traversalLimits = boundedRemovalTraversalLimits(
+    dependencies.traversalLimits,
+    execution,
+  );
   const inspect = dependencies.inspect ?? inspectTarget;
   const boundary = dependencies.boundary ?? captureSafeRemovalBoundary;
   const anchoredRemove = dependencies.anchoredRemove ?? removeAnchoredUnixPath;
@@ -2548,11 +2655,7 @@ export async function removePathTarget(
       };
     }
     if (context.platform !== "windows") {
-      serializedRemovalBoundary(
-        target,
-        validatedBoundary,
-        dependencies.traversalLimits,
-      );
+      serializedRemovalBoundary(target, validatedBoundary, traversalLimits);
     }
   } catch (error) {
     return {
@@ -2596,7 +2699,8 @@ export async function removePathTarget(
         dependencies.inspectExecutable ?? inspectExecutable,
         dependencies.resolveExecutable ?? realpath,
         dependencies.expectedPrivilegedPythonRuntime,
-        dependencies.traversalLimits,
+        traversalLimits,
+        execution,
       );
       if (result.exitCode !== 0) {
         throw new Error(
@@ -2618,11 +2722,7 @@ export async function removePathTarget(
           dependencies,
         );
       } else {
-        await anchoredRemove(
-          target,
-          immediateBoundary,
-          dependencies.traversalLimits,
-        );
+        await anchoredRemove(target, immediateBoundary, traversalLimits);
       }
     } else if (inspected.isLink) {
       // Unlink the directory symlink/junction itself. Never give a recursive
@@ -2718,7 +2818,8 @@ export async function removePathTarget(
           dependencies.inspectExecutable ?? inspectExecutable,
           dependencies.resolveExecutable ?? realpath,
           dependencies.expectedPrivilegedPythonRuntime,
-          dependencies.traversalLimits,
+          traversalLimits,
+          execution,
         );
       } else {
         assertCommandTerminationConfirmed();
@@ -2745,13 +2846,13 @@ export async function removePathTarget(
             dependencies.inspectExecutable ?? inspectExecutable,
             dependencies.resolveExecutable ?? realpath,
             dependencies.expectedPrivilegedPythonRuntime,
-            dependencies.traversalLimits,
+            traversalLimits,
+            execution,
           );
         };
         try {
-          const traversalTimeoutMs = normalizedRemovalTraversalLimits(
-            dependencies.traversalLimits,
-          ).timeoutMs;
+          const traversalTimeoutMs =
+            normalizedRemovalTraversalLimits(traversalLimits).timeoutMs;
           result = await elevate(
             context,
             runtime,
@@ -2764,10 +2865,13 @@ export async function removePathTarget(
               input: serializedRemovalBoundary(
                 target,
                 fallbackBoundary,
-                dependencies.traversalLimits,
+                traversalLimits,
               ),
               silent: true,
-              timeoutMs: traversalTimeoutMs + 60_000,
+              timeoutMs: Math.min(
+                traversalTimeoutMs + 60_000,
+                execution?.remainingMs() ?? Number.MAX_SAFE_INTEGER,
+              ),
             },
           );
         } catch (error) {
@@ -2816,7 +2920,15 @@ export function createRemovePathOperation(
   let validatedBoundary: RemovalBoundarySnapshot | undefined;
   let validatedPrivilegedPythonRuntime: PrivilegedPythonRuntime | undefined;
   let validatedWindowsRemovalRuntime: WindowsRemovalRuntime | undefined;
-  const validate = async (): Promise<void> => {
+  const validate = async (
+    execution?: OperationExecutionContext,
+  ): Promise<void> => {
+    const scopedDependencies =
+      execution === undefined ? dependencies : { ...dependencies, execution };
+    const boundedLimits = boundedRemovalTraversalLimits(
+      dependencies.traversalLimits,
+      execution,
+    );
     const current = await (dependencies.boundary ?? captureSafeRemovalBoundary)(
       target,
       options.allowedParents,
@@ -2847,11 +2959,11 @@ export function createRemovePathOperation(
         target,
         current,
         options.context,
-        dependencies,
+        scopedDependencies,
         validatedWindowsRemovalRuntime,
       );
     } else if (current.targetExists) {
-      serializedRemovalBoundary(target, current, dependencies.traversalLimits);
+      serializedRemovalBoundary(target, current, boundedLimits);
       const pythonRuntime = await capturePrivilegedPythonRuntime(
         dependencies.inspectExecutable ?? inspectExecutable,
         dependencies.resolveExecutable ?? realpath,
@@ -2872,9 +2984,13 @@ export function createRemovePathOperation(
       validatedPrivilegedPythonRuntime ??= pythonRuntime;
     }
   };
-  const validateAfterPreflight = async (): Promise<void> => {
+  const validateAfterPreflight = async (
+    execution?: OperationExecutionContext,
+  ): Promise<void> => {
+    const scopedDependencies =
+      execution === undefined ? dependencies : { ...dependencies, execution };
     if (options.context.platform !== "windows") return;
-    if (validatedBoundary === undefined) await validate();
+    if (validatedBoundary === undefined) await validate(execution);
     const expected = validatedBoundary;
     if (expected === undefined) {
       throw new Error("Windows removal boundary was not captured");
@@ -2896,7 +3012,7 @@ export function createRemovePathOperation(
       target,
       current,
       options.context,
-      dependencies,
+      scopedDependencies,
       runtime,
     );
   };
@@ -2920,10 +3036,10 @@ export function createRemovePathOperation(
     ...(options.context.platform === "windows"
       ? { validateAfterPreflight }
       : {}),
-    run: async () => {
+    run: async (execution?: OperationExecutionContext) => {
       if (validatedBoundary === undefined) {
         try {
-          await validate();
+          await validate(execution);
         } catch (error) {
           return {
             status: "failed",
@@ -2944,6 +3060,7 @@ export function createRemovePathOperation(
         options.context,
         {
           ...dependencies,
+          ...(execution === undefined ? {} : { execution }),
           expectedBoundary,
           ...(validatedPrivilegedPythonRuntime === undefined
             ? {}
@@ -2986,13 +3103,19 @@ export function createFunctionOperation(options: {
   readonly coveredBySuccessfulOperations?: readonly string[];
   readonly always?: boolean;
   readonly fatal?: boolean;
-  readonly validate?: () => Promise<void>;
-  readonly validateAfterPreflight?: () => Promise<void>;
+  readonly validate?: (execution?: OperationExecutionContext) => Promise<void>;
+  readonly validateAfterPreflight?: (
+    execution?: OperationExecutionContext,
+  ) => Promise<void>;
   readonly validateAfterPreflightLast?: boolean;
-  readonly validateBeforeRun?: () => Promise<void>;
+  readonly validateBeforeRun?: (
+    execution?: OperationExecutionContext,
+  ) => Promise<void>;
   readonly rollback?: () => Promise<void>;
   readonly rollbackAfterPayloadMutation?: boolean;
-  readonly run: () => Promise<OperationResult>;
+  readonly run: (
+    execution?: OperationExecutionContext,
+  ) => Promise<OperationResult>;
 }): Operation {
   return {
     id: options.id,
@@ -3063,12 +3186,15 @@ export function prepareOperations(
   return prepared;
 }
 
-async function runOne(operation: Operation): Promise<OperationResult> {
+async function runOne(
+  operation: Operation,
+  execution?: OperationExecutionContext,
+): Promise<OperationResult> {
   core.info(`• ${operation.description}`);
   assertCommandTerminationConfirmed();
   let result: OperationResult;
   try {
-    result = await operation.run();
+    result = await operation.run(execution);
   } catch (error) {
     if (error instanceof UnconfirmedCommandTerminationError) throw error;
     assertCommandTerminationConfirmed();
@@ -3154,17 +3280,33 @@ function isCoveredBySuccessfulOperation(
 
 export async function executeOperations(
   operations: readonly Operation[],
+  options: ExecuteOperationsOptions = {},
 ): Promise<readonly OperationResult[]> {
   assertCommandTerminationConfirmed();
   assertValidResultCoverage(operations);
+  const filesystemBudget = createFilesystemCleanupBudget(options);
+  const runFilesystemTask = async <T>(
+    operation: Operation,
+    task: (execution: OperationExecutionContext) => Promise<T>,
+  ): Promise<T> => {
+    if (operation.phase !== "filesystem") {
+      return await task({ remainingMs: () => Number.MAX_SAFE_INTEGER });
+    }
+    return await filesystemBudget.run(task);
+  };
   const validationFailures: string[] = [];
   for (const operation of operations) {
     if (operation.validate === undefined) continue;
     try {
-      await operation.validate();
+      await runFilesystemTask(operation, async (execution) => {
+        await operation.validate?.(
+          operation.phase === "filesystem" ? execution : undefined,
+        );
+      });
       assertCommandTerminationConfirmed();
     } catch (error) {
       if (error instanceof UnconfirmedCommandTerminationError) throw error;
+      if (error instanceof FilesystemCleanupDeadlineError) throw error;
       assertCommandTerminationConfirmed();
       const detail = error instanceof Error ? error.message : String(error);
       validationFailures.push(`${operation.description}: ${detail}`);
@@ -3183,10 +3325,15 @@ export async function executeOperations(
   const validateBeforeRun = async (operation: Operation): Promise<void> => {
     if (operation.validateBeforeRun === undefined) return;
     try {
-      await operation.validateBeforeRun();
+      await runFilesystemTask(operation, async (execution) => {
+        await operation.validateBeforeRun?.(
+          operation.phase === "filesystem" ? execution : undefined,
+        );
+      });
       assertCommandTerminationConfirmed();
     } catch (error) {
       if (error instanceof UnconfirmedCommandTerminationError) throw error;
+      if (error instanceof FilesystemCleanupDeadlineError) throw error;
       assertCommandTerminationConfirmed();
       throw new Error(
         `${operation.description} failed immediate validation: ${
@@ -3214,7 +3361,9 @@ export async function executeOperations(
             for (const operation of eligible) {
               await validateBeforeRun(operation);
               payloadMutationMayHaveStarted = true;
-              const result = await runOne(operation);
+              const result = await filesystemBudget.run(
+                async (execution) => await runOne(operation, execution),
+              );
               results.push(result);
               resultsById.set(operation.id, result);
               if (
@@ -3255,10 +3404,17 @@ export async function executeOperations(
               continue;
             }
             try {
-              await operation.validateAfterPreflight();
+              await runFilesystemTask(operation, async (execution) => {
+                await operation.validateAfterPreflight?.(
+                  operation.phase === "filesystem" ? execution : undefined,
+                );
+              });
               assertCommandTerminationConfirmed();
             } catch (error) {
               if (error instanceof UnconfirmedCommandTerminationError) {
+                throw error;
+              }
+              if (error instanceof FilesystemCleanupDeadlineError) {
                 throw error;
               }
               assertCommandTerminationConfirmed();

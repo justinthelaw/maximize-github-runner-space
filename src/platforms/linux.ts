@@ -17,6 +17,7 @@ import {
   runCommand,
   runElevated,
   sameCommandFileIdentity,
+  trustedUnixCommandEnvironment,
   TRUSTED_UNIX_PATH,
   UNIX_ENV_EXECUTABLE,
   UNIX_SUDO_EXECUTABLE,
@@ -242,12 +243,7 @@ export function linuxSystemCommandEnvironment(
   context: RuntimeContext,
 ): NodeJS.ProcessEnv {
   return {
-    HOME: context.home,
-    USER: "runner",
-    LOGNAME: "runner",
-    PATH: TRUSTED_UNIX_PATH,
-    LANG: "C.UTF-8",
-    LC_ALL: "C.UTF-8",
+    ...trustedUnixCommandEnvironment(context),
     SYSTEMD_COLORS: "0",
     SYSTEMD_PAGER: "",
   };
@@ -546,6 +542,7 @@ const APT_PACKAGES: Readonly<Partial<Record<ComponentId, readonly string[]>>> =
       "postgresql",
       "postgresql-common",
       "postgresql-client-common",
+      "libpq-dev",
       "^postgresql-.*",
     ],
     mysql: ["mysql-common", "^mysql-.*", "^mariadb-.*"],

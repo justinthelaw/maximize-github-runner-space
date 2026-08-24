@@ -96,8 +96,8 @@ utility or incomplete inventory fails closed.
 
 Before cleanup, the action checks fixed runner-image metadata and validates the
 complete plan. Destructive commands use fixed executable paths, restricted
-environments, bounded inventories, and removal checks. A command timeout stops
-all later cleanup.
+environments, bounded inventories, and removal checks. A command timeout or the
+shared filesystem cleanup deadline stops all later cleanup.
 
 This is a safety boundary for a fresh hosted runner, not a sandbox or signed
 runner attestation. See [runner support](docs/RUNNER-SUPPORT.md) for exact

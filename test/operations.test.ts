@@ -670,3 +670,62 @@ test("filesystem operations are serialized before a fatal termination latch", as
     clearCommandTerminationUnconfirmed();
   }
 });
+
+test("filesystem operations share one aggregate deadline", async () => {
+  let now = 0;
+  const executionOrder: string[] = [];
+  const first = createFunctionOperation({
+    id: "aggregate-first",
+    component: "java",
+    description: "aggregate-first",
+    phase: "filesystem",
+    run: async () => {
+      executionOrder.push("first");
+      now = 100;
+      return { status: "removed" };
+    },
+  });
+  const second = createFunctionOperation({
+    id: "aggregate-second",
+    component: "dotnet",
+    description: "aggregate-second",
+    phase: "filesystem",
+    run: async () => {
+      executionOrder.push("second");
+      return { status: "removed" };
+    },
+  });
+
+  await assert.rejects(
+    async () =>
+      await executeOperations([first, second], {
+        now: () => now,
+        filesystemTimeoutMs: 100,
+      }),
+    /filesystem cleanup exceeded its aggregate deadline/,
+  );
+  assert.deepEqual(executionOrder, ["first"]);
+});
+
+test("filesystem deadline rejects an operation that completes after expiry", async () => {
+  let now = 0;
+  const operation = createFunctionOperation({
+    id: "aggregate-overrun",
+    component: "java",
+    description: "aggregate-overrun",
+    phase: "filesystem",
+    run: async () => {
+      now = 101;
+      return { status: "removed" };
+    },
+  });
+
+  await assert.rejects(
+    async () =>
+      await executeOperations([operation], {
+        now: () => now,
+        filesystemTimeoutMs: 100,
+      }),
+    /filesystem cleanup exceeded its aggregate deadline/,
+  );
+});

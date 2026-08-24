@@ -163,11 +163,13 @@ then locks and rechecks the Node validator. OS-protected executables and a
 root-owned Unix OS Python are trusted boundaries. Each recursive traversal has
 limits of 2,000,000 entries, depth 256, and 10 minutes of traversal work.
 Version discovery inspects at most 256 directory entries for 10 seconds and
-accepts at most 64 matching versions on Linux and Windows. Do not let another
-process write to, rename, or remount selected trees or their writable parents
-during cleanup. Those changes are outside the threat model. Concurrent
-privileged changes to protected files, mounts, Windows service registrations,
-or `xcode-select` are also outside it. The action also trusts hosted-image
+accepts at most 64 matching versions on Linux and Windows. Serialized filesystem
+cleanup shares a ten-minute aggregate deadline across validation, traversal,
+fallbacks, and Windows lock/deletion passes. Do not let another process write to,
+rename, or remount selected trees or their writable parents during cleanup. Those
+changes are outside the threat model. Concurrent privileged changes to protected
+files, mounts, Windows service registrations, or `xcode-select` are also outside
+it. The action also trusts hosted-image
 package hooks, transitive installer code, vendor uninstallers, and children
 intentionally left running by a successful vendor launcher. It is not a
 sandbox or signed attestation.

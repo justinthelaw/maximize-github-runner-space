@@ -25,7 +25,7 @@ Key changes:
   starts, services stay stopped to avoid restarting a partly removed install.
 - Destructive executables are content-identity-checked again before use.
 - Supported uninstallers must pass a bounded removal postcondition.
-- Every command timeout stops all later cleanup.
+- Every command timeout or aggregate filesystem deadline stops all later cleanup.
 - If timeout handling cannot confirm the process tree ended, no rollback
   command is started; a service already stopped can remain stopped until the
   ephemeral runner is discarded.
