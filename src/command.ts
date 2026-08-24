@@ -222,6 +222,14 @@ export async function inspectExecutable(
     };
   } catch (error) {
     if (
+      process.platform === "darwin" &&
+      executable === UNIX_SUDO_EXECUTABLE &&
+      error instanceof Error &&
+      (error as NodeJS.ErrnoException).code === "EACCES"
+    ) {
+      return await inspectUnreadableMacOSSudo();
+    }
+    if (
       error instanceof Error &&
       ["ENOENT", "ENOTDIR"].includes(
         (error as NodeJS.ErrnoException).code ?? "",
