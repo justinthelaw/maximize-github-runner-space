@@ -1189,7 +1189,7 @@ test(
         await new Promise<void>((resolve) => {
           const killer = spawn(
             "C:\\Windows\\System32\\taskkill.exe",
-            ["/pid", String(holder.pid), "/t", "/f"],
+            ["/pid", String(holder.pid), "/f"],
             { stdio: "ignore", windowsHide: true },
           );
           let finished = false;
