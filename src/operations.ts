@@ -252,27 +252,6 @@ async function runOne(operation: Operation): Promise<OperationResult> {
   }
 }
 
-async function runBounded(
-  operations: readonly Operation[],
-  concurrency: number,
-): Promise<readonly OperationResult[]> {
-  const results: OperationResult[] = new Array(operations.length);
-  let cursor = 0;
-  const workers = Array.from(
-    { length: Math.min(concurrency, operations.length) },
-    async () => {
-      for (;;) {
-        const index = cursor++;
-        const operation = operations[index];
-        if (operation === undefined) return;
-        results[index] = await runOne(operation);
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
 const PHASES = ["preflight", "package", "filesystem", "system"] as const;
 
 function assertValidResultCoverage(operations: readonly Operation[]): void {
@@ -366,23 +345,6 @@ export async function executeOperations(
     );
     if (phaseOperations.length === 0) continue;
     await core.group(`${phase} cleanup`, async () => {
-      if (phase === "filesystem") {
-        const eligible = phaseOperations.filter(
-          (operation) =>
-            !isCoveredBySuccessfulOperation(operation, resultsById),
-        );
-        const phaseResults = await runBounded(eligible, 4);
-        results.push(...phaseResults);
-        for (let index = 0; index < eligible.length; index++) {
-          const operation = eligible[index];
-          const result = phaseResults[index];
-          if (operation !== undefined && result !== undefined) {
-            resultsById.set(operation.id, result);
-          }
-        }
-        return;
-      }
-
       for (const operation of phaseOperations) {
         if (isCoveredBySuccessfulOperation(operation, resultsById)) continue;
         const result = await runOne(operation);
