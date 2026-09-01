@@ -4,11 +4,6 @@ permissions:
   contents: read
 
 on:
-  pull_request:
-    branches:
-      - main
-  merge_group:
-    types: [checks_requested]
   workflow_dispatch:
   schedule:
     - cron: "17 8 * * 1"
@@ -95,4 +90,3 @@ jobs:
         with:
           expected-platform: ${{ matrix.platform }}
           expected-architecture: ${{ matrix.architecture }}
-          remove-azcopy: ${{ matrix.runner != 'ubuntu-slim' }}

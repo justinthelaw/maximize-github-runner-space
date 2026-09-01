@@ -5,18 +5,12 @@ and [configuration reference](CONFIGURATION.md).
 
 ## Prerequisites
 
-Development requires Node.js 22 or newer, npm, and Python 3.12 or 3.14. Create a
-branch from `main`, then install the exact Node and Python tools:
+Development requires Node.js 22 or newer, npm, and pre-commit. Create a branch
+from `main`, install locked dependencies, then install the hooks:
 
 ```bash
-npm ci --ignore-scripts
-python -m pip install --require-hashes --requirement .github/requirements/pre-commit.txt
 pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
-
-Before running the full hook set locally, install the checksum-verified
-actionlint 1.7.12 binary as `node_modules/.bin/actionlint`. CI performs this
-step from the pinned release archive and checksum.
 
 ## Repository map
 

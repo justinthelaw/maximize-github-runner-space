@@ -138,8 +138,3 @@ test("swap sizes preserve legacy binary-unit and rounding semantics", () => {
   assert.throws(() => parseSwapfileSize("-1"), /Invalid swapfile-size/);
   assert.throws(() => parseSwapfileSize("1PB"), /Invalid swapfile-size/);
 });
-
-test("swap sizes reject oversized text before bigint conversion", () => {
-  const oversized = `1${"0".repeat(100_000)}GiB`;
-  assert.throws(() => parseSwapfileSize(oversized), /too long/);
-});

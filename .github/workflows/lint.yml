@@ -31,50 +31,10 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.14.0"
+          python-version: "3.14"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "22.0.0"
-          package-manager-cache: false
-
-      - name: Install lockfile-pinned Node.js lint tools
-        run: npm ci --ignore-scripts
-
-      - name: Install hash-locked Python lint tools
-        run: |
-          python -m pip install \
-            --require-hashes \
-            --requirement .github/requirements/pre-commit.txt
-          python -m pip check
-
-      # actionlint's go.sum fixes module versions and content hashes, but a
-      # source build still resolves the Go toolchain and modules over the
-      # network. Use the release binary only after verifying its published hash.
-      - name: Install checksum-locked actionlint
-        env:
-          ACTIONLINT_ARCHIVE: actionlint_1.7.12_linux_amd64.tar.gz
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-          ACTIONLINT_BINARY_SHA256: c872d6db8c6bf83a8eaa704fc93999f027d55dffbc63b8a6abdccb47df5f4cd4
-        run: |
-          set -euo pipefail
-          archive="${RUNNER_TEMP}/${ACTIONLINT_ARCHIVE}"
-          install_root="${GITHUB_WORKSPACE}/node_modules/.bin"
-          /usr/bin/test -d "$install_root"
-          /usr/bin/test ! -L "$install_root"
-          /usr/bin/test ! -e "$install_root/actionlint"
-          /usr/bin/curl --fail --location --proto '=https' --tlsv1.2 \
-            --output "$archive" \
-            "https://github.com/rhysd/actionlint/releases/download/v1.7.12/${ACTIONLINT_ARCHIVE}"
-          /usr/bin/printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | \
-            /usr/bin/sha256sum --check --strict
-          /usr/bin/tar --extract --no-same-owner --no-same-permissions \
-            --file "$archive" --directory "$install_root" actionlint
-          /usr/bin/chmod 0755 "$install_root/actionlint"
-          /usr/bin/printf '%s  %s\n' "$ACTIONLINT_BINARY_SHA256" "$install_root/actionlint" | \
-            /usr/bin/sha256sum --check --strict
-          /usr/bin/test -x "$install_root/actionlint"
+      - name: Install Pre-Commit
+        run: python -m pip install pre-commit==4.6.2
 
       - name: Run Pre-Commits
         run: pre-commit run --all-files --hook-stage pre-push

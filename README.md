@@ -1,118 +1,104 @@
 # Maximize GitHub Runner Space
 
 Reclaim disk space on standard GitHub-hosted Linux, macOS, and Windows runners
-before a disk-heavy build, test, or Docker image build. The action detects
-the runner platform and architecture automatically.
+before a large build, test, or container job. The action detects the runner
+platform and architecture automatically.
 
 > [!WARNING]
 > This action is intentionally destructive. It removes preinstalled tools,
-> SDKs, services, and caches. Run it on a fresh hosted runner before repository
-> code or other privileged steps. Start with `custom`, and remove only tools
-> that later steps do not need.
+> SDKs, services, and caches that later workflow steps might need. Run it near
+> the start of a job and explicitly retain every component your workflow uses.
 
 ## Quick start
 
-The examples pin the commit behind `v0.12.2`, the latest published release.
-Behavior documented on `main` may not be released yet.
+These examples target `v0.12.2`; until that tag is published, pin the full
+commit SHA instead.
 
-For a new workflow, use `custom` and opt in one component at a time. This
-example assumes the job does not use Android or CodeQL:
+Calling the action without `with:` uses the aggressive `max` profile, which
+removes every applicable component unless it is protected.
 
 ```yaml
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Free runner space
+        uses: justinthelaw/maximize-github-runner-space@v0.12.2
+        with:
+          skip-components: java,browsers,docker-engine,docker-images
+          swapfile-size: 2GiB
+      - run: ./build.sh
+```
+
+For a new workflow, begin with the conservative `custom` profile and opt in
+only to components you have measured as disposable:
+
+```yaml
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Free runner space
         id: cleanup
-        uses: justinthelaw/maximize-github-runner-space@ab8cbab7abef3d8a2565cc7827c22ffd462202be # v0.12.2
+        uses: justinthelaw/maximize-github-runner-space@v0.12.2
         with:
           cleanup-profile: custom
-          remove-android: "true"
           remove-codeql: "true"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+          remove-cached-go: "true"
       - run: echo "Reclaimed ${{ steps.cleanup.outputs.reclaimed-bytes }} bytes"
-      - run: ./build.sh
 ```
 
-After the job passes, `max` can reclaim more. List every component the job must
-keep. This example keeps Java, browsers, and all existing Docker state; replace
-that list with the tools your job needs:
-
-```yaml
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@ab8cbab7abef3d8a2565cc7827c22ffd462202be # v0.12.2
-        with:
-          cleanup-profile: max
-          skip-components: java,browsers,docker-engine,docker-images
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: ./build.sh
-```
-
-Run cleanup before checkout when possible, and always before creating build
-outputs or caches you want to keep. If checkout must run first, pin it, disable
-credential persistence, and do not execute repository code before cleanup.
-Quote `remove-*` values: `custom` enables a component only when its value is
-exactly `"true"`.
+Quote `remove-*` values: `custom` selects a component only when its input is
+exactly the string `"true"`.
 
 ## Profiles at a glance
 
-| Profile  | What it removes                                                                  |
-| -------- | -------------------------------------------------------------------------------- |
-| `custom` | Only `remove-*` inputs set to `"true"`. Recommended for a new job.               |
-| `max`    | Every applicable component except IDs in `skip-components`. This is the default. |
+- `max` is the default. It enables all components that apply to the detected
+  platform, except component IDs listed in `skip-components`.
+- `custom` enables only the `remove-*` inputs set to `"true"`; it ignores
+  `skip-components` for compatibility.
+- `swapfile-size` is separate from both profiles. It is supported only on a
+  privileged Linux VM; omit it to leave swap unchanged.
 
-`swapfile-size` is independent of the profile. Omit it to leave swap unchanged,
-set it to `0` to remove `/mnt/swapfile`, or set a positive size when a build
-needs swap on a privileged Linux VM. Creating or enlarging swap uses disk space
-and can reduce `available-bytes-after`.
-
-Important `max` caveats:
-
-- Windows: can remove PowerShell 7, the default shell for later `run` steps.
-- macOS: can remove unselected Xcode installations.
-- Linux and Windows: can remove Docker and all runner Docker data.
-- Windows base-image Edge is preserved; its separate WebDriver can be removed.
-
-See the [component table](docs/CONFIGURATION.md#component-inputs) for IDs to
-remove or preserve.
+`max` can remove the default PowerShell 7 shell on Windows, unselected Xcode
+installations on macOS, and Docker data or build tools on Linux and Windows.
+Use `custom` first on a new platform integration, or protect required tools
+with `skip-components`.
 
 ## Runner support
 
-Supported: standard ephemeral GitHub-hosted Ubuntu, Windows, and macOS runners,
-plus `ubuntu-slim`. Self-hosted runners, larger runners, and arbitrary job
-containers are not supported. `not-found` means a cleanup target was safely
-confirmed absent. `unsupported` means the recognized runner cannot safely
-perform that operation, so its target can remain. A missing required cleanup
-utility or incomplete inventory fails closed.
+The action supports ephemeral standard GitHub-hosted Ubuntu, Windows, and
+macOS runner images, including the supported x64 and arm64 families. It also
+supports GitHub's `ubuntu-slim` container with capability-aware cleanup; that
+environment cannot manage swap, mounts, or a Docker daemon.
 
-Before cleanup, the action checks fixed runner-image metadata and validates the
-complete plan. Destructive commands use fixed executable paths, restricted
-environments, bounded inventories, and removal checks. A command timeout or the
-shared filesystem cleanup deadline stops all later cleanup.
+Self-hosted runners, larger runners, and arbitrary job containers are outside
+the support contract. The action validates the fixed runner-image metadata
+before it schedules cleanup. A component absent from a supported image is
+reported as a no-op or unsupported result rather than an error.
 
-This is a safety boundary for a fresh hosted runner, not a sandbox or signed
-runner attestation. See [runner support](docs/RUNNER-SUPPORT.md) for exact
-labels, platform limits, and the full safety boundary.
+See [runner support](docs/RUNNER-SUPPORT.md) for the exact supported-label
+matrix, platform caveats, and image-drift policy.
 
 ## Outputs
 
-| Output                   | Meaning                                                      |
-| ------------------------ | ------------------------------------------------------------ |
-| `available-bytes-before` | Available bytes on the runner system volume before cleanup.  |
-| `available-bytes-after`  | Available bytes on the runner system volume after cleanup.   |
-| `reclaimed-bytes`        | Increase in available bytes after cleanup; `0` if none.      |
-| `failed-operations`      | `0` when cleanup succeeds. A cleanup failure fails the step. |
-| `platform`               | Detected platform: `linux`, `macos`, or `windows`.           |
-| `architecture`           | Detected architecture: `x64` or `arm64`.                     |
+| Output | Meaning |
+| --- | --- |
+| `available-bytes-before` | Available bytes on the runner system volume before cleanup. |
+| `available-bytes-after` | Available bytes on the runner system volume after cleanup. |
+| `reclaimed-bytes` | Net additional available bytes after cleanup. |
+| `failed-operations` | Number of best-effort cleanup operations that failed. |
+| `platform` | Detected platform: `linux`, `macos`, or `windows`. |
+| `architecture` | Detected architecture: `x64` or `arm64`. |
 
 ## Documentation
 

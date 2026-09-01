@@ -8,7 +8,6 @@ import type { Architecture, Platform, RuntimeContext } from "./types.js";
 import {
   runCommand,
   TRUSTED_UNIX_PATH,
-  UnconfirmedCommandTerminationError,
   UNIX_SUDO_EXECUTABLE,
 } from "./command.js";
 
@@ -132,53 +131,26 @@ const SUPPORTED_VM_IMAGES: Readonly<Record<string, SupportedVmImage>> = {
   },
 };
 
-export function detectPlatform(
-  runnerOs = process.env.RUNNER_OS ?? "",
-  hostPlatform = process.platform,
-): Platform {
-  const host: Platform =
-    hostPlatform === "linux"
-      ? "linux"
-      : hostPlatform === "darwin"
-        ? "macos"
-        : hostPlatform === "win32"
-          ? "windows"
-          : (() => {
-              throw new Error(
-                `Unsupported host operating system: ${hostPlatform}`,
-              );
-            })();
-  const claimed = runnerOs.trim().toLowerCase();
-  if (claimed === "") return host;
-  if (!(["linux", "macos", "windows"] as const).includes(claimed as Platform)) {
-    throw new Error(`Unsupported RUNNER_OS value: '${runnerOs}'`);
-  }
-  if (claimed !== host) {
-    throw new Error(
-      `RUNNER_OS '${runnerOs}' does not match host platform '${hostPlatform}'`,
-    );
-  }
-  return host;
+function detectPlatform(): Platform {
+  const runnerOs = (process.env.RUNNER_OS ?? "").toLowerCase();
+  if (runnerOs === "linux") return "linux";
+  if (runnerOs === "macos") return "macos";
+  if (runnerOs === "windows") return "windows";
+
+  if (process.platform === "linux") return "linux";
+  if (process.platform === "darwin") return "macos";
+  if (process.platform === "win32") return "windows";
+  throw new Error(`Unsupported runner operating system: ${process.platform}`);
 }
 
-export function detectArchitecture(
-  runnerArchitecture = process.env.RUNNER_ARCH ?? "",
-  hostArchitecture = process.arch,
-): Architecture {
-  if (hostArchitecture !== "x64" && hostArchitecture !== "arm64") {
-    throw new Error(`Unsupported host architecture: ${hostArchitecture}`);
+function detectArchitecture(): Architecture {
+  const runnerArchitecture = (process.env.RUNNER_ARCH ?? "").toLowerCase();
+  if (runnerArchitecture === "x64") return "x64";
+  if (runnerArchitecture === "arm64") return "arm64";
+  if (process.arch === "x64" || process.arch === "arm64") {
+    return process.arch;
   }
-  const claimed = runnerArchitecture.trim().toLowerCase();
-  if (claimed === "") return hostArchitecture;
-  if (claimed !== "x64" && claimed !== "arm64") {
-    throw new Error(`Unsupported RUNNER_ARCH value: '${runnerArchitecture}'`);
-  }
-  if (claimed !== hostArchitecture) {
-    throw new Error(
-      `RUNNER_ARCH '${runnerArchitecture}' does not match host architecture '${hostArchitecture}'`,
-    );
-  }
-  return hostArchitecture;
+  throw new Error(`Unsupported runner architecture: ${process.arch}`);
 }
 
 function parseImageData(
@@ -396,7 +368,31 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
     (existsSync("/run/.containerenv") || existsSync("/.dockerenv"));
   const imageData = await readDefinitionImageData(platform);
   const isUbuntuSlim = isOfficialUbuntuSlimContainer(isContainer, imageData);
-  const hasPasswordlessSudo = await probePasswordlessSudo(platform);
+  let hasPasswordlessSudo = false;
+  if (platform !== "windows" && typeof process.getuid === "function") {
+    if (process.getuid() === 0) {
+      hasPasswordlessSudo = true;
+    } else {
+      try {
+        const result = await runCommand(
+          UNIX_SUDO_EXECUTABLE,
+          ["-n", "--", "/usr/bin/true"],
+          {
+            env: {
+              LANG: "C.UTF-8",
+              LC_ALL: "C.UTF-8",
+              PATH: TRUSTED_UNIX_PATH,
+            },
+            silent: true,
+            timeoutMs: 5_000,
+          },
+        );
+        hasPasswordlessSudo = result.exitCode === 0;
+      } catch {
+        hasPasswordlessSudo = false;
+      }
+    }
+  }
 
   return {
     platform,
@@ -428,35 +424,4 @@ export async function createRuntimeContext(): Promise<RuntimeContext> {
     isUbuntuSlim,
     hasPasswordlessSudo,
   };
-}
-
-export async function probePasswordlessSudo(
-  platform: Platform,
-  getUserId: () => number | undefined = () =>
-    typeof process.getuid === "function" ? process.getuid() : undefined,
-  execute: typeof runCommand = runCommand,
-): Promise<boolean> {
-  if (platform === "windows") return false;
-  const userId = getUserId();
-  if (userId === undefined) return false;
-  if (userId === 0) return true;
-  try {
-    const result = await execute(
-      UNIX_SUDO_EXECUTABLE,
-      ["-n", "--", "/usr/bin/true"],
-      {
-        env: {
-          LANG: "C.UTF-8",
-          LC_ALL: "C.UTF-8",
-          PATH: TRUSTED_UNIX_PATH,
-        },
-        silent: true,
-        timeoutMs: 5_000,
-      },
-    );
-    return result.exitCode === 0;
-  } catch (error) {
-    if (error instanceof UnconfirmedCommandTerminationError) throw error;
-    return false;
-  }
 }

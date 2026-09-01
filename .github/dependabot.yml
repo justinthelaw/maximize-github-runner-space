@@ -9,20 +9,20 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: pre-commit
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      pre-commit-hooks:
+        patterns:
+          - "*"
+
   - package-ecosystem: npm
     directory: "/"
     schedule:
       interval: weekly
     groups:
       javascript-action:
-        patterns:
-          - "*"
-
-  - package-ecosystem: pip
-    directory: "/.github/requirements"
-    schedule:
-      interval: weekly
-    groups:
-      python-lint-tools:
         patterns:
           - "*"

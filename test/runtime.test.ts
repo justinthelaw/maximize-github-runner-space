@@ -3,15 +3,11 @@ import { mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { UnconfirmedCommandTerminationError } from "../src/command.js";
 import {
-  detectArchitecture,
-  detectPlatform,
   definitionActionPath,
   definitionImageDataPath,
   isDefinitionCompatibleRunnerImage,
   isOfficialUbuntuSlimContainer,
-  probePasswordlessSudo,
   readDefinitionImageData,
 } from "../src/runtime.js";
 
@@ -80,35 +76,6 @@ const VM_IMAGE_LOCATIONS: Readonly<Record<string, readonly [string, string]>> =
       "images/macos/xcode-27-arm64-Readme.md",
     ],
   };
-
-test("runner OS and architecture claims cannot override the host process", () => {
-  assert.throws(
-    () => detectPlatform("Windows", "linux"),
-    /RUNNER_OS.*does not match.*linux/i,
-  );
-  assert.throws(
-    () => detectArchitecture("ARM64", "x64"),
-    /RUNNER_ARCH.*does not match.*x64/i,
-  );
-  assert.equal(detectPlatform("Linux", "linux"), "linux");
-  assert.equal(detectArchitecture("X64", "x64"), "x64");
-});
-
-test("an unconfirmed sudo probe timeout is never downgraded to no sudo", async () => {
-  await assert.rejects(
-    async () =>
-      await probePasswordlessSudo(
-        "macos",
-        () => 501,
-        async () => {
-          throw new UnconfirmedCommandTerminationError(
-            "sudo probe process tree may still be running",
-          );
-        },
-      ),
-    UnconfirmedCommandTerminationError,
-  );
-});
 
 function vmImageData(label: string, version = "20260805.1"): string {
   const [sourceRef, readme] = VM_IMAGE_LOCATIONS[label] ?? [

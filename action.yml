@@ -1,5 +1,5 @@
 name: "Maximize GitHub Runner Space"
-description: "Reclaim disk space on standard GitHub-hosted Linux, macOS, and Windows runners"
+description: "Safely reclaim disk space on standard GitHub-hosted Linux, macOS, and Windows runners"
 branding:
   icon: "crop"
   color: "blue"
@@ -14,7 +14,7 @@ inputs:
     required: false
     default: ""
   swapfile-size:
-    description: "Optional swap size on privileged Linux VMs: 0, 512MiB, 1.5GiB, or 2 (GiB); empty leaves swap unchanged"
+    description: "Optional privileged-Linux swap size: 0, 1.5GiB, 512MiB, or a plain GiB value like 2; omitted leaves swap unchanged"
     required: false
     default: ""
 
@@ -52,7 +52,7 @@ inputs:
     required: false
     default: "false"
   remove-powershell:
-    description: "Removes PowerShell where separable; preserves Windows all-users modules"
+    description: "Removes PowerShell where it is safely separable from the runner"
     required: false
     default: "false"
   remove-miniconda:
@@ -60,7 +60,7 @@ inputs:
     required: false
     default: "false"
   remove-homebrew:
-    description: "Linux: removes only ~/.cache/Homebrew. macOS: removes definition-listed packages. Preserves both prefixes"
+    description: "Runs conservative Linuxbrew cleanup or removes definition-listed macOS packages without deleting either prefix"
     required: false
     default: "false"
   remove-vcpkg:
@@ -104,7 +104,7 @@ inputs:
     required: false
     default: "false"
   remove-edge:
-    description: "Removes Microsoft Edge where safely separable; preserves Windows base-image Edge"
+    description: "Removes Microsoft Edge where installed"
     required: false
     default: "false"
   remove-firefox:
@@ -112,7 +112,7 @@ inputs:
     required: false
     default: "false"
   remove-webdrivers:
-    description: "Removes ChromeDriver, GeckoDriver, Edge WebDriver, and IEDriver artifacts"
+    description: "Removes ChromeDriver, GeckoDriver, and Edge WebDriver artifacts"
     required: false
     default: "false"
   remove-selenium:
@@ -168,7 +168,7 @@ inputs:
 
   # Containers, build tools, and languages
   remove-docker-engine:
-    description: "Stops and removes Docker Engine, helpers, and its exact Windows service; custom also removes runner data. In max, skip docker-images to keep that data"
+    description: "Stops and removes Docker Engine packages, helpers, and data where installed"
     required: false
     default: "false"
   remove-buildah:
@@ -176,11 +176,11 @@ inputs:
     required: false
     default: "false"
   remove-podman:
-    description: "Removes Podman; shared Podman/Buildah storage is removed only when both are selected"
+    description: "Removes Podman and its runner storage where installed"
     required: false
     default: "false"
   remove-maven:
-    description: "Removes Apache Maven; preserves the shared Windows ProgramData Maven cache"
+    description: "Removes Apache Maven"
     required: false
     default: "false"
   remove-gradle:
@@ -202,29 +202,29 @@ inputs:
 
   # Services and databases
   remove-postgresql:
-    description: "Removes PostgreSQL packages, runner data, and exact Windows service registrations where installed"
+    description: "Removes PostgreSQL packages and runner data where installed"
     required: false
     default: "false"
   remove-mysql:
-    description: "Linux removes MySQL/MariaDB packages and data; Windows uninstalls the runner-image MySQL CLI MSI"
+    description: "Removes MySQL/MariaDB packages and runner data where installed"
     required: false
     default: "false"
   remove-apache:
-    description: "Removes Apache HTTP Server and its exact Windows service registration where installed"
+    description: "Removes Apache HTTP Server where installed"
     required: false
     default: "false"
   remove-nginx:
-    description: "Removes Nginx and its exact Windows service registration where installed"
+    description: "Removes Nginx where installed"
     required: false
     default: "false"
 
   # Broad and platform-specific cleanup
   remove-docker-images:
-    description: "Prunes unused Docker data when the engine is kept; named volumes stay. Engine removal covers this when both are selected"
+    description: "Removes unused Docker containers, images, build cache, networks, and volumes"
     required: false
     default: "false"
   remove-large-packages:
-    description: "Purges broad Linux apt groups: .NET, LLVM, PHP, databases, cloud CLIs, browsers, PowerShell, Mono, and Mesa"
+    description: "Purges the legacy set of additional large apt packages on Linux"
     required: false
     default: "false"
   remove-xcode:
@@ -236,7 +236,7 @@ inputs:
     required: false
     default: "false"
   remove-windows-sdk:
-    description: "Removes definition-listed Visual Studio SDK/WDK components and registered standalone SDK/WDK bundles"
+    description: "Removes definition-listed Windows SDK/WDK components through the Visual Studio installer"
     required: false
     default: "false"
 
@@ -246,9 +246,9 @@ outputs:
   available-bytes-after:
     description: "Available bytes on the runner system volume after cleanup"
   reclaimed-bytes:
-    description: "Increase in available bytes after cleanup; zero if none"
+    description: "Net additional available bytes after cleanup"
   failed-operations:
-    description: "Zero when cleanup succeeds; a cleanup failure fails the step"
+    description: "Number of best-effort cleanup operations that reported failure"
   platform:
     description: "Detected platform: linux, macos, or windows"
   architecture:

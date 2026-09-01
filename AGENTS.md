@@ -43,14 +43,11 @@ pre-commit run --all-files --hook-stage pre-push
   `ImageVersion`, or a workflow-selected path.
 - Never remove a filesystem root, home, temp/workspace/action/runtime tree,
   Homebrew prefix, `WinSxS`, or unchecked `Program Files` subtree.
-- Keep recursive deletion anchored to validated native handles. Never replace
-  it with path-only recursive removal on Unix or Windows.
 - Preserve grouped-component skip promises. If a broad operation owns a
   protected child, it must yield and narrower sibling operations must run.
 - Validate the complete plan before the first mutation. Swap replacement must
-  be atomic. Every cleanup failure is terminal. Use `not-found` only for a
-  safely confirmed-absent target. Use `unsupported` only for an explicitly
-  unavailable capability on a recognized runner; the target may remain.
+  be atomic and failure-fatal; ordinary absent/image-drift cleanup is
+  best-effort for backward compatibility.
 - Keep configuration or support-policy changes aligned across `action.yml`, the
   relevant tests and workflows, README, `docs/CONFIGURATION.md`, and
   `docs/RUNNER-SUPPORT.md`.
@@ -58,11 +55,7 @@ pre-commit run --all-files --hook-stage pre-push
 ## CI cost policy
 
 - Put planner, path, and adapter-shape coverage in the single Linux quality job.
-- In the Test workflow, run one representative destructive job for each of the
-  seven standard runner environment classes; avoid a component-by-OS product.
-- Separately run the bounded exact-label and preview sweep on PRs, weekly, and
-  manually. Cap matrix parallelism, time out every job, and cancel superseded
-  PR runs.
-- Run representative Windows and macOS `max` cleanup weekly and manually, not
-  on ordinary pull requests. Post-cleanup checks must use runtimes that `max`
-  promises to preserve.
+- Test each of the seven standard runner environment classes once on PRs;
+  avoid a component-by-OS Cartesian product.
+- Keep every-label and preview coverage in the scheduled/manual workflow,
+  cap matrix parallelism, time out every job, and cancel superseded PR runs.

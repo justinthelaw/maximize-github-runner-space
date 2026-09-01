@@ -33,26 +33,13 @@ export interface CommandResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
-  /** True when captured stdout exceeded the bounded in-memory result. */
-  readonly stdoutTruncated?: boolean;
-  /** True when captured stderr exceeded the bounded in-memory result. */
-  readonly stderrTruncated?: boolean;
-  /** True when timeout handling could not confirm that the process tree ended. */
-  readonly terminationUnconfirmed?: boolean;
 }
 
 export type OperationPhase = "preflight" | "filesystem" | "package" | "system";
 
-export interface OperationExecutionContext {
-  /** Remaining milliseconds in the shared filesystem cleanup budget. */
-  readonly remainingMs: () => number;
-}
-
 export interface OperationResult {
   readonly status: "removed" | "not-found" | "unsupported" | "failed";
   readonly detail?: string;
-  /** Explicitly marks a failed result as terminal for older operation callers. */
-  readonly abortAction?: boolean;
 }
 
 export interface Operation {
@@ -74,29 +61,8 @@ export interface Operation {
   /** Abort the action when the operation cannot preserve its state contract. */
   readonly fatal?: boolean;
   /** Read-only complete-plan validation, run before any operation mutates state. */
-  readonly validate?: (execution?: OperationExecutionContext) => Promise<void>;
-  /**
-   * Read-only validation that must run after reversible preflight transitions
-   * (such as service stops) but before package or payload mutation.
-   */
-  readonly validateAfterPreflight?: (
-    execution?: OperationExecutionContext,
-  ) => Promise<void>;
-  /** Run this post-preflight validator after ordinary post-preflight checks. */
-  readonly validateAfterPreflightLast?: boolean;
-  /** Read-only guard run immediately before this operation can mutate state. */
-  readonly validateBeforeRun?: (
-    execution?: OperationExecutionContext,
-  ) => Promise<void>;
-  /** Restore reversible preflight state when a later operation fails. */
-  readonly rollback?: () => Promise<void>;
-  /**
-   * Allow only state-neutral housekeeping rollback after a payload operation
-   * may have partially mutated the runner. Service restarts must leave this
-   * false so they cannot revive a damaged installation.
-   */
-  readonly rollbackAfterPayloadMutation?: boolean;
-  run(execution?: OperationExecutionContext): Promise<OperationResult>;
+  readonly validate?: () => Promise<void>;
+  run(): Promise<OperationResult>;
 }
 
 export interface Adapter {
