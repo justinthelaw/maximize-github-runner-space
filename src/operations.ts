@@ -27,6 +27,13 @@ export interface RemovePathOptions {
   readonly coveredBy?: readonly ComponentId[];
 }
 
+export interface RemovePathDependencies {
+  readonly inspectTarget?: typeof inspectTarget;
+  readonly remove?: typeof rm;
+  readonly unlink?: typeof unlink;
+  readonly runElevated?: typeof runElevated;
+}
+
 export async function validateRemovePathTarget(
   target: string,
   allowedParents: readonly string[],
@@ -39,8 +46,13 @@ export async function removePathTarget(
   target: string,
   allowedParents: readonly string[],
   context: RuntimeContext,
+  dependencies: RemovePathDependencies = {},
 ): Promise<OperationResult> {
-  const inspected = await inspectTarget(target);
+  const inspect = dependencies.inspectTarget ?? inspectTarget;
+  const remove = dependencies.remove ?? rm;
+  const unlinkTarget = dependencies.unlink ?? unlink;
+  const elevate = dependencies.runElevated ?? runElevated;
+  const inspected = await inspect(target);
   if (!inspected.exists) return { status: "not-found" };
   try {
     await assertSafeExistingTarget(target, allowedParents, context);
@@ -51,32 +63,50 @@ export async function removePathTarget(
     };
   }
 
+  const revalidated = await inspect(target);
+  if (!revalidated.exists) return { status: "not-found" };
+  if (revalidated.isLink !== inspected.isLink) {
+    return {
+      status: "failed",
+      detail: `Cleanup target kind changed after validation: '${target}'.`,
+    };
+  }
+  const verifyRemoved = async (): Promise<OperationResult> => {
+    if ((await inspect(target)).exists) {
+      return {
+        status: "failed",
+        detail: `Cleanup target still exists after removal: '${target}'.`,
+      };
+    }
+    return { status: "removed" };
+  };
+
   try {
-    if (inspected.isLink) {
+    if (revalidated.isLink) {
       // Unlink the directory symlink/junction itself. Never give a recursive
       // remover a final link that could be swapped or followed differently.
-      await unlink(target);
+      await unlinkTarget(target);
     } else {
-      await rm(target, {
+      await remove(target, {
         recursive: true,
         force: true,
         maxRetries: 3,
         retryDelay: 100,
       });
     }
-    return { status: "removed" };
+    return await verifyRemoved();
   } catch (nodeError) {
     if (context.platform === "windows") {
       return { status: "failed", detail: (nodeError as Error).message };
     }
 
-    const result = await runElevated(
+    const result = await elevate(
       context,
       "/bin/rm",
-      [inspected.isLink ? "-f" : "-rf", "--", target],
+      [revalidated.isLink ? "-f" : "-rf", "--", target],
       { silent: true, timeoutMs: 10 * 60_000 },
     );
-    if (result.exitCode === 0) return { status: "removed" };
+    if (result.exitCode === 0) return await verifyRemoved();
     return {
       status: "failed",
       detail: result.stderr.trim() || (nodeError as Error).message,

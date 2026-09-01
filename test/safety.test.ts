@@ -15,6 +15,8 @@ import {
   createRemovePathOperation,
   executeOperations,
   prepareOperations,
+  removePathTarget,
+  type RemovePathDependencies,
 } from "../src/operations.js";
 import {
   createSwapOperation,
@@ -453,6 +455,83 @@ test("a final symlink is unlinked without deleting its destination", async () =>
     await readFile(join(outside, "sentinel"), "utf8"),
     "preserve me",
   );
+});
+
+test("path removal refuses a target whose kind changes after validation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-type-drift-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const context = {
+    ...contextFor("linux"),
+    temp: join(root, "runner-temp"),
+    workspace: undefined,
+  };
+  let unlinkCalls = 0;
+  let removeCalls = 0;
+  const inspections = [
+    { exists: true, isLink: true },
+    { exists: true, isLink: false, realPath: target },
+  ];
+
+  const dependencies: RemovePathDependencies = {
+    inspectTarget: async () => {
+      const inspected = inspections.shift();
+      assert.ok(inspected);
+      return inspected;
+    },
+    unlink: async () => {
+      unlinkCalls++;
+    },
+    remove: async () => {
+      removeCalls++;
+    },
+  };
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    context,
+    dependencies,
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(unlinkCalls, 0);
+  assert.equal(removeCalls, 0);
+});
+
+test("path removal fails when the target still exists after removal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-postcondition-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const context = {
+    ...contextFor("linux"),
+    temp: join(root, "runner-temp"),
+    workspace: undefined,
+  };
+  const inspections = Array.from({ length: 3 }, () => ({
+    exists: true,
+    isLink: false,
+    realPath: target,
+  }));
+  const dependencies: RemovePathDependencies = {
+    inspectTarget: async () => {
+      const inspected = inspections.shift();
+      assert.ok(inspected);
+      return inspected;
+    },
+    remove: async () => {},
+  };
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    context,
+    dependencies,
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /still exists/);
 });
 
 test("directory recreation rejects a final symlink", async () => {
