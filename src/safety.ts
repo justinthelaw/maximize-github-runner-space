@@ -90,17 +90,36 @@ export function assertSafeRemovalTarget(
   return api.normalize(api.resolve(target));
 }
 
-export async function inspectTarget(target: string): Promise<{
-  readonly exists: boolean;
-  readonly isLink: boolean;
-  readonly realPath?: string;
-}> {
-  try {
-    const stat = await lstat(target);
-    if (stat.isSymbolicLink()) {
-      return { exists: true, isLink: true };
+export interface TargetIdentity {
+  readonly device: bigint;
+  readonly inode: bigint;
+}
+
+export type TargetInspection =
+  | {
+      readonly exists: false;
+      readonly isLink: false;
     }
-    return { exists: true, isLink: false, realPath: await realpath(target) };
+  | {
+      readonly exists: true;
+      readonly isLink: boolean;
+      readonly realPath?: string;
+      readonly identity: TargetIdentity;
+    };
+
+export async function inspectTarget(target: string): Promise<TargetInspection> {
+  try {
+    const stat = await lstat(target, { bigint: true });
+    const identity = { device: stat.dev, inode: stat.ino };
+    if (stat.isSymbolicLink()) {
+      return { exists: true, isLink: true, identity };
+    }
+    return {
+      exists: true,
+      isLink: false,
+      realPath: await realpath(target),
+      identity,
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return { exists: false, isLink: false };

@@ -6,6 +6,7 @@ import {
   assertSafeExistingTarget,
   assertSafeRemovalTarget,
   inspectTarget,
+  type TargetInspection,
 } from "./safety.js";
 import type {
   CleanupPlan,
@@ -32,6 +33,30 @@ export interface RemovePathDependencies {
   readonly remove?: typeof rm;
   readonly unlink?: typeof unlink;
   readonly runElevated?: typeof runElevated;
+}
+
+function targetDriftFailure(
+  expected: TargetInspection,
+  current: TargetInspection,
+  target: string,
+): OperationResult | undefined {
+  if (!expected.exists || !current.exists) return undefined;
+  if (current.isLink !== expected.isLink) {
+    return {
+      status: "failed",
+      detail: `Cleanup target kind changed after validation: '${target}'.`,
+    };
+  }
+  if (
+    current.identity.device !== expected.identity.device ||
+    current.identity.inode !== expected.identity.inode
+  ) {
+    return {
+      status: "failed",
+      detail: `Cleanup target identity changed after validation: '${target}'.`,
+    };
+  }
+  return undefined;
 }
 
 export async function validateRemovePathTarget(
@@ -65,12 +90,12 @@ export async function removePathTarget(
 
   const revalidated = await inspect(target);
   if (!revalidated.exists) return { status: "not-found" };
-  if (revalidated.isLink !== inspected.isLink) {
-    return {
-      status: "failed",
-      detail: `Cleanup target kind changed after validation: '${target}'.`,
-    };
-  }
+  const revalidationFailure = targetDriftFailure(
+    inspected,
+    revalidated,
+    target,
+  );
+  if (revalidationFailure !== undefined) return revalidationFailure;
   const verifyRemoved = async (): Promise<OperationResult> => {
     if ((await inspect(target)).exists) {
       return {
@@ -100,10 +125,30 @@ export async function removePathTarget(
       return { status: "failed", detail: (nodeError as Error).message };
     }
 
+    let elevatedTarget: TargetInspection;
+    try {
+      elevatedTarget = await inspect(target);
+    } catch (inspectionError) {
+      return {
+        status: "failed",
+        detail:
+          inspectionError instanceof Error
+            ? inspectionError.message
+            : String(inspectionError),
+      };
+    }
+    if (!elevatedTarget.exists) return { status: "removed" };
+    const elevationFailure = targetDriftFailure(
+      revalidated,
+      elevatedTarget,
+      target,
+    );
+    if (elevationFailure !== undefined) return elevationFailure;
+
     const result = await elevate(
       context,
       "/bin/rm",
-      [revalidated.isLink ? "-f" : "-rf", "--", target],
+      [elevatedTarget.isLink ? "-f" : "-rf", "--", target],
       { silent: true, timeoutMs: 10 * 60_000 },
     );
     if (result.exitCode === 0) return await verifyRemoved();
