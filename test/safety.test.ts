@@ -15,6 +15,8 @@ import {
   createRemovePathOperation,
   executeOperations,
   prepareOperations,
+  removePathTarget,
+  type RemovePathDependencies,
 } from "../src/operations.js";
 import {
   createSwapOperation,
@@ -25,6 +27,7 @@ import {
 import {
   assertSafeDirectoryTarget,
   assertSafeRemovalTarget,
+  type TargetInspection,
 } from "../src/safety.js";
 import { contextFor } from "./helpers.js";
 
@@ -453,6 +456,167 @@ test("a final symlink is unlinked without deleting its destination", async () =>
     await readFile(join(outside, "sentinel"), "utf8"),
     "preserve me",
   );
+});
+
+const driftScenarios: readonly {
+  readonly name: string;
+  readonly expectedDetail: RegExp;
+  readonly localRemovalFails: boolean;
+  readonly expectedRemoveCalls: number;
+  readonly inspections: (target: string) => TargetInspection[];
+}[] = [
+  {
+    name: "path removal refuses a target whose kind changes after validation",
+    expectedDetail: /kind changed/,
+    localRemovalFails: false,
+    expectedRemoveCalls: 0,
+    inspections: (target) => [
+      {
+        exists: true,
+        isLink: true,
+        identity: { device: 1n, inode: 1n },
+      },
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 1n },
+      },
+      { exists: false, isLink: false },
+    ],
+  },
+  {
+    name: "path removal refuses a target whose identity changes after validation",
+    expectedDetail: /identity changed/,
+    localRemovalFails: false,
+    expectedRemoveCalls: 0,
+    inspections: (target) => [
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 1n },
+      },
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 2n },
+      },
+      { exists: false, isLink: false },
+    ],
+  },
+  {
+    name: "path removal rechecks target identity before elevated removal",
+    expectedDetail: /identity changed/,
+    localRemovalFails: true,
+    expectedRemoveCalls: 1,
+    inspections: (target) => [
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 1n },
+      },
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 1n },
+      },
+      {
+        exists: true,
+        isLink: false,
+        realPath: target,
+        identity: { device: 1n, inode: 2n },
+      },
+      { exists: false, isLink: false },
+    ],
+  },
+];
+
+for (const scenario of driftScenarios) {
+  test(scenario.name, async () => {
+    const root = await mkdtemp(join(tmpdir(), "maximize-space-drift-"));
+    const allowed = join(root, "allowed");
+    const target = join(allowed, "target");
+    await mkdir(target, { recursive: true });
+    const inspections = scenario.inspections(target);
+    let removeCalls = 0;
+    let unlinkCalls = 0;
+    let elevatedCalls = 0;
+    const dependencies: RemovePathDependencies = {
+      inspectTarget: async () => {
+        const inspected = inspections.shift();
+        assert.ok(inspected);
+        return inspected;
+      },
+      remove: async () => {
+        removeCalls++;
+        if (scenario.localRemovalFails) throw new Error("permission denied");
+      },
+      unlink: async () => {
+        unlinkCalls++;
+      },
+      runElevated: async () => {
+        elevatedCalls++;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const result = await removePathTarget(
+      target,
+      [allowed],
+      {
+        ...contextFor("linux"),
+        temp: join(root, "runner-temp"),
+        workspace: undefined,
+      },
+      dependencies,
+    );
+
+    assert.equal(result.status, "failed");
+    assert.match(result.detail ?? "", scenario.expectedDetail);
+    assert.equal(removeCalls, scenario.expectedRemoveCalls);
+    assert.equal(unlinkCalls, 0);
+    assert.equal(elevatedCalls, 0);
+  });
+}
+
+test("path removal fails when the target still exists after removal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-postcondition-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const context = {
+    ...contextFor("linux"),
+    temp: join(root, "runner-temp"),
+    workspace: undefined,
+  };
+  const inspections: TargetInspection[] = Array.from({ length: 3 }, () => ({
+    exists: true,
+    isLink: false,
+    realPath: target,
+    identity: { device: 1n, inode: 1n },
+  }));
+  const dependencies: RemovePathDependencies = {
+    inspectTarget: async () => {
+      const inspected = inspections.shift();
+      assert.ok(inspected);
+      return inspected;
+    },
+    remove: async () => {},
+  };
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    context,
+    dependencies,
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /still exists/);
 });
 
 test("directory recreation rejects a final symlink", async () => {

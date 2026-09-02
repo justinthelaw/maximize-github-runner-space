@@ -89,6 +89,33 @@ test("package uninstallers run before their filesystem payloads disappear", asyn
   ]);
 });
 
+test("filesystem mutations run serially", async () => {
+  let active = 0;
+  let maximumActive = 0;
+  const sharedTurn = new Promise<void>((resolve) => setImmediate(resolve));
+  const filesystemOperation = (id: string): Operation =>
+    createFunctionOperation({
+      id,
+      component: "java",
+      description: id,
+      phase: "filesystem",
+      run: async () => {
+        active++;
+        maximumActive = Math.max(maximumActive, active);
+        await sharedTurn;
+        active--;
+        return { status: "removed" };
+      },
+    });
+
+  await executeOperations([
+    filesystemOperation("first"),
+    filesystemOperation("second"),
+  ]);
+
+  assert.equal(maximumActive, 1);
+});
+
 test("a narrower fallback runs unless its broad operation removed the payload", async () => {
   for (const [broadStatus, expectedOrder] of [
     ["removed", ["visual-studio", "unrelated"]],
