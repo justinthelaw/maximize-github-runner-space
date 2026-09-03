@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
   access,
   lstat,
@@ -14,6 +14,8 @@ import { COMPONENTS } from "../components.js";
 import {
   createFunctionOperation,
   createRemovePathOperation,
+  removePathTarget,
+  validateRemovePathTarget,
 } from "../operations.js";
 import { assertSafeDirectoryTarget } from "../safety.js";
 import type {
@@ -28,6 +30,9 @@ import type {
 } from "../types.js";
 
 const APPLICATIONS_ROOT = "/Applications";
+const XCODE_ALIAS = `${APPLICATIONS_ROOT}/Xcode.app`;
+const COMMAND_LINE_TOOLS_DEVELOPER_DIRECTORY =
+  "/Library/Developer/CommandLineTools";
 const LOCAL_ROOT = "/usr/local";
 const LOCAL_BIN = `${LOCAL_ROOT}/bin`;
 const LOCAL_SHARE = `${LOCAL_ROOT}/share`;
@@ -213,6 +218,11 @@ export interface MacOSAdapterDependencies {
   readonly createBrewConfigRoot?: BrewConfigRootCreator;
   readonly removeBrewConfigRoot?: BrewConfigRootRemover;
   readonly validateBrewConfigRoot?: BrewConfigRootValidator;
+  readonly runXcodeSelect?: () => Promise<CommandResult>;
+  readonly resolveXcodePath?: (path: string) => Promise<string | undefined>;
+  readonly listApplications?: () => Promise<readonly Dirent[]>;
+  readonly validateXcodeRemoval?: typeof validateRemovePathTarget;
+  readonly removeXcodeTarget?: typeof removePathTarget;
 }
 
 export type BrewConfigRootCreator = (prefix: string) => Promise<string>;
@@ -836,51 +846,319 @@ async function resolvedPath(value: string): Promise<string | undefined> {
   }
 }
 
-async function xcodeOperations(
-  context: RuntimeContext,
-): Promise<readonly Operation[]> {
-  let selected;
+interface XcodeBundleSelection {
+  readonly kind: "xcode";
+  readonly developerDirectory: string;
+  readonly selectedSpellingBundle: string;
+  readonly selectedBundle: string;
+}
+
+interface CommandLineToolsSelection {
+  readonly kind: "command-line-tools";
+  readonly developerDirectory: string;
+  readonly resolvedDeveloperDirectory: string;
+  readonly xcodeAliasResolvedPath: string | undefined;
+}
+
+type XcodeSelection = XcodeBundleSelection | CommandLineToolsSelection;
+
+type XcodeSelectionSnapshot =
+  { readonly selection: XcodeSelection } | { readonly failure: string };
+
+function boundedXcodeFailure(detail: string): string {
+  return detail.slice(0, 2_000);
+}
+
+async function discoverXcodeSelection(
+  runXcodeSelect: () => Promise<CommandResult>,
+  resolveXcodePath: (path: string) => Promise<string | undefined>,
+): Promise<XcodeSelectionSnapshot> {
+  let selected: CommandResult;
   try {
-    selected = await runCommand("/usr/bin/xcode-select", ["--print-path"], {
-      silent: true,
-      timeoutMs: 10_000,
-    });
+    selected = await runXcodeSelect();
   } catch (error) {
-    return [
-      xcodeFailureOperation(
-        `xcode-select is unavailable; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to identify the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
       ),
-    ];
+    };
   }
 
-  const selectedDeveloper = selected.stdout.trim();
+  const value = selected.stdout.trim();
   if (
     selected.exitCode !== 0 ||
-    selectedDeveloper === "" ||
-    selectedDeveloper.length > 1024 ||
-    !isAbsolute(selectedDeveloper)
+    selected.stdoutTruncated === true ||
+    value === "" ||
+    value.length > 1024 ||
+    !isAbsolute(value)
   ) {
-    return [
-      xcodeFailureOperation(
-        "Unable to identify the xcode-select developer directory; no Xcode bundle was removed.",
-      ),
-    ];
+    return {
+      failure:
+        "Unable to identify the current Xcode selection; no Xcode bundle was removed.",
+    };
   }
 
-  const preserved = new Set<string>([join(APPLICATIONS_ROOT, "Xcode.app")]);
-  const selectedBundle = xcodeBundleFromPath(selectedDeveloper);
-  if (selectedBundle !== undefined) preserved.add(normalize(selectedBundle));
+  const developerDirectory = normalize(value);
+  const selectedSpellingBundle = xcodeBundleFromPath(developerDirectory);
+  const commandLineToolsSelected =
+    selectedSpellingBundle === undefined &&
+    developerDirectory === COMMAND_LINE_TOOLS_DEVELOPER_DIRECTORY;
+  if (selectedSpellingBundle === undefined && !commandLineToolsSelected) {
+    return {
+      failure:
+        "Unable to identify the selected Xcode bundle; no Xcode bundle was removed.",
+    };
+  }
+  const selectionResolutionPath = selectedSpellingBundle ?? XCODE_ALIAS;
+
+  let resolvedDeveloper: string | undefined;
+  let resolvedSpellingBundle: string | undefined;
+  try {
+    resolvedDeveloper = await resolveXcodePath(developerDirectory);
+    resolvedSpellingBundle = await resolveXcodePath(selectionResolutionPath);
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to resolve the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  if (resolvedDeveloper === undefined) {
+    return {
+      failure:
+        "Xcode selection changed or could not be resolved safely; no Xcode bundle was removed.",
+    };
+  }
+  const resolvedDeveloperDirectory = normalize(resolvedDeveloper);
+  const xcodeAliasResolvedPath =
+    resolvedSpellingBundle === undefined
+      ? undefined
+      : normalize(resolvedSpellingBundle);
+  const developerBundle = xcodeBundleFromPath(resolvedDeveloperDirectory);
+  const selectedBundle =
+    xcodeAliasResolvedPath === undefined
+      ? undefined
+      : xcodeBundleFromPath(xcodeAliasResolvedPath);
+  if (
+    selectedSpellingBundle !== undefined &&
+    (developerBundle === undefined ||
+      selectedBundle === undefined ||
+      normalize(developerBundle) !== normalize(selectedBundle))
+  ) {
+    return {
+      failure:
+        "Xcode selection changed or could not be resolved safely; no Xcode bundle was removed.",
+    };
+  }
+
+  let closingSelection: CommandResult;
+  try {
+    closingSelection = await runXcodeSelect();
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const closingValue = closingSelection.stdout.trim();
+  if (
+    closingSelection.exitCode !== 0 ||
+    closingSelection.stdoutTruncated === true ||
+    closingValue === "" ||
+    closingValue.length > 1024 ||
+    !isAbsolute(closingValue) ||
+    normalize(closingValue) !== developerDirectory
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+    };
+  }
+
+  let closingResolvedDeveloper: string | undefined;
+  let closingResolvedSpellingBundle: string | undefined;
+  try {
+    closingResolvedDeveloper = await resolveXcodePath(developerDirectory);
+    closingResolvedSpellingBundle = await resolveXcodePath(
+      selectionResolutionPath,
+    );
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the resolved Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const closingResolvedDeveloperDirectory =
+    closingResolvedDeveloper === undefined
+      ? undefined
+      : normalize(closingResolvedDeveloper);
+  const closingXcodeAliasResolvedPath =
+    closingResolvedSpellingBundle === undefined
+      ? undefined
+      : normalize(closingResolvedSpellingBundle);
+  const closingDeveloperBundle =
+    closingResolvedDeveloperDirectory === undefined
+      ? undefined
+      : xcodeBundleFromPath(closingResolvedDeveloperDirectory);
+  const closingSelectedBundle =
+    closingXcodeAliasResolvedPath === undefined
+      ? undefined
+      : xcodeBundleFromPath(closingXcodeAliasResolvedPath);
+
+  let finalSelection: CommandResult;
+  try {
+    finalSelection = await runXcodeSelect();
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const finalValue = finalSelection.stdout.trim();
+  if (
+    finalSelection.exitCode !== 0 ||
+    finalSelection.stdoutTruncated === true ||
+    finalValue === "" ||
+    finalValue.length > 1024 ||
+    !isAbsolute(finalValue) ||
+    normalize(finalValue) !== developerDirectory
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+    };
+  }
+
+  if (selectedSpellingBundle === undefined) {
+    if (
+      closingResolvedDeveloperDirectory === undefined ||
+      closingResolvedDeveloperDirectory !== resolvedDeveloperDirectory ||
+      closingXcodeAliasResolvedPath !== xcodeAliasResolvedPath
+    ) {
+      return {
+        failure:
+          "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+      };
+    }
+
+    return {
+      selection: {
+        kind: "command-line-tools",
+        developerDirectory,
+        resolvedDeveloperDirectory,
+        xcodeAliasResolvedPath,
+      },
+    };
+  }
+
+  if (
+    closingDeveloperBundle === undefined ||
+    closingSelectedBundle === undefined ||
+    developerBundle === undefined ||
+    selectedBundle === undefined ||
+    normalize(closingDeveloperBundle) !== normalize(closingSelectedBundle) ||
+    normalize(closingDeveloperBundle) !== normalize(developerBundle) ||
+    normalize(closingSelectedBundle) !== normalize(selectedBundle)
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+    };
+  }
+
+  return {
+    selection: {
+      kind: "xcode",
+      developerDirectory,
+      selectedSpellingBundle: normalize(selectedSpellingBundle),
+      selectedBundle: normalize(selectedBundle),
+    },
+  };
+}
+
+function xcodeSelectionChanged(
+  expected: XcodeSelection,
+  current: XcodeSelection,
+): boolean {
+  if (
+    expected.kind !== current.kind ||
+    expected.developerDirectory !== current.developerDirectory
+  ) {
+    return true;
+  }
+  if (expected.kind === "xcode") {
+    return (
+      current.kind !== "xcode" ||
+      expected.selectedSpellingBundle !== current.selectedSpellingBundle ||
+      expected.selectedBundle !== current.selectedBundle
+    );
+  }
+  return (
+    current.kind !== "command-line-tools" ||
+    expected.resolvedDeveloperDirectory !==
+      current.resolvedDeveloperDirectory ||
+    expected.xcodeAliasResolvedPath !== current.xcodeAliasResolvedPath
+  );
+}
+
+function protectedXcodeBundles(selection: XcodeSelection): Set<string> {
+  const protectedBundles = new Set<string>([XCODE_ALIAS]);
+  if (selection.kind === "xcode") {
+    protectedBundles.add(selection.selectedSpellingBundle);
+    protectedBundles.add(selection.selectedBundle);
+    return protectedBundles;
+  }
+
+  for (const resolved of [
+    selection.resolvedDeveloperDirectory,
+    selection.xcodeAliasResolvedPath,
+  ]) {
+    if (resolved === undefined) continue;
+    const bundle = xcodeBundleFromPath(resolved);
+    if (bundle !== undefined) protectedBundles.add(normalize(bundle));
+  }
+  return protectedBundles;
+}
+
+async function xcodeOperations(
+  context: RuntimeContext,
+  dependencies: Required<
+    Pick<
+      MacOSAdapterDependencies,
+      | "runXcodeSelect"
+      | "resolveXcodePath"
+      | "listApplications"
+      | "validateXcodeRemoval"
+      | "removeXcodeTarget"
+    >
+  >,
+): Promise<readonly Operation[]> {
+  const initial = await discoverXcodeSelection(
+    dependencies.runXcodeSelect,
+    dependencies.resolveXcodePath,
+  );
+  if ("failure" in initial) return [xcodeFailureOperation(initial.failure)];
+
+  const preserved = protectedXcodeBundles(initial.selection);
 
   // Preserve both the selected spelling and its real bundle. Xcode.app is a
-  // runner-image convenience symlink; preserving its target avoids leaving it
-  // dangling when xcode-select points at CommandLineTools instead.
+  // runner-image convenience alias, so its target is preserved even when the
+  // active developer directory is the standalone Command Line Tools tree.
   for (const path of [
-    selectedDeveloper,
-    selectedBundle,
-    "/Applications/Xcode.app",
+    ...(initial.selection.kind === "xcode"
+      ? [initial.selection.selectedSpellingBundle]
+      : []),
+    XCODE_ALIAS,
   ]) {
-    if (path === undefined) continue;
-    const resolved = await resolvedPath(path);
+    let resolved: string | undefined;
+    try {
+      resolved = await dependencies.resolveXcodePath(path);
+    } catch {
+      continue;
+    }
     if (resolved === undefined) continue;
     const bundle = xcodeBundleFromPath(resolved);
     if (bundle !== undefined) preserved.add(normalize(bundle));
@@ -888,7 +1166,7 @@ async function xcodeOperations(
 
   let entries;
   try {
-    entries = await readdir(APPLICATIONS_ROOT, { withFileTypes: true });
+    entries = await dependencies.listApplications();
   } catch (error) {
     return [
       xcodeFailureOperation(
@@ -898,16 +1176,29 @@ async function xcodeOperations(
   }
 
   const operations: Operation[] = [];
-  for (const entry of entries) {
-    if (
-      (!entry.isDirectory() && !entry.isSymbolicLink()) ||
-      !/^Xcode_[0-9][A-Za-z0-9._-]{0,63}\.app$/.test(entry.name)
-    ) {
-      continue;
-    }
+  const candidates = entries
+    .filter(
+      (entry) =>
+        (entry.isDirectory() || entry.isSymbolicLink()) &&
+        /^Xcode_[0-9][A-Za-z0-9._-]{0,63}\.app$/.test(entry.name),
+    )
+    // Remove aliases before backing bundles so this cleanup cannot turn a
+    // later alias into a broken link before its own operation runs.
+    .sort(
+      (left, right) =>
+        Number(right.isSymbolicLink()) - Number(left.isSymbolicLink()),
+    );
+  for (const entry of candidates) {
+    const candidateWasLink = entry.isSymbolicLink();
 
     const target = normalize(join(APPLICATIONS_ROOT, entry.name));
-    const targetRealPath = await resolvedPath(target);
+    let targetRealPath: string | undefined;
+    try {
+      targetRealPath = await dependencies.resolveXcodePath(target);
+    } catch {
+      // Keep the operation so its run-time guard reports a bounded failure if
+      // the target still cannot be resolved immediately before removal.
+    }
     if (
       preserved.has(target) ||
       (targetRealPath !== undefined && preserved.has(targetRealPath))
@@ -915,16 +1206,136 @@ async function xcodeOperations(
       continue;
     }
 
-    operations.push(
-      createRemovePathOperation({
-        id: `xcode:${entry.name}`,
-        component: "xcode",
-        description: `Remove non-selected ${entry.name}`,
-        target,
-        allowedParents: [APPLICATIONS_ROOT],
-        context,
-      }),
-    );
+    let validationSnapshot: XcodeSelectionSnapshot | undefined;
+    operations.push({
+      id: `xcode:${entry.name}`,
+      component: "xcode",
+      description: `Remove non-selected ${entry.name}`,
+      phase: "filesystem",
+      dedupeKey: `path:${target}`,
+      validate: async () => {
+        await dependencies.validateXcodeRemoval(
+          target,
+          [APPLICATIONS_ROOT],
+          context,
+        );
+        validationSnapshot ??= await discoverXcodeSelection(
+          dependencies.runXcodeSelect,
+          dependencies.resolveXcodePath,
+        );
+      },
+      run: async (): Promise<OperationResult> => {
+        if (validationSnapshot === undefined) {
+          return {
+            status: "failed",
+            detail:
+              "Xcode plan-validation snapshot is unavailable; no Xcode bundle was removed.",
+          };
+        }
+        if ("failure" in validationSnapshot) {
+          return { status: "failed", detail: validationSnapshot.failure };
+        }
+        const expectedSelection = validationSnapshot.selection;
+
+        let resolvedTarget: string | undefined;
+        try {
+          resolvedTarget = await dependencies.resolveXcodePath(target);
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: boundedXcodeFailure(
+              `Unable to resolve the Xcode removal target; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+            ),
+          };
+        }
+        if (resolvedTarget === undefined && !candidateWasLink) {
+          return {
+            status: "failed",
+            detail:
+              "Unable to resolve the Xcode removal target; no Xcode bundle was removed.",
+          };
+        }
+        try {
+          await dependencies.validateXcodeRemoval(
+            target,
+            [APPLICATIONS_ROOT],
+            context,
+          );
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: boundedXcodeFailure(
+              `Unable to validate the Xcode removal target; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+            ),
+          };
+        }
+
+        const assertSelectionStillSafe = async (
+          currentResolvedTarget: string | undefined,
+          isLink = false,
+        ): Promise<void> => {
+          if (currentResolvedTarget === undefined && !isLink) {
+            throw new Error(
+              "Unable to resolve the Xcode removal target; no Xcode bundle was removed.",
+            );
+          }
+          const current = await discoverXcodeSelection(
+            dependencies.runXcodeSelect,
+            dependencies.resolveXcodePath,
+          );
+          if ("failure" in current) throw new Error(current.failure);
+          if (xcodeSelectionChanged(expectedSelection, current.selection)) {
+            throw new Error(
+              "Xcode selection changed after plan validation; no Xcode bundle was removed.",
+            );
+          }
+          const normalizedResolvedTarget =
+            currentResolvedTarget === undefined
+              ? undefined
+              : normalize(currentResolvedTarget);
+          const currentProtectedBundles = protectedXcodeBundles(
+            current.selection,
+          );
+          if (
+            currentProtectedBundles.has(target) ||
+            (normalizedResolvedTarget !== undefined &&
+              currentProtectedBundles.has(normalizedResolvedTarget))
+          ) {
+            throw new Error(
+              "Xcode selection changed or the removal target now aliases the selected bundle; no Xcode bundle was removed.",
+            );
+          }
+        };
+
+        // Preserve the existing early run-time check for injected removers,
+        // then repeat it inside removePathTarget after its filesystem safety
+        // pass and immediately before each local or elevated mutation.
+        try {
+          await assertSelectionStillSafe(resolvedTarget, candidateWasLink);
+        } catch (error) {
+          return {
+            status: "failed",
+            detail: boundedXcodeFailure(
+              error instanceof Error ? error.message : String(error),
+            ),
+          };
+        }
+
+        return await dependencies.removeXcodeTarget(
+          target,
+          [APPLICATIONS_ROOT],
+          context,
+          {
+            beforeMutation: async (_boundary, inspection) => {
+              await assertSelectionStillSafe(
+                inspection.realPath,
+                inspection.isLink,
+              );
+            },
+          },
+        );
+      },
+    });
   }
 
   if (operations.length === 0) {
@@ -956,6 +1367,22 @@ export async function createMacOSAdapter(
     dependencies.removeBrewConfigRoot ?? NODE_BREW_CONFIG_ROOT_REMOVER;
   const validateBrewConfigRoot =
     dependencies.validateBrewConfigRoot ?? validateDefinitionBrewConfigRoot;
+  const xcodeDependencies = {
+    runXcodeSelect:
+      dependencies.runXcodeSelect ??
+      (async () =>
+        await runCommand("/usr/bin/xcode-select", ["--print-path"], {
+          silent: true,
+          timeoutMs: 10_000,
+        })),
+    resolveXcodePath: dependencies.resolveXcodePath ?? resolvedPath,
+    listApplications:
+      dependencies.listApplications ??
+      (async () => await readdir(APPLICATIONS_ROOT, { withFileTypes: true })),
+    validateXcodeRemoval:
+      dependencies.validateXcodeRemoval ?? validateRemovePathTarget,
+    removeXcodeTarget: dependencies.removeXcodeTarget ?? removePathTarget,
+  };
   const brew = await resolveBrew(context.architecture);
   let brewConfigRoot: string | undefined;
   const environment = (): NodeJS.ProcessEnv => brewEnvironment(brewConfigRoot);
@@ -1065,6 +1492,19 @@ export async function createMacOSAdapter(
           "Remove .NET executable link",
         ],
         ["android", androidRoot, [androidParent], "Remove Android SDK and NDK"],
+        [
+          "android",
+          join(safeHome, ".android"),
+          [safeHome],
+          "Remove Android user state",
+        ],
+        [
+          "gradle",
+          join(safeHome, ".gradle"),
+          [safeHome],
+          "Remove Gradle user home",
+          ["android"],
+        ],
         [
           "codeql",
           join(toolCache, "CodeQL"),
@@ -1181,6 +1621,12 @@ export async function createMacOSAdapter(
           join(LOCAL_BIN, "azcopy"),
           [LOCAL_BIN],
           "Remove AzCopy executable",
+        ],
+        [
+          "azure-cli",
+          join(safeHome, ".azure", "cliextensions", "azure-devops"),
+          [safeHome],
+          "Remove Azure DevOps CLI extension",
         ],
         ["rust", join(safeHome, ".cargo"), [safeHome], "Remove Cargo home"],
         [
@@ -1309,7 +1755,7 @@ export async function createMacOSAdapter(
       }
 
       if (plan.enabled.has("xcode")) {
-        operations.push(...(await xcodeOperations(context)));
+        operations.push(...(await xcodeOperations(context, xcodeDependencies)));
       }
 
       const usesHomebrew =

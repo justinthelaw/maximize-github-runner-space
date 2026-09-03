@@ -53,7 +53,7 @@ On Linux, `swapfile-size` works only on a privileged VM. Container, macOS, and W
 
 ## Safety and result semantics
 
-The complete cleanup plan is validated before its first mutation. Deletion targets are derived from runner context, native package metadata, resolved executables, or bounded runner-image definitions; protected roots and unsafe paths are rejected.
+The complete cleanup plan is validated before its first mutation. Deletion targets are derived from runner context, native package metadata, resolved executables, or bounded runner-image definitions; protected roots and unsafe paths are rejected. On Linux, recursive removal also refuses any target that is a mount point or contains a mounted filesystem.
 
 Invalid profile or component names, an unsupported runner identity, an invalid swap request, a failed swap transaction, and a required service stop failure are fatal. Swap replacement rolls back when it cannot safely complete. On macOS, selecting Homebrew cleanup or a Homebrew-owned component makes Homebrew configuration validation and preparation a fatal preflight requirement; failure stops cleanup.
 
@@ -61,6 +61,11 @@ Ordinary removal is best-effort for compatibility with existing workflows. Each 
 
 ## Image drift and CI coverage
 
-Runner images change independently of action releases. Use a full action commit SHA for immutable execution; `v0.12.2` is the next readable release tag. Pinning an explicit runner label reduces surprises from `-latest`, but does not freeze GitHub's regularly refreshed image inventory. Track the official runner-images [latest-image migration process](https://github.com/actions/runner-images#latest-migration-process), [support policy](https://github.com/actions/runner-images#support-policy), and [available images](https://github.com/actions/runner-images#available-images). Treat an absent component as a normal image variation and re-measure reclaimed space after image changes.
+Runner images change independently of action releases. Use `v0.12.3` as a readable release pin or a full action commit SHA as an immutable pin. Pinning an explicit runner label reduces surprises from `-latest`, but does not freeze GitHub's regularly refreshed image inventory. Track the official runner-images [latest-image migration process](https://github.com/actions/runner-images#latest-migration-process), [support policy](https://github.com/actions/runner-images#support-policy), and [available images](https://github.com/actions/runner-images#available-images). Treat an absent component as a normal image variation and re-measure reclaimed space after image changes.
 
-Pull requests run deterministic quality checks, Ubuntu swap/skip coverage, and representative destructive smoke tests for the remaining runner families. The scheduled/manual compatibility workflow covers the exact labels above. The project keeps component behavior and safety checks in fast tests rather than running every component against every operating-system image.
+Pull requests run deterministic quality checks, Ubuntu swap/skip coverage, and representative destructive smoke tests for the remaining runner families. Those smoke jobs assert the numeric output contracts and zero failed operations. Windows smoke also validates, without mutation, that the hosted image exposes a Visual Studio inventory and an eligible standalone SDK registration through the action's strict parser. The scheduled/manual compatibility workflow keeps the exact 18-label matrix above to bounded native-adapter cleanup; scheduled runs never execute default `max`. A manual dispatch also runs a fresh-runner, seven-class no-input default-max matrix covering `ubuntu-latest`, `ubuntu-24.04-arm`, `ubuntu-slim`, `windows-latest`, `windows-11-arm`, `macos-latest`, and `macos-15-intel`. The generated-dist job must pass before the dispatch-only default-max jobs start, so every default invocation exercises the committed bundle on a fresh runner.
+
+A release requires green PR CI, completed automated review, the manual
+seven-class default-max matrix, and the 18-label bounded compatibility sweep.
+The project keeps component behavior and safety checks in fast tests rather
+than running every component against every operating-system image.

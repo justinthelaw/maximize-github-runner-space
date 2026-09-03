@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
-import { access, lstat, mkdtemp, rm } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import test from "node:test";
+import type { RemovePathDependencies } from "../src/operations.js";
 import {
   createLinuxAdapter,
   createLinuxHomebrewCleanupOperation,
@@ -22,6 +31,10 @@ function commandResult(
   stderr = "",
 ): CommandResult {
   return { exitCode, stdout, stderr };
+}
+
+function linuxMountInfoLine(mountPoint: string): string {
+  return `36 25 0:32 / ${mountPoint} rw,relatime - ext4 /dev/root rw`;
 }
 
 test("Linux service commands ignore workflow-selected D-Bus endpoints", () => {
@@ -298,7 +311,7 @@ test("Linux Homebrew cleanup preserves the prefix and workflow-installed package
   }
   assert.equal(result?.status, "removed");
   assert.equal(calls.length, 1);
-  assert.equal(calls[0]?.executable, "/home/linuxbrew/.linuxbrew/bin/brew");
+  assert.equal(calls[0]?.executable, executable);
   assert.deepEqual(calls[0]?.args, ["cleanup", "--prune=120"]);
   assert.equal(
     calls[0]?.environment.HOMEBREW_PREFIX,
@@ -366,6 +379,57 @@ test("Linux Homebrew cleanup rejects configuration that can override safe paths"
     "/etc/homebrew/brew.env",
     "/home/linuxbrew/.linuxbrew/etc/homebrew/brew.env",
   ]);
+});
+
+test("Linux Homebrew cleanup rechecks fixed configuration after temp setup", async () => {
+  const executable = "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew";
+  let configDirectory: string | undefined;
+  let configAppeared = false;
+  let executed = false;
+  let removed = false;
+  const operation = createLinuxHomebrewCleanupOperation(
+    contextFor("linux"),
+    async () => ({ executable }),
+    async () => {
+      executed = true;
+      return commandResult("");
+    },
+    async (path) =>
+      configAppeared && path === "/etc/homebrew/brew.env"
+        ? { isFile: () => true, isSymbolicLink: () => false }
+        : undefined,
+    async () => {
+      configDirectory = await mkdtemp(
+        "/tmp/maximize-github-runner-space-brew-config-",
+      );
+      configAppeared = true;
+      return configDirectory;
+    },
+    async (path) => {
+      assert.equal(path, configDirectory);
+      await rm(path, { recursive: true, force: true });
+      removed = true;
+    },
+  );
+  assert.ok(operation.validate);
+
+  try {
+    await operation.validate();
+    const result = await operation.run();
+    assert.equal(result.status, "unsupported");
+    assert.match(
+      result.detail ?? "",
+      /configuration can override cleanup paths/,
+    );
+    assert.equal(executed, false);
+    assert.equal(removed, true);
+    assert.ok(configDirectory);
+    await assert.rejects(access(configDirectory), { code: "ENOENT" });
+  } finally {
+    if (configDirectory !== undefined) {
+      await rm(configDirectory, { recursive: true, force: true });
+    }
+  }
 });
 
 test("Linux Homebrew cleanup fails closed if its executable changes", async () => {
@@ -458,6 +522,7 @@ test("Linux Homebrew cleanup fails closed if the verified file identity changes"
       inode,
       size: 1024n,
       modifiedNanoseconds: 3n,
+      changedNanoseconds: 4n,
     },
   });
   const operation = createLinuxHomebrewCleanupOperation(
@@ -475,3 +540,172 @@ test("Linux Homebrew cleanup fails closed if the verified file identity changes"
   assert.equal(result.status, "failed");
   assert.equal(executed, false);
 });
+
+test("Linux Homebrew cleanup detects an executable ctime-only change", async () => {
+  const executable = "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew";
+  let resolveCalls = 0;
+  let executed = false;
+  let configDirectory: string | undefined;
+  const resolved = (changedNanoseconds: bigint) => ({
+    executable,
+    identity: {
+      device: 1n,
+      inode: 2n,
+      size: 1024n,
+      modifiedNanoseconds: 3n,
+      changedNanoseconds,
+    },
+  });
+  const operation = createLinuxHomebrewCleanupOperation(
+    contextFor("linux"),
+    async () => resolved(++resolveCalls < 3 ? 4n : 5n),
+    async () => {
+      executed = true;
+      return commandResult("");
+    },
+    async () => undefined,
+    async () => {
+      configDirectory = await mkdtemp(
+        "/tmp/maximize-github-runner-space-brew-config-",
+      );
+      return configDirectory;
+    },
+  );
+  assert.ok(operation.validate);
+
+  try {
+    await operation.validate();
+    const result = await operation.run();
+
+    assert.equal(result.status, "failed");
+    assert.match(result.detail ?? "", /executable changed.*before execution/i);
+    assert.equal(resolveCalls, 3);
+    assert.equal(executed, false);
+    assert.ok(configDirectory);
+    await assert.rejects(access(configDirectory), { code: "ENOENT" });
+  } finally {
+    if (configDirectory !== undefined) {
+      await rm(configDirectory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Linux Homebrew cleanup rechecks its resolved executable adjacent to spawn", async () => {
+  const executable = "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew";
+  let resolveCalls = 0;
+  let executed = false;
+  let configDirectory: string | undefined;
+  const resolved = (inode: bigint): ResolvedLinuxBrew => ({
+    executable,
+    identity: {
+      device: 1n,
+      inode,
+      size: 1024n,
+      modifiedNanoseconds: 3n,
+      changedNanoseconds: 4n,
+    },
+  });
+  const operation = createLinuxHomebrewCleanupOperation(
+    contextFor("linux"),
+    async () => resolved(++resolveCalls < 3 ? 2n : 4n),
+    async () => {
+      executed = true;
+      return commandResult("");
+    },
+    async () => undefined,
+    async () => {
+      configDirectory = await mkdtemp(
+        "/tmp/maximize-github-runner-space-brew-config-",
+      );
+      return configDirectory;
+    },
+  );
+  assert.ok(operation.validate);
+
+  try {
+    await operation.validate();
+    const result = await operation.run();
+    assert.equal(result.status, "failed");
+    assert.match(result.detail ?? "", /executable changed.*before execution/i);
+    assert.equal(resolveCalls, 3);
+    assert.equal(executed, false);
+    assert.ok(configDirectory);
+    await assert.rejects(access(configDirectory), { code: "ENOENT" });
+  } finally {
+    if (configDirectory !== undefined) {
+      await rm(configDirectory, { recursive: true, force: true });
+    }
+  }
+});
+
+for (const mountedPath of ["target", "descendant"] as const) {
+  test(`Linux Homebrew temporary config cleanup rejects ${mountedPath} mount drift`, async () => {
+    const createWithRemovalDependencies =
+      createLinuxHomebrewCleanupOperation as unknown as (
+        ...args: unknown[]
+      ) => ReturnType<typeof createLinuxHomebrewCleanupOperation>;
+    let configDirectory: string | undefined;
+    let sentinel: string | undefined;
+    let mountReads = 0;
+    let recursiveRemovals = 0;
+    let elevatedRemovals = 0;
+    const removalDependencies: RemovePathDependencies = {
+      readLinuxMountInfo: async () => {
+        mountReads += 1;
+        if (mountReads === 1) return "";
+        assert.ok(configDirectory);
+        return linuxMountInfoLine(
+          mountedPath === "target"
+            ? configDirectory
+            : `${configDirectory}/mounted-child`,
+        );
+      },
+      runElevated: async () => {
+        elevatedRemovals += 1;
+        return commandResult("");
+      },
+    };
+    const operation = createWithRemovalDependencies(
+      contextFor("linux"),
+      async () => ({
+        executable: "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew",
+      }),
+      async () => {
+        assert.ok(configDirectory);
+        const child = `${configDirectory}/mounted-child`;
+        await mkdir(child);
+        sentinel = `${child}/sentinel`;
+        await writeFile(sentinel, "preserve me");
+        return commandResult("");
+      },
+      async () => undefined,
+      async () => {
+        configDirectory = await mkdtemp(
+          "/tmp/maximize-github-runner-space-brew-config-",
+        );
+        return configDirectory;
+      },
+      async () => {
+        recursiveRemovals += 1;
+      },
+      removalDependencies,
+    );
+    assert.ok(operation.validate);
+
+    try {
+      await operation.validate();
+      const result = await operation.run();
+      assert.equal(result.status, "failed");
+      assert.match(result.detail ?? "", /mounted path/);
+      assert.equal(mountReads, 2);
+      assert.equal(recursiveRemovals, 0);
+      assert.equal(elevatedRemovals, 0);
+      assert.ok(sentinel);
+      assert.equal(await readFile(sentinel, "utf8"), "preserve me");
+    } finally {
+      if (configDirectory !== undefined) {
+        await rm(configDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+}

@@ -11,8 +11,8 @@ platform and architecture automatically.
 
 ## Quick start
 
-These examples target `v0.12.2`; until that tag is published, pin the full
-commit SHA instead.
+These examples use `v0.12.3`. Release tags are readable pins.
+Use a full commit SHA for an immutable pin.
 
 Calling the action without `with:` uses the aggressive `max` profile, which
 removes every applicable component unless it is protected.
@@ -26,7 +26,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.2
+        uses: justinthelaw/maximize-github-runner-space@v0.12.3
         with:
           skip-components: java,browsers,docker-engine,docker-images
           swapfile-size: 2GiB
@@ -49,7 +49,7 @@ jobs:
           persist-credentials: false
       - name: Free runner space
         id: cleanup
-        uses: justinthelaw/maximize-github-runner-space@v0.12.2
+        uses: justinthelaw/maximize-github-runner-space@v0.12.3
         with:
           cleanup-profile: custom
           remove-codeql: "true"
@@ -73,6 +73,14 @@ exactly the string `"true"`.
 installations on macOS, and Docker data or build tools on Linux and Windows.
 Use `custom` first on a new platform integration, or protect required tools
 with `skip-components`.
+
+Component ownership includes related definition payloads: macOS Android
+cleanup removes its SDK/NDK and Android user state. On Linux and macOS, Gradle
+cleanup owns the shared `~/.gradle` user state; under `max`, skipping either
+Android or Gradle preserves it. macOS Azure CLI cleanup also removes the Azure
+DevOps extension. Windows SDK/WDK cleanup handles both Visual Studio-owned
+components and eligible standalone bundles identified by strict registry
+metadata, including current version-suffixed runner-image registrations.
 
 ## Runner support
 

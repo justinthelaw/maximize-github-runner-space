@@ -16,6 +16,7 @@ With `max`, every component applicable to the detected platform is selected unle
 
 - Skipping `browsers` protects `chrome`, `chromium`, `edge`, `firefox`, `webdrivers`, and `selenium`. Skipping one child disables only the broad `browsers` operation so unprotected siblings can still run.
 - Skipping `cached-tools` protects its toolcache children. Skipping a toolcache child, or `codeql`, `dotnet`, `haskell`, `swift`, `julia`, or `java`, disables broad `cached-tools` cleanup so the protected toolcache owner is retained.
+- Skipping any of `android`, `maven`, `gradle`, `ant`, or `selenium` implicitly preserves `java` because each component requires a JVM. Because `java` owns a hosted-toolcache child, that preservation also disables broad `cached-tools` cleanup. Unprotected, narrower `cached-go`, `cached-node`, `cached-python`, `cached-pypy`, and `cached-ruby` siblings may still run.
 - Skipping a protected component that overlaps Linux `large-packages` disables that broad legacy package purge.
 - When `docker-engine` is selected, its removal covers `docker-images`; the action does not start a daemon to run a redundant image prune. Under `max`, skip both `docker-engine` and `docker-images` when the daemon and its existing images, containers, volumes, and build cache must survive.
 - On Windows, skipping `visual-studio` preserves its definition-owned Android, .NET, vcpkg, and Windows SDK payloads. Skipping one of those payloads blocks broad Visual Studio removal while allowing unrelated cleanup.
@@ -32,7 +33,7 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | Input | Component ID | Platforms | Effect |
 | --- | --- | --- | --- |
 | `remove-dotnet` | `dotnet` | Linux, macOS, Windows | Removes installed .NET SDKs, runtimes, and user tools. |
-| `remove-android` | `android` | Linux, macOS, Windows | Removes the Android SDK and Android user caches. |
+| `remove-android` | `android` | Linux, macOS, Windows | Removes the Android SDK/NDK and Android user state. On macOS this includes `~/Library/Android/sdk` and `~/.android`. |
 | `remove-haskell` | `haskell` | Linux, Windows | Removes GHCup, GHC, Cabal, and Stack artifacts where installed. |
 | `remove-codeql` | `codeql` | Linux, macOS, Windows | Removes CodeQL Action bundles from the hosted toolcache. |
 | `remove-cached-tools` | `cached-tools` | Linux, macOS, Windows | Removes and recreates the hosted setup-action toolcache. |
@@ -57,7 +58,7 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | `remove-selenium` | `selenium` | Linux, macOS, Windows | Removes Selenium server artifacts. |
 | `remove-aws-cli` | `aws-cli` | Linux, macOS, Windows | Removes AWS CLI v2 and the Session Manager plugin. |
 | `remove-aws-sam-cli` | `aws-sam-cli` | Linux, macOS, Windows | Removes AWS SAM CLI. |
-| `remove-azure-cli` | `azure-cli` | Linux, macOS, Windows | Removes Azure CLI. |
+| `remove-azure-cli` | `azure-cli` | Linux, macOS, Windows | Removes Azure CLI and, on macOS, its Azure DevOps CLI extension under `~/.azure/cliextensions/azure-devops`. |
 | `remove-gh-cli` | `gh-cli` | Linux, macOS, Windows | Removes GitHub CLI. |
 | `remove-gcloud-cli` | `gcloud-cli` | Linux | Removes Google Cloud CLI/SDK where installed. |
 | `remove-azcopy` | `azcopy` | Linux, macOS, Windows | Removes AzCopy. |
@@ -70,19 +71,19 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | `remove-buildah` | `buildah` | Linux | Removes Buildah where installed. |
 | `remove-podman` | `podman` | Linux | Removes Podman and its runner storage where installed. |
 | `remove-maven` | `maven` | Linux, macOS, Windows | Removes Apache Maven. |
-| `remove-gradle` | `gradle` | Linux, macOS, Windows | Removes Gradle. |
+| `remove-gradle` | `gradle` | Linux, macOS, Windows | Removes Gradle and, on Linux and macOS, the shared `~/.gradle` user state. Under `max`, skipping either `android` or `gradle` preserves that state for compatibility. |
 | `remove-ant` | `ant` | Linux, macOS, Windows | Removes Apache Ant. |
 | `remove-php` | `php` | Linux, macOS, Windows | Removes PHP, Composer, and PHPUnit where installed. |
 | `remove-rust` | `rust` | Linux, macOS, Windows | Removes Rustup, Cargo, and Rust toolchains. |
-| `remove-postgresql` | `postgresql` | Linux, Windows | Removes PostgreSQL packages and runner data where installed. |
-| `remove-mysql` | `mysql` | Linux, Windows | Removes MySQL/MariaDB packages and runner data where installed. |
+| `remove-postgresql` | `postgresql` | Linux, Windows | Removes PostgreSQL packages and runner data where installed. Linux apt ownership is exact: PostgreSQL owns `libpq-dev`, `postgresql`, `postgresql-common`, `postgresql-client-common`, and `postgresql-*`. |
+| `remove-mysql` | `mysql` | Linux, Windows | Removes MySQL/MariaDB packages and runner data where installed. Linux apt ownership is exact: MySQL owns `libmysqlclient-dev`, `mysql-common`, `mysql-*`, and `mariadb-*`. |
 | `remove-apache` | `apache` | Linux, Windows | Removes Apache HTTP Server where installed. |
 | `remove-nginx` | `nginx` | Linux, macOS, Windows | Removes Nginx where installed. |
 | `remove-docker-images` | `docker-images` | Linux, Windows | Removes unused Docker containers, images, build cache, networks, and volumes. |
 | `remove-large-packages` | `large-packages` | Linux | Purges the legacy set of additional large apt packages on Linux. |
 | `remove-xcode` | `xcode` | macOS | Removes unselected versioned Xcode applications while preserving the selected Xcode. |
 | `remove-visual-studio` | `visual-studio` | Windows | Removes eligible runner-image Visual Studio instances through the registered installer. |
-| `remove-windows-sdk` | `windows-sdk` | Windows | Removes definition-listed Windows SDK/WDK components through the Visual Studio installer. |
+| `remove-windows-sdk` | `windows-sdk` | Windows | Windows SDK/WDK cleanup covers both definition-listed Visual Studio-owned components and eligible registered standalone Burn bundles. Visual Studio-owned payloads use the Visual Studio Installer; standalone bundles run only from strict uninstall-registry metadata whose display name is either the exact legacy product name or its current `Windows 10.0.<build>.<revision>` suffix form. |
 
 ## Outputs
 
@@ -97,6 +98,6 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 
 ## Failure behavior
 
-The action fails before mutation for invalid `cleanup-profile` or `skip-components` values, unsupported runner identities and containers, incompatible runner-image metadata, and invalid or unsupported swap requests. Swap failures and failures to stop a required service are also fatal because continuing could leave the machine in an unsafe state. On macOS, when Homebrew cleanup or a Homebrew-owned component is selected, Homebrew configuration validation and preparation are fatal preflight requirements; a failure stops cleanup.
+The action fails before mutation for invalid `cleanup-profile` or `skip-components` values, unsupported runner identities and containers, incompatible runner-image metadata, and invalid or unsupported swap requests. On Linux, a mounted filesystem at or below a recursive cleanup target is refused; the complete plan stops before mutation. Swap failures and failures to stop a required service are also fatal because continuing could leave the machine in an unsafe state. On macOS, when Homebrew cleanup or a Homebrew-owned component is selected, Homebrew configuration validation and preparation are fatal preflight requirements; a failure stops cleanup.
 
 Ordinary component cleanup is best-effort. The action records `removed`, `not-found`, `unsupported`, and `failed` results; ordinary failures do not stop later operations, are emitted as warnings, and increase `failed-operations`.

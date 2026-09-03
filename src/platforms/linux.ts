@@ -21,6 +21,8 @@ import { COMPONENTS } from "../components.js";
 import {
   createFunctionOperation,
   createRemovePathOperation,
+  removePathTarget,
+  type RemovePathDependencies,
 } from "../operations.js";
 import { assertSafeDirectoryTarget, assertSafeExactTarget } from "../safety.js";
 import type {
@@ -232,12 +234,13 @@ const APT_PACKAGES: Readonly<Partial<Record<ComponentId, readonly string[]>>> =
     ant: ["ant", "ant-optional"],
     php: ["^php.*", "composer", "phpunit"],
     postgresql: [
+      "libpq-dev",
       "postgresql",
       "postgresql-common",
       "postgresql-client-common",
       "^postgresql-.*",
     ],
-    mysql: ["mysql-common", "^mysql-.*", "^mariadb-.*"],
+    mysql: ["libmysqlclient-dev", "mysql-common", "^mysql-.*", "^mariadb-.*"],
     apache: ["apache2", "apache2-utils", "apache2-bin", "apache2-data"],
     nginx: ["nginx", "nginx-common", "nginx-core"],
     "large-packages": [
@@ -261,6 +264,37 @@ const APT_PACKAGES: Readonly<Partial<Record<ComponentId, readonly string[]>>> =
       "libgl1-mesa-dri",
     ],
   };
+
+function selectedLinuxAptSpecifications(plan: CleanupPlan): readonly string[] {
+  return [
+    ...new Set(
+      (
+        Object.entries(APT_PACKAGES) as [ComponentId, readonly string[]][]
+      ).flatMap(([component, packages]) =>
+        plan.enabled.has(component) ? packages : [],
+      ),
+    ),
+  ];
+}
+
+export function selectLinuxAptPackages(
+  plan: CleanupPlan,
+  installedPackages: readonly string[],
+): readonly string[] {
+  const specifications = selectedLinuxAptSpecifications(plan);
+  return installedPackages.filter((name) =>
+    specifications.some((specification) => {
+      if (!specification.includes("*") && !specification.startsWith("^")) {
+        return name === specification || name.startsWith(`${specification}:`);
+      }
+      try {
+        return new RegExp(specification).test(name);
+      } catch {
+        return false;
+      }
+    }),
+  );
+}
 
 function exactDefinitionPath(
   value: string | undefined,
@@ -342,15 +376,7 @@ function aptBatchOperation(
     dedupeKey: "apt:selected-packages",
     always: true,
     run: async () => {
-      const specifications = [
-        ...new Set(
-          (
-            Object.entries(APT_PACKAGES) as [ComponentId, readonly string[]][]
-          ).flatMap(([component, packages]) =>
-            plan.enabled.has(component) ? packages : [],
-          ),
-        ),
-      ];
+      const specifications = selectedLinuxAptSpecifications(plan);
       if (specifications.length === 0) return { status: "not-found" };
       if (context.isContainer && !context.hasPasswordlessSudo) {
         return {
@@ -367,20 +393,7 @@ function aptBatchOperation(
       if (query.exitCode !== 0)
         return { status: "unsupported", detail: "dpkg database unavailable" };
       const installed = query.stdout.split(/\r?\n/).filter(Boolean);
-      const selected = installed.filter((name) =>
-        specifications.some((specification) => {
-          if (!specification.includes("*") && !specification.startsWith("^")) {
-            return (
-              name === specification || name.startsWith(`${specification}:`)
-            );
-          }
-          try {
-            return new RegExp(specification).test(name);
-          } catch {
-            return false;
-          }
-        }),
-      );
+      const selected = selectLinuxAptPackages(plan, installed);
       if (selected.length === 0) return { status: "not-found" };
       const result = await runElevated(
         context,
@@ -577,6 +590,7 @@ interface LinuxBrewFileIdentity {
   readonly inode: bigint;
   readonly size: bigint;
   readonly modifiedNanoseconds: bigint;
+  readonly changedNanoseconds: bigint;
 }
 
 export interface LinuxBrewPathProbe {
@@ -597,6 +611,7 @@ const NODE_LINUX_BREW_PATH_PROBE: LinuxBrewPathProbe = {
       inode: stat.ino,
       size: stat.size,
       modifiedNanoseconds: stat.mtimeNs,
+      changedNanoseconds: stat.ctimeNs,
     };
   },
 };
@@ -775,6 +790,7 @@ export function createLinuxHomebrewCleanupOperation(
   inspectConfig: LinuxBrewConfigProbe = NODE_LINUX_BREW_CONFIG_PROBE,
   createConfigDirectory: LinuxBrewConfigDirectoryFactory = NODE_LINUX_BREW_CONFIG_DIRECTORY_FACTORY,
   removeConfigDirectory: LinuxBrewConfigDirectoryRemover = NODE_LINUX_BREW_CONFIG_DIRECTORY_REMOVER,
+  removeConfigDependencies: Omit<RemovePathDependencies, "remove"> = {},
 ): Operation {
   let validationComplete = false;
   let validatedExecutable: ResolvedLinuxBrew | undefined;
@@ -801,7 +817,9 @@ export function createLinuxHomebrewCleanupOperation(
     current?.identity?.inode === validated?.identity?.inode &&
     current?.identity?.size === validated?.identity?.size &&
     current?.identity?.modifiedNanoseconds ===
-      validated?.identity?.modifiedNanoseconds;
+      validated?.identity?.modifiedNanoseconds &&
+    current?.identity?.changedNanoseconds ===
+      validated?.identity?.changedNanoseconds;
 
   return createFunctionOperation({
     id: "linux:brew:cleanup",
@@ -847,12 +865,25 @@ export function createLinuxHomebrewCleanupOperation(
 
       let result: CommandResult | undefined;
       let executionError: unknown;
+      let lateConfig: string | undefined;
       try {
-        result = await execute(
-          LINUXBREW_CANDIDATE,
-          ["cleanup", "--prune=120"],
-          linuxBrewEnvironment(context, configDirectory),
-        );
+        lateConfig = await findLinuxBrewConfig(inspectConfig);
+        if (lateConfig === undefined) {
+          const executionExecutable = await resolveExecutable();
+          if (
+            executionExecutable === undefined ||
+            !sameExecutable(executionExecutable, executable)
+          ) {
+            throw new Error(
+              "Linuxbrew executable changed immediately before execution",
+            );
+          }
+          result = await execute(
+            executionExecutable.executable,
+            ["cleanup", "--prune=120"],
+            linuxBrewEnvironment(context, configDirectory),
+          );
+        }
       } catch (error) {
         executionError = error;
       }
@@ -860,11 +891,41 @@ export function createLinuxHomebrewCleanupOperation(
       let removalError: unknown;
       try {
         await assertLinuxBrewConfigDirectory(configDirectory, context);
-        await removeConfigDirectory(configDirectory);
+        const removal = await removePathTarget(
+          configDirectory,
+          [LINUXBREW_CONFIG_ROOT],
+          context,
+          {
+            ...removeConfigDependencies,
+            remove: async (path) => {
+              if (typeof path !== "string") {
+                throw new Error("Refusing a non-string Linuxbrew config path.");
+              }
+              await removeConfigDirectory(path);
+            },
+          },
+        );
+        if (removal.status === "failed") {
+          removalError = new Error(
+            removal.detail ?? "temporary config removal failed",
+          );
+        }
       } catch (error) {
         removalError = error;
       }
 
+      if (lateConfig !== undefined) {
+        if (removalError !== undefined) {
+          return {
+            status: "failed",
+            detail: `Homebrew configuration appeared before cleanup (${lateConfig}); temporary config cleanup failed: ${removalError instanceof Error ? removalError.message : String(removalError)}`,
+          };
+        }
+        return {
+          status: "unsupported",
+          detail: `Homebrew configuration can override cleanup paths (${lateConfig})`,
+        };
+      }
       if (executionError !== undefined) {
         return {
           status: "failed",
@@ -1109,6 +1170,13 @@ function escapeExtendedRegularExpression(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
+function rollbackSwaponFailure(result: CommandResult): string | undefined {
+  if (result.exitCode === 0) return undefined;
+  return `rollback swapon failed: ${
+    result.stderr.trim() || `swapon exited ${result.exitCode}`
+  }`;
+}
+
 /** The root override keeps exact-path safety tests isolated from the host. */
 export function createSwapOperation(
   context: RuntimeContext,
@@ -1286,15 +1354,26 @@ export function createSwapOperation(
           );
           if (backedUp.exitCode !== 0) {
             await removeTemporaryFile(backup);
+            let rollbackDetail: string | undefined;
             if (isActive) {
-              await runSwapUtility(true, "swapon", [paths.swapfile], {
-                silent: true,
-              });
+              const reenabled = await runSwapUtility(
+                true,
+                "swapon",
+                [paths.swapfile],
+                {
+                  silent: true,
+                },
+              );
+              rollbackDetail = rollbackSwaponFailure(reenabled);
             }
             return {
               status: "failed",
-              detail:
+              detail: [
                 backedUp.stderr.trim() || "unable to back up existing swap",
+                rollbackDetail,
+              ]
+                .filter(Boolean)
+                .join("; "),
             };
           }
         }
@@ -1527,16 +1606,28 @@ export function createSwapOperation(
           { silent: true },
         );
         if (backedUp.exitCode !== 0) {
+          let rollbackDetail: string | undefined;
           if (isActive) {
-            await runSwapUtility(true, "swapon", [paths.swapfile], {
-              silent: true,
-            });
+            const reenabled = await runSwapUtility(
+              true,
+              "swapon",
+              [paths.swapfile],
+              {
+                silent: true,
+              },
+            );
+            rollbackDetail = rollbackSwaponFailure(reenabled);
           }
           await removeTemporaryFile(replacement);
           await removeTemporaryFile(backup);
           return {
             status: "failed",
-            detail: backedUp.stderr.trim() || "unable to back up existing swap",
+            detail: [
+              backedUp.stderr.trim() || "unable to back up existing swap",
+              rollbackDetail,
+            ]
+              .filter(Boolean)
+              .join("; "),
           };
         }
       }
@@ -1686,11 +1777,11 @@ export async function createLinuxAdapter(
           "Remove Android user state",
         ],
         [
-          "android",
+          "gradle",
           join(home, ".gradle"),
           [home],
-          "Remove Android Gradle cache",
-          ["gradle"],
+          "Remove Gradle user home",
+          ["android"],
         ],
         [
           "haskell",

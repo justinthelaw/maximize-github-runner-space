@@ -24,7 +24,7 @@ inputs:
     required: false
     default: "false"
   remove-android:
-    description: "Removes the Android SDK and Android user caches"
+    description: "Removes Android SDK/NDK payloads and Android user state"
     required: false
     default: "false"
   remove-haskell:
@@ -130,7 +130,7 @@ inputs:
     required: false
     default: "false"
   remove-azure-cli:
-    description: "Removes Azure CLI"
+    description: "Removes Azure CLI and its definition-owned extensions"
     required: false
     default: "false"
   remove-gh-cli:
@@ -184,7 +184,7 @@ inputs:
     required: false
     default: "false"
   remove-gradle:
-    description: "Removes Gradle"
+    description: "Removes Gradle and its user state where applicable"
     required: false
     default: "false"
   remove-ant:
@@ -236,7 +236,7 @@ inputs:
     required: false
     default: "false"
   remove-windows-sdk:
-    description: "Removes definition-listed Windows SDK/WDK components through the Visual Studio installer"
+    description: "Removes Visual Studio-owned and registered standalone Windows SDK/WDK payloads"
     required: false
     default: "false"
 

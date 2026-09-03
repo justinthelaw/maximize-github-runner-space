@@ -2,6 +2,41 @@
 
 Use these notes when moving between action releases. See the [configuration reference](CONFIGURATION.md) for the current input catalog.
 
+## v0.12.2 to v0.12.3
+
+`v0.12.3` is a safety and compatibility hardening release. It has no new inputs
+or workflow-syntax changes: existing profiles, component IDs, defaults,
+outputs, and supported runner classes retain their names and selection syntax.
+It includes targeted behavior changes: recursive cleanup now refuses a selected
+target with a mounted boundary, and Gradle cleanup now owns shared Gradle user
+state on Linux and macOS.
+
+Linux recursive removal now refuses targets that are mount points or contain a
+mounted descendant before any cleanup mutation. Skipping `maven` under `max`
+also implicitly preserves Java, and swap replacement performs stronger
+rollback checks. macOS cleanup revalidates targets at mutation time and uses a
+validated snapshot of the selected Xcode. macOS Android cleanup explicitly
+owns the SDK/NDK and `.android`; Linux and macOS Gradle cleanup own the shared
+`.gradle` user state. Under `max`, skipping either Android or Gradle preserves
+that shared state. This corrects `custom` ownership: Android-only cleanup now
+preserves `.gradle`, while Gradle cleanup removes it. Azure CLI cleanup also
+owns the Azure DevOps extension. Windows Docker cleanup covers the current
+runner-image helper paths, while Windows SDK cleanup handles both Visual
+Studio-owned components and eligible standalone installer bundles through
+strict registered metadata, including current version-suffixed display names.
+
+Release validation now separates the scheduled bounded 18-label sweep from a
+dispatch-only seven-class no-input `max` matrix on fresh runners. The generated
+distribution job is a dependency of that matrix, whose destructive smoke steps
+assert numeric outputs and zero failed operations.
+
+Review workflows that select `remove-gradle` or rely on the default `max`
+profile before upgrading if later steps reuse `~/.gradle`. To preserve that
+state, leave `remove-gradle` disabled under `custom` or add `gradle` to
+`skip-components` under `max`. Workflows that intentionally mount content
+below a cleanup target must unmount it first or preserve that component; the
+action now fails closed instead of recursively deleting across the mount.
+
 ## v0.11.x to v0.12.0
 
 `v0.12.0` introduced cross-platform support and the three OS-specific inputs: `remove-xcode`, `remove-visual-studio`, and `remove-windows-sdk`.
