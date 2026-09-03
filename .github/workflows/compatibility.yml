@@ -85,6 +85,28 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Use the minimum supported Node.js version for the native Windows probe
+        if: matrix.platform == 'windows'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install locked dependencies for the native Windows probe
+        if: matrix.platform == 'windows'
+        run: npm ci --ignore-scripts
+
+      - name: Compile the native Windows probe regression
+        if: matrix.platform == 'windows'
+        run: npx tsc --project tsconfig.json
+
+      - name: Exercise the native Windows PowerShell probe
+        if: matrix.platform == 'windows'
+        run: >-
+          node --test
+          --test-name-pattern="native Windows PowerShell probe"
+          build/test/safety.test.js
+
       - name: Exercise the native adapter
         uses: ./.github/actions/platform-smoke
         with:

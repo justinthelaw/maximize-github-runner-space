@@ -47,7 +47,10 @@ const WINDOWS_FILE_ATTRIBUTE_SCRIPT = [
   "  $stage = 'decode-input'",
   "  $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))",
   "  $stage = 'parse-input'",
-  "  $paths = @($json | ConvertFrom-Json)",
+  // Windows PowerShell 5.1 emits a JSON array as one pipeline object. The
+  // inner grouping forces enumeration; the outer array expression preserves
+  // a one-path input as an array.
+  "  $paths = @(($json | ConvertFrom-Json))",
   "  $stage = 'read-attributes'",
   "  $attributes = @()",
   "  foreach ($path in $paths) {",

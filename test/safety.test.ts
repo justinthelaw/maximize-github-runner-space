@@ -3,6 +3,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rm,
   symlink,
   unlink,
   writeFile,
@@ -1635,6 +1636,31 @@ test("Windows file attribute probing reports only a whitelisted failure stage", 
     },
   );
 });
+
+test(
+  "native Windows PowerShell probe returns one attribute per hostile path",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "maximize-space-windows-attributes-"),
+    );
+    const directory = join(root, "résumé-$()';");
+    const file = join(root, "路径.txt");
+    try {
+      await mkdir(directory);
+      await writeFile(file, "fixture");
+
+      const attributes = await readWindowsFileAttributes([directory, file]);
+
+      assert.deepEqual(
+        attributes.map((value) => (value & 0x10) !== 0),
+        [true, false],
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("a target containing a protected workspace is rejected", () => {
   const context = contextFor("linux");

@@ -356,6 +356,10 @@ function assertWorkflowTopology(
 
   assert.deepEqual(stepNames(exactImage, 6), [
     "Checkout",
+    "Use the minimum supported Node.js version for the native Windows probe",
+    "Install locked dependencies for the native Windows probe",
+    "Compile the native Windows probe regression",
+    "Exercise the native Windows PowerShell probe",
     "Exercise the native adapter",
   ]);
   assert.deepEqual(stepNames(generatedDist, 6), [
@@ -402,6 +406,10 @@ function assertWorkflowTopology(
   ]);
   assert.deepEqual(stepNames(platformSmoke, 6), [
     "Checkout",
+    "Use the minimum supported Node.js version for the native Windows probe",
+    "Install locked dependencies for the native Windows probe",
+    "Compile the native Windows probe regression",
+    "Exercise the native Windows PowerShell probe",
     "Assert Windows PostgreSQL fixture and service exist",
     "Exercise Windows PostgreSQL cleanup",
     "Verify Windows PostgreSQL cleanup",
