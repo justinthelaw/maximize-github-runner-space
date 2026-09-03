@@ -83,11 +83,16 @@ export async function readWindowsFileAttributes(
   if (
     result.exitCode !== 0 ||
     result.stdoutTruncated === true ||
-    result.stderrTruncated === true ||
-    result.stderr.trim() !== ""
+    result.stderrTruncated === true
   ) {
     throw new Error("Unable to read complete Windows file attributes safely.");
   }
+
+  // Windows PowerShell 5.1 can emit bounded startup progress records as
+  // CLIXML on stderr even when an encoded command succeeds. Stderr is not the
+  // result channel: script failures are terminating, while the stdout payload
+  // below must still be a complete, exact attribute array. Truncated stderr
+  // remains fatal because its classification would be incomplete.
 
   let parsed: unknown;
   try {

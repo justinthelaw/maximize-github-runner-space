@@ -1555,10 +1555,9 @@ test("Windows file attributes use a fixed executable and carry hostile paths onl
 test("Windows file attribute probing fails closed on incomplete or malformed output", async () => {
   const unsafeResults = [
     { exitCode: 1, stdout: "[0]", stderr: "" },
-    { exitCode: 0, stdout: "[0]", stderr: "warning" },
     { exitCode: 0, stdout: "[0]", stderr: "", stdoutTruncated: true },
     { exitCode: 0, stdout: "[0]", stderr: "", stderrTruncated: true },
-    { exitCode: 0, stdout: "not-json", stderr: "" },
+    { exitCode: 0, stdout: "not-json", stderr: "warning" },
     { exitCode: 0, stdout: "0", stderr: "" },
     { exitCode: 0, stdout: "[0,1024]", stderr: "" },
     { exitCode: 0, stdout: "[-1]", stderr: "" },
@@ -1579,6 +1578,24 @@ test("Windows file attribute probing fails closed on incomplete or malformed out
     [],
   );
   assert.equal(calls, 0);
+});
+
+test("Windows file attribute probing accepts bounded host diagnostics after valid output", async () => {
+  const progressDiagnostic = [
+    "#< CLIXML",
+    '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">',
+    '<Obj S="progress"><MS><PR N="Record"><AV>Preparing modules for first use.</AV></PR></MS></Obj>',
+    "</Objs>",
+  ].join("\n");
+
+  assert.deepEqual(
+    await readWindowsFileAttributes(["C:\\ordinary"], async () => ({
+      exitCode: 0,
+      stdout: "[0]",
+      stderr: progressDiagnostic,
+    })),
+    [0],
+  );
 });
 
 test("a target containing a protected workspace is rejected", () => {
