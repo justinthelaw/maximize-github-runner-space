@@ -59,6 +59,223 @@ function xcodeSelect(path: string, exitCode = 0) {
 
 const SELECTED_XCODE = "/Applications/Xcode_16.4.app";
 const SELECTED_DEVELOPER = `${SELECTED_XCODE}/Contents/Developer`;
+const COMMAND_LINE_TOOLS = "/Library/Developer/CommandLineTools";
+
+test("macOS cleans unselected Xcode bundles when Command Line Tools are selected", async () => {
+  const removalCalls: string[] = [];
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(COMMAND_LINE_TOOLS),
+    resolveXcodePath: async (path) =>
+      path === "/Applications/Xcode.app" ? SELECTED_XCODE : path,
+    listApplications: async () => [
+      xcodeEntry("Xcode.app", "symlink"),
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async (target) => {
+      removalCalls.push(target);
+      return { status: "removed" };
+    },
+  });
+
+  const operations = await adapter.operations(planFor("xcode"));
+  assert.deepEqual(
+    operations.map(({ id }) => id),
+    ["xcode:Xcode_15.4.app"],
+  );
+  const [removal] = operations;
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  assert.deepEqual(await removal.run(), { status: "removed" });
+  assert.deepEqual(removalCalls, ["/Applications/Xcode_15.4.app"]);
+});
+
+test("macOS cleans versioned Xcodes when Command Line Tools are selected without an Xcode alias", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(COMMAND_LINE_TOOLS),
+    resolveXcodePath: async (path) =>
+      path === "/Applications/Xcode.app" ? undefined : path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => ({ status: "removed" }),
+  });
+
+  assert.deepEqual(
+    (await adapter.operations(planFor("xcode"))).map(({ id }) => id),
+    ["xcode:Xcode_16.4.app", "xcode:Xcode_15.4.app"],
+  );
+});
+
+test("macOS blocks a Command Line Tools cleanup when the Xcode alias retargets at the removal boundary", async () => {
+  const target = "/Applications/Xcode_15.4.app";
+  let aliasTarget = SELECTED_XCODE;
+  let boundaryActive = false;
+  let aliasRetargeted = false;
+  let mutationCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(COMMAND_LINE_TOOLS),
+    resolveXcodePath: async (path) => {
+      if (path !== "/Applications/Xcode.app") return path;
+      const resolved = aliasTarget;
+      if (boundaryActive && !aliasRetargeted) {
+        aliasRetargeted = true;
+        aliasTarget = target;
+      }
+      return resolved;
+    },
+    listApplications: async () => [
+      xcodeEntry("Xcode.app", "symlink"),
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async (
+      _target,
+      _allowedParents,
+      _context,
+      removalDependencies,
+    ) => {
+      const beforeMutation = removalDependencies?.beforeMutation;
+      assert.ok(beforeMutation);
+      boundaryActive = true;
+      try {
+        await beforeMutation("local", {
+          exists: true,
+          isLink: false,
+          realPath: target,
+          identity: { device: 1n, inode: 1n },
+        });
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+      mutationCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.equal(aliasRetargeted, true);
+  assert.equal(mutationCalls, 0);
+});
+
+test("macOS blocks Command Line Tools cleanup when the active selection changes at the removal boundary", async () => {
+  const target = "/Applications/Xcode_15.4.app";
+  let selectedDeveloper = COMMAND_LINE_TOOLS;
+  let mutationCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(selectedDeveloper),
+    resolveXcodePath: async (path) =>
+      path === "/Applications/Xcode.app" ? SELECTED_XCODE : path,
+    listApplications: async () => [
+      xcodeEntry("Xcode.app", "symlink"),
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async (
+      _target,
+      _allowedParents,
+      _context,
+      removalDependencies,
+    ) => {
+      const beforeMutation = removalDependencies?.beforeMutation;
+      assert.ok(beforeMutation);
+      selectedDeveloper = `${target}/Contents/Developer`;
+      try {
+        await beforeMutation("local", {
+          exists: true,
+          isLink: false,
+          realPath: target,
+          identity: { device: 1n, inode: 1n },
+        });
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+      mutationCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.equal(mutationCalls, 0);
+});
+
+test("macOS rejects an unstable resolved Command Line Tools selection", async () => {
+  let commandLineToolsResolutions = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(COMMAND_LINE_TOOLS),
+    resolveXcodePath: async (path) => {
+      if (path === "/Applications/Xcode.app") return SELECTED_XCODE;
+      if (path === COMMAND_LINE_TOOLS && ++commandLineToolsResolutions > 1) {
+        return `${SELECTED_XCODE}/Contents/Developer`;
+      }
+      return path;
+    },
+    listApplications: async () => [xcodeEntry("Xcode_15.4.app")],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => ({ status: "removed" }),
+  });
+
+  const operations = await adapter.operations(planFor("xcode"));
+
+  assert.deepEqual(
+    operations.map(({ id }) => id),
+    ["xcode:inventory"],
+  );
+  assert.deepEqual(await operations[0]?.run(), {
+    status: "failed",
+    detail:
+      "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+  });
+});
+
+test("macOS rejects arbitrary developer directories outside an Xcode bundle", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () =>
+      xcodeSelect("/Library/Developer/UnexpectedTools"),
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [xcodeEntry("Xcode_15.4.app")],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => ({ status: "removed" }),
+  });
+
+  const operations = await adapter.operations(planFor("xcode"));
+
+  assert.deepEqual(
+    operations.map(({ id }) => id),
+    ["xcode:inventory"],
+  );
+  const [inventoryFailure] = operations;
+  assert.ok(inventoryFailure);
+  assert.equal((await inventoryFailure.run()).status, "failed");
+});
 
 test("macOS revalidates stable Xcode selection immediately before removal", async () => {
   let selectionCalls = 0;

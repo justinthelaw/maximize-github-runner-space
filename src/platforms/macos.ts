@@ -30,6 +30,9 @@ import type {
 } from "../types.js";
 
 const APPLICATIONS_ROOT = "/Applications";
+const XCODE_ALIAS = `${APPLICATIONS_ROOT}/Xcode.app`;
+const COMMAND_LINE_TOOLS_DEVELOPER_DIRECTORY =
+  "/Library/Developer/CommandLineTools";
 const LOCAL_ROOT = "/usr/local";
 const LOCAL_BIN = `${LOCAL_ROOT}/bin`;
 const LOCAL_SHARE = `${LOCAL_ROOT}/share`;
@@ -843,11 +846,21 @@ async function resolvedPath(value: string): Promise<string | undefined> {
   }
 }
 
-interface XcodeSelection {
+interface XcodeBundleSelection {
+  readonly kind: "xcode";
   readonly developerDirectory: string;
   readonly selectedSpellingBundle: string;
   readonly selectedBundle: string;
 }
+
+interface CommandLineToolsSelection {
+  readonly kind: "command-line-tools";
+  readonly developerDirectory: string;
+  readonly resolvedDeveloperDirectory: string;
+  readonly xcodeAliasResolvedPath: string | undefined;
+}
+
+type XcodeSelection = XcodeBundleSelection | CommandLineToolsSelection;
 
 type XcodeSelectionSnapshot =
   { readonly selection: XcodeSelection } | { readonly failure: string };
@@ -887,18 +900,22 @@ async function discoverXcodeSelection(
 
   const developerDirectory = normalize(value);
   const selectedSpellingBundle = xcodeBundleFromPath(developerDirectory);
-  if (selectedSpellingBundle === undefined) {
+  const commandLineToolsSelected =
+    selectedSpellingBundle === undefined &&
+    developerDirectory === COMMAND_LINE_TOOLS_DEVELOPER_DIRECTORY;
+  if (selectedSpellingBundle === undefined && !commandLineToolsSelected) {
     return {
       failure:
         "Unable to identify the selected Xcode bundle; no Xcode bundle was removed.",
     };
   }
+  const selectionResolutionPath = selectedSpellingBundle ?? XCODE_ALIAS;
 
   let resolvedDeveloper: string | undefined;
   let resolvedSpellingBundle: string | undefined;
   try {
     resolvedDeveloper = await resolveXcodePath(developerDirectory);
-    resolvedSpellingBundle = await resolveXcodePath(selectedSpellingBundle);
+    resolvedSpellingBundle = await resolveXcodePath(selectionResolutionPath);
   } catch (error) {
     return {
       failure: boundedXcodeFailure(
@@ -906,18 +923,27 @@ async function discoverXcodeSelection(
       ),
     };
   }
-  const developerBundle =
-    resolvedDeveloper === undefined
-      ? undefined
-      : xcodeBundleFromPath(normalize(resolvedDeveloper));
-  const selectedBundle =
+  if (resolvedDeveloper === undefined) {
+    return {
+      failure:
+        "Xcode selection changed or could not be resolved safely; no Xcode bundle was removed.",
+    };
+  }
+  const resolvedDeveloperDirectory = normalize(resolvedDeveloper);
+  const xcodeAliasResolvedPath =
     resolvedSpellingBundle === undefined
       ? undefined
-      : xcodeBundleFromPath(normalize(resolvedSpellingBundle));
+      : normalize(resolvedSpellingBundle);
+  const developerBundle = xcodeBundleFromPath(resolvedDeveloperDirectory);
+  const selectedBundle =
+    xcodeAliasResolvedPath === undefined
+      ? undefined
+      : xcodeBundleFromPath(xcodeAliasResolvedPath);
   if (
-    developerBundle === undefined ||
-    selectedBundle === undefined ||
-    normalize(developerBundle) !== normalize(selectedBundle)
+    selectedSpellingBundle !== undefined &&
+    (developerBundle === undefined ||
+      selectedBundle === undefined ||
+      normalize(developerBundle) !== normalize(selectedBundle))
   ) {
     return {
       failure:
@@ -955,7 +981,7 @@ async function discoverXcodeSelection(
   try {
     closingResolvedDeveloper = await resolveXcodePath(developerDirectory);
     closingResolvedSpellingBundle = await resolveXcodePath(
-      selectedSpellingBundle,
+      selectionResolutionPath,
     );
   } catch (error) {
     return {
@@ -964,14 +990,22 @@ async function discoverXcodeSelection(
       ),
     };
   }
-  const closingDeveloperBundle =
+  const closingResolvedDeveloperDirectory =
     closingResolvedDeveloper === undefined
       ? undefined
-      : xcodeBundleFromPath(normalize(closingResolvedDeveloper));
-  const closingSelectedBundle =
+      : normalize(closingResolvedDeveloper);
+  const closingXcodeAliasResolvedPath =
     closingResolvedSpellingBundle === undefined
       ? undefined
-      : xcodeBundleFromPath(normalize(closingResolvedSpellingBundle));
+      : normalize(closingResolvedSpellingBundle);
+  const closingDeveloperBundle =
+    closingResolvedDeveloperDirectory === undefined
+      ? undefined
+      : xcodeBundleFromPath(closingResolvedDeveloperDirectory);
+  const closingSelectedBundle =
+    closingXcodeAliasResolvedPath === undefined
+      ? undefined
+      : xcodeBundleFromPath(closingXcodeAliasResolvedPath);
 
   let finalSelection: CommandResult;
   try {
@@ -990,9 +1024,41 @@ async function discoverXcodeSelection(
     finalValue === "" ||
     finalValue.length > 1024 ||
     !isAbsolute(finalValue) ||
-    normalize(finalValue) !== developerDirectory ||
+    normalize(finalValue) !== developerDirectory
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+    };
+  }
+
+  if (selectedSpellingBundle === undefined) {
+    if (
+      closingResolvedDeveloperDirectory === undefined ||
+      closingResolvedDeveloperDirectory !== resolvedDeveloperDirectory ||
+      closingXcodeAliasResolvedPath !== xcodeAliasResolvedPath
+    ) {
+      return {
+        failure:
+          "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+      };
+    }
+
+    return {
+      selection: {
+        kind: "command-line-tools",
+        developerDirectory,
+        resolvedDeveloperDirectory,
+        xcodeAliasResolvedPath,
+      },
+    };
+  }
+
+  if (
     closingDeveloperBundle === undefined ||
     closingSelectedBundle === undefined ||
+    developerBundle === undefined ||
+    selectedBundle === undefined ||
     normalize(closingDeveloperBundle) !== normalize(closingSelectedBundle) ||
     normalize(closingDeveloperBundle) !== normalize(developerBundle) ||
     normalize(closingSelectedBundle) !== normalize(selectedBundle)
@@ -1005,6 +1071,7 @@ async function discoverXcodeSelection(
 
   return {
     selection: {
+      kind: "xcode",
       developerDirectory,
       selectedSpellingBundle: normalize(selectedSpellingBundle),
       selectedBundle: normalize(selectedBundle),
@@ -1016,10 +1083,44 @@ function xcodeSelectionChanged(
   expected: XcodeSelection,
   current: XcodeSelection,
 ): boolean {
+  if (
+    expected.kind !== current.kind ||
+    expected.developerDirectory !== current.developerDirectory
+  ) {
+    return true;
+  }
+  if (expected.kind === "xcode") {
+    return (
+      current.kind !== "xcode" ||
+      expected.selectedSpellingBundle !== current.selectedSpellingBundle ||
+      expected.selectedBundle !== current.selectedBundle
+    );
+  }
   return (
-    expected.developerDirectory !== current.developerDirectory ||
-    expected.selectedBundle !== current.selectedBundle
+    current.kind !== "command-line-tools" ||
+    expected.resolvedDeveloperDirectory !==
+      current.resolvedDeveloperDirectory ||
+    expected.xcodeAliasResolvedPath !== current.xcodeAliasResolvedPath
   );
+}
+
+function protectedXcodeBundles(selection: XcodeSelection): Set<string> {
+  const protectedBundles = new Set<string>([XCODE_ALIAS]);
+  if (selection.kind === "xcode") {
+    protectedBundles.add(selection.selectedSpellingBundle);
+    protectedBundles.add(selection.selectedBundle);
+    return protectedBundles;
+  }
+
+  for (const resolved of [
+    selection.resolvedDeveloperDirectory,
+    selection.xcodeAliasResolvedPath,
+  ]) {
+    if (resolved === undefined) continue;
+    const bundle = xcodeBundleFromPath(resolved);
+    if (bundle !== undefined) protectedBundles.add(normalize(bundle));
+  }
+  return protectedBundles;
 }
 
 async function xcodeOperations(
@@ -1041,15 +1142,16 @@ async function xcodeOperations(
   );
   if ("failure" in initial) return [xcodeFailureOperation(initial.failure)];
 
-  const preserved = new Set<string>([join(APPLICATIONS_ROOT, "Xcode.app")]);
-  preserved.add(initial.selection.selectedSpellingBundle);
-  preserved.add(initial.selection.selectedBundle);
+  const preserved = protectedXcodeBundles(initial.selection);
 
   // Preserve both the selected spelling and its real bundle. Xcode.app is a
-  // runner-image convenience alias, so its selected target is preserved too.
+  // runner-image convenience alias, so its target is preserved even when the
+  // active developer directory is the standalone Command Line Tools tree.
   for (const path of [
-    initial.selection.selectedSpellingBundle,
-    "/Applications/Xcode.app",
+    ...(initial.selection.kind === "xcode"
+      ? [initial.selection.selectedSpellingBundle]
+      : []),
+    XCODE_ALIAS,
   ]) {
     let resolved: string | undefined;
     try {
@@ -1191,12 +1293,13 @@ async function xcodeOperations(
             currentResolvedTarget === undefined
               ? undefined
               : normalize(currentResolvedTarget);
+          const currentProtectedBundles = protectedXcodeBundles(
+            current.selection,
+          );
           if (
-            target === current.selection.selectedSpellingBundle ||
-            target === current.selection.selectedBundle ||
-            normalizedResolvedTarget ===
-              current.selection.selectedSpellingBundle ||
-            normalizedResolvedTarget === current.selection.selectedBundle
+            currentProtectedBundles.has(target) ||
+            (normalizedResolvedTarget !== undefined &&
+              currentProtectedBundles.has(normalizedResolvedTarget))
           ) {
             throw new Error(
               "Xcode selection changed or the removal target now aliases the selected bundle; no Xcode bundle was removed.",
