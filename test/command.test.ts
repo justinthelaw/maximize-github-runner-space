@@ -29,6 +29,18 @@ function fakeCommandChild(pid: number): ChildProcess {
   }) as unknown as ChildProcess;
 }
 
+async function withFakeChildEventLoopRef<T>(run: () => Promise<T>): Promise<T> {
+  // A real child process and its pipes keep the event loop alive. The fake
+  // EventEmitter above has no OS handles, while runCommand intentionally
+  // unrefs its timeout, so keep these timer-driven tests realistic and stable.
+  const keepAlive = setTimeout(() => undefined, 1_000);
+  try {
+    return await run();
+  } finally {
+    clearTimeout(keepAlive);
+  }
+}
+
 test("findCommandPath skips an earlier non-executable shadow", async (context) => {
   if (process.platform === "win32") {
     context.skip("Unix executable permissions");
@@ -173,11 +185,13 @@ test("runCommand Windows timeout launches pinned System32 taskkill", async () =>
     return killer;
   }) as CommandSpawn;
 
-  const result = await runCommand(
-    process.execPath,
-    ["-e", "setTimeout(() => {}, 10_000)"],
-    { timeoutMs: 5, silent: true },
-    { platform: "win32", spawn },
+  const result = await withFakeChildEventLoopRef(() =>
+    runCommand(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 10_000)"],
+      { timeoutMs: 5, silent: true },
+      { platform: "win32", spawn },
+    ),
   );
 
   assert.equal(result.exitCode, 124);
@@ -204,11 +218,13 @@ test("runCommand Windows timeout tolerates a taskkill spawn error", async () => 
     return killer;
   }) as CommandSpawn;
 
-  const result = await runCommand(
-    process.execPath,
-    ["-e", "setTimeout(() => {}, 10_000)"],
-    { timeoutMs: 5, silent: true },
-    { platform: "win32", spawn },
+  const result = await withFakeChildEventLoopRef(() =>
+    runCommand(
+      process.execPath,
+      ["-e", "setTimeout(() => {}, 10_000)"],
+      { timeoutMs: 5, silent: true },
+      { platform: "win32", spawn },
+    ),
   );
 
   assert.equal(result.exitCode, 124);
