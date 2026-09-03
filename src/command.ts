@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { posix, win32 } from "node:path";
 import type { CommandResult, RuntimeContext } from "./types.js";
 
 export interface CommandOptions {
@@ -8,6 +9,14 @@ export interface CommandOptions {
   readonly input?: string;
   readonly timeoutMs?: number;
   readonly silent?: boolean;
+}
+
+export interface CommandPathDependencies {
+  readonly platform?: NodeJS.Platform;
+  readonly pathValue?: string;
+  readonly pathExtValue?: string;
+  readonly stat?: typeof stat;
+  readonly access?: typeof access;
 }
 
 interface CommandInvocation {
@@ -36,13 +45,15 @@ export async function runCommand(
     });
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let timedOut = false;
     let settled = false;
     let timeout: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     let hardBound: NodeJS.Timeout | undefined;
     let pendingTimedOutResult: CommandResult | undefined;
-    const maxCaptureBytes = 2 * 1024 * 1024;
+    const maxCaptureLength = 2 * 1024 * 1024;
 
     const settle = (result: CommandResult): void => {
       if (settled) return;
@@ -50,7 +61,11 @@ export async function runCommand(
       if (timeout !== undefined) clearTimeout(timeout);
       if (forceKill !== undefined) clearTimeout(forceKill);
       if (hardBound !== undefined) clearTimeout(hardBound);
-      resolve(result);
+      resolve({
+        ...result,
+        ...(stdoutTruncated ? { stdoutTruncated: true } : {}),
+        ...(stderrTruncated ? { stderrTruncated: true } : {}),
+      });
     };
 
     if (child.stdin !== null) {
@@ -78,11 +93,21 @@ export async function runCommand(
     childStderr.setEncoding("utf8");
     childStdout.on("data", (chunk: string) => {
       if (!options.silent) process.stdout.write(chunk);
-      if (stdout.length < maxCaptureBytes) stdout += chunk;
+      const remaining = maxCaptureLength - stdout.length;
+      if (chunk.length <= remaining) stdout += chunk;
+      else {
+        stdout += chunk.slice(0, Math.max(remaining, 0));
+        stdoutTruncated = true;
+      }
     });
     childStderr.on("data", (chunk: string) => {
       if (!options.silent) process.stderr.write(chunk);
-      if (stderr.length < maxCaptureBytes) stderr += chunk;
+      const remaining = maxCaptureLength - stderr.length;
+      if (chunk.length <= remaining) stderr += chunk;
+      else {
+        stderr += chunk.slice(0, Math.max(remaining, 0));
+        stderrTruncated = true;
+      }
     });
 
     const killTree = (signal: NodeJS.Signals): void => {
@@ -170,18 +195,54 @@ export async function runCommand(
 
 export async function findCommandPath(
   name: string,
+  dependencies: CommandPathDependencies = {},
 ): Promise<string | undefined> {
-  const pathEntries = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
+  const platform = dependencies.platform ?? process.platform;
+  const path = platform === "win32" ? win32 : posix;
+  const pathEntries = (dependencies.pathValue ?? process.env.PATH ?? "")
+    .split(platform === "win32" ? ";" : ":")
+    .filter(Boolean);
   const extensions =
-    process.platform === "win32"
-      ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";")
+    platform === "win32"
+      ? (
+          dependencies.pathExtValue ??
+          process.env.PATHEXT ??
+          ".EXE;.CMD;.BAT;.COM"
+        )
+          .split(";")
+          .filter(Boolean)
       : [""];
+  const allowedExtensions = new Set(
+    extensions.map((extension) => extension.toLowerCase()),
+  );
+  const suppliedExtension = platform === "win32" ? path.extname(name) : "";
+  if (
+    platform === "win32" &&
+    suppliedExtension !== "" &&
+    !allowedExtensions.has(suppliedExtension.toLowerCase())
+  ) {
+    return undefined;
+  }
+  const candidateExtensions =
+    platform === "win32" && suppliedExtension !== "" ? [""] : extensions;
+  const inspect = dependencies.stat ?? stat;
+  const checkAccess = dependencies.access ?? access;
 
   for (const pathEntry of pathEntries) {
-    for (const extension of extensions) {
-      const candidate = join(pathEntry, `${name}${extension}`);
+    for (const extension of candidateExtensions) {
+      const candidate = path.join(pathEntry, `${name}${extension}`);
+      if (
+        platform === "win32" &&
+        !allowedExtensions.has(path.extname(candidate).toLowerCase())
+      ) {
+        continue;
+      }
       try {
-        await access(candidate);
+        const candidateStats = await inspect(candidate);
+        if (!candidateStats.isFile()) continue;
+        if (platform !== "win32") {
+          await checkAccess(candidate, constants.X_OK);
+        }
         return candidate;
       } catch {
         // Continue searching PATH.

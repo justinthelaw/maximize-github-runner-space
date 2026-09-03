@@ -3,8 +3,86 @@ import { chmod, mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createLinuxAdapter } from "../src/platforms/linux.js";
+import { prepareOperations } from "../src/operations.js";
+import {
+  createLinuxAdapter,
+  selectLinuxAptPackages,
+} from "../src/platforms/linux.js";
 import { contextFor, planFor } from "./helpers.js";
+
+const databasePackageCases = [
+  {
+    component: "postgresql" as const,
+    installed: [
+      "libpq-dev:amd64",
+      "libpq-devtools",
+      "postgresql",
+      "postgresqlish",
+      "postgresql-16",
+      "xpostgresql-17",
+      "postgresql-common",
+      "postgresql-client-common:amd64",
+    ],
+    selected: [
+      "libpq-dev:amd64",
+      "postgresql",
+      "postgresql-16",
+      "postgresql-common",
+      "postgresql-client-common:amd64",
+    ],
+    residualPaths: [
+      "/var/lib/postgresql",
+      "/etc/postgresql",
+      "/usr/lib/postgresql",
+    ],
+  },
+  {
+    component: "mysql" as const,
+    installed: [
+      "libmysqlclient-dev",
+      "libmysqlclient-devtools",
+      "mysql-common:amd64",
+      "mysql-server-8.0",
+      "mysqlish",
+      "mariadb-server",
+      "xmysql-server",
+      "xmariadb-server",
+    ],
+    selected: [
+      "libmysqlclient-dev",
+      "mysql-common:amd64",
+      "mysql-server-8.0",
+      "mariadb-server",
+    ],
+    residualPaths: ["/var/lib/mysql", "/etc/mysql"],
+  },
+] as const;
+
+for (const {
+  component,
+  installed,
+  selected: expected,
+  residualPaths,
+} of databasePackageCases) {
+  test(`Linux ${component} package cleanup selects only exact database packages before residual paths`, async () => {
+    const plan = planFor(component);
+    const selected = selectLinuxAptPackages(plan, installed);
+    assert.deepEqual(selected, expected);
+
+    const adapter = await createLinuxAdapter(contextFor("linux"));
+    const operations = prepareOperations(await adapter.operations(plan), plan);
+    const apt = operations.find(({ id }) => id === "apt:selected-packages");
+    assert.ok(apt);
+    assert.equal(apt.phase, "package");
+    for (const path of residualPaths) {
+      const residual = operations.find(
+        ({ id }) => id === `${component}:${path}`,
+      );
+      assert.ok(residual, `${component} omitted residual path ${path}`);
+      assert.equal(residual.phase, "filesystem");
+    }
+  });
+}
 
 test("Linux rejects workflow overrides that point at broad allowlist parents", async () => {
   const names = [

@@ -2,6 +2,32 @@
 
 Use these notes when moving between action releases. See the [configuration reference](CONFIGURATION.md) for the current input catalog.
 
+## v0.12.2 to v0.12.3
+
+`v0.12.3` is a safety and compatibility hardening release. It has no new inputs
+and no breaking changes: existing profiles, component IDs, defaults, outputs,
+and supported runner classes remain compatible.
+
+Linux recursive removal now refuses targets that are mount points or contain a
+mounted descendant before any cleanup mutation. Skipping `maven` under `max`
+also implicitly preserves Java, and swap replacement performs stronger
+rollback checks. macOS cleanup revalidates targets at mutation time and uses a
+validated snapshot of the selected Xcode. macOS Android cleanup explicitly
+owns the SDK/NDK, `.android`, and its Gradle cache when Gradle is not protected;
+Azure CLI cleanup also owns the Azure DevOps extension. Windows Docker cleanup
+covers the current runner-image helper paths, while Windows SDK cleanup handles
+both Visual Studio-owned components and eligible standalone installer bundles
+through exact registered metadata.
+
+Release validation now separates the scheduled bounded 18-label sweep from a
+dispatch-only seven-class no-input `max` matrix on fresh runners. The generated
+distribution job is a dependency of that matrix, whose destructive smoke steps
+assert numeric outputs and zero failed operations.
+
+No input or workflow-syntax changes are required. Workflows that intentionally
+mount content below a cleanup target must unmount it first or preserve that
+component.
+
 ## v0.11.x to v0.12.0
 
 `v0.12.0` introduced cross-platform support and the three OS-specific inputs: `remove-xcode`, `remove-visual-studio`, and `remove-windows-sdk`.

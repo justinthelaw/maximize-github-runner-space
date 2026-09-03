@@ -6,8 +6,10 @@ import {
   assertSafeExistingTarget,
   assertSafeRemovalTarget,
   inspectTarget,
+  type LinuxMountInfoReader,
   type TargetInspection,
 } from "./safety.js";
+import { isWindowsReparsePoint } from "./windows-path.js";
 import type {
   CleanupPlan,
   ComponentId,
@@ -30,9 +32,30 @@ export interface RemovePathOptions {
 
 export interface RemovePathDependencies {
   readonly inspectTarget?: typeof inspectTarget;
+  readonly readLinuxMountInfo?: LinuxMountInfoReader;
+  readonly lstat?: typeof import("node:fs/promises").lstat;
+  readonly realpath?: typeof import("node:fs/promises").realpath;
+  readonly readWindowsFileAttributes?: typeof import("./windows-path.js").readWindowsFileAttributes;
   readonly remove?: typeof rm;
   readonly unlink?: typeof unlink;
   readonly runElevated?: typeof runElevated;
+}
+
+function classifyWindowsReparseInspection(
+  inspection: TargetInspection,
+  context: RuntimeContext,
+): TargetInspection {
+  if (
+    context.platform !== "windows" ||
+    !inspection.exists ||
+    inspection.fileAttributes === undefined ||
+    !isWindowsReparsePoint(inspection.fileAttributes) ||
+    inspection.isLink
+  ) {
+    return inspection;
+  }
+  const { realPath: _realPath, ...withoutRealPath } = inspection;
+  return { ...withoutRealPath, isLink: true };
 }
 
 function targetDriftFailure(
@@ -56,6 +79,26 @@ function targetDriftFailure(
       detail: `Cleanup target identity changed after validation: '${target}'.`,
     };
   }
+  if (
+    current.ancestors?.length !== expected.ancestors?.length ||
+    !(
+      expected.ancestors?.every((ancestor, index) => {
+        const other = current.ancestors?.[index];
+        return (
+          other !== undefined &&
+          ancestor.path === other.path &&
+          ancestor.kind === other.kind &&
+          ancestor.identity.device === other.identity.device &&
+          ancestor.identity.inode === other.identity.inode
+        );
+      }) ?? true
+    )
+  ) {
+    return {
+      status: "failed",
+      detail: `Cleanup target ancestor changed after validation: '${target}'.`,
+    };
+  }
   return undefined;
 }
 
@@ -77,18 +120,43 @@ export async function removePathTarget(
   const remove = dependencies.remove ?? rm;
   const unlinkTarget = dependencies.unlink ?? unlink;
   const elevate = dependencies.runElevated ?? runElevated;
-  const inspected = await inspect(target);
-  if (!inspected.exists) return { status: "not-found" };
-  try {
-    await assertSafeExistingTarget(target, allowedParents, context);
-  } catch (error) {
-    return {
-      status: "failed",
-      detail: error instanceof Error ? error.message : String(error),
-    };
-  }
+  const inspectSafely = async (): Promise<
+    | { readonly inspection: TargetInspection }
+    | { readonly failure: OperationResult }
+  > => {
+    try {
+      return {
+        inspection: classifyWindowsReparseInspection(
+          await assertSafeExistingTarget(
+            target,
+            allowedParents,
+            context,
+            dependencies,
+          ),
+          context,
+        ),
+      };
+    } catch (error) {
+      return {
+        failure: {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  };
 
-  const revalidated = await inspect(target);
+  const initialResult = await inspectSafely();
+  if ("failure" in initialResult) return initialResult.failure;
+  const inspected = initialResult.inspection;
+  if (!inspected.exists) return { status: "not-found" };
+
+  // This complete safety pass is the final observation before local mutation.
+  // Its returned classification, not an older preflight snapshot, decides
+  // whether the entry can be recursively removed or must be unlinked.
+  const revalidatedResult = await inspectSafely();
+  if ("failure" in revalidatedResult) return revalidatedResult.failure;
+  const revalidated = revalidatedResult.inspection;
   if (!revalidated.exists) return { status: "not-found" };
   const revalidationFailure = targetDriftFailure(
     inspected,
@@ -97,13 +165,18 @@ export async function removePathTarget(
   );
   if (revalidationFailure !== undefined) return revalidationFailure;
   const verifyRemoved = async (): Promise<OperationResult> => {
-    if ((await inspect(target)).exists) {
+    try {
+      if (!(await inspect(target)).exists) return { status: "removed" };
       return {
         status: "failed",
         detail: `Cleanup target still exists after removal: '${target}'.`,
       };
+    } catch (error) {
+      return {
+        status: "failed",
+        detail: error instanceof Error ? error.message : String(error),
+      };
     }
-    return { status: "removed" };
   };
 
   try {
@@ -121,22 +194,19 @@ export async function removePathTarget(
     }
     return await verifyRemoved();
   } catch (nodeError) {
+    if (
+      revalidated.isLink &&
+      (nodeError as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return await verifyRemoved();
+    }
     if (context.platform === "windows") {
       return { status: "failed", detail: (nodeError as Error).message };
     }
 
-    let elevatedTarget: TargetInspection;
-    try {
-      elevatedTarget = await inspect(target);
-    } catch (inspectionError) {
-      return {
-        status: "failed",
-        detail:
-          inspectionError instanceof Error
-            ? inspectionError.message
-            : String(inspectionError),
-      };
-    }
+    const elevatedResult = await inspectSafely();
+    if ("failure" in elevatedResult) return elevatedResult.failure;
+    const elevatedTarget = elevatedResult.inspection;
     if (!elevatedTarget.exists) return { status: "removed" };
     const elevationFailure = targetDriftFailure(
       revalidated,

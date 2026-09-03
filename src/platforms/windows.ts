@@ -9,6 +9,12 @@ import {
   validateRemovePathTarget,
 } from "../operations.js";
 import { assertSafeDirectoryTarget } from "../safety.js";
+import {
+  isWindowsReparsePoint,
+  observeStableWindowsPaths,
+  readWindowsFileAttributes,
+  type WindowsPathIdentityComparator,
+} from "../windows-path.js";
 import type {
   Adapter,
   CleanupPlan,
@@ -133,10 +139,12 @@ interface WindowsPathStats {
   readonly ino: bigint;
   readonly size: bigint;
   readonly mtimeNs: bigint;
+  readonly fileAttributes?: number;
 }
 
 export interface WindowsPathProbe {
   lstat(path: string): Promise<WindowsPathStats>;
+  fileAttributes?(paths: readonly string[]): Promise<readonly number[]>;
 }
 
 export type WindowsManagedPathProbe = WindowsPathProbe;
@@ -150,7 +158,41 @@ interface WindowsPathIdentity {
 
 const NODE_WINDOWS_PATH_PROBE: WindowsPathProbe = {
   lstat: async (path: string) => await lstat(path, { bigint: true }),
+  fileAttributes: readWindowsFileAttributes,
 };
+
+interface WindowsAttributedPath {
+  readonly path: string;
+  readonly stats: WindowsPathStats;
+  readonly fileAttributes?: number;
+}
+
+async function assertNoWindowsReparsePoints(
+  paths: readonly WindowsAttributedPath[],
+  probe: WindowsPathProbe,
+  detail: (path: string) => string,
+  additionalIdentity?: WindowsPathIdentityComparator<WindowsPathStats>,
+): Promise<readonly WindowsAttributedPath[]> {
+  const observed = await observeStableWindowsPaths(
+    paths,
+    async (path) => await probe.lstat(path),
+    probe.fileAttributes ?? readWindowsFileAttributes,
+    additionalIdentity ?? (() => true),
+  );
+  const reparseIndex = observed.findIndex(({ fileAttributes }) =>
+    isWindowsReparsePoint(fileAttributes),
+  );
+  if (reparseIndex !== -1) {
+    const path = observed[reparseIndex]?.path;
+    if (path === undefined) {
+      throw new Error(
+        "Windows file attribute probe returned malformed output.",
+      );
+    }
+    throw new Error(detail(path));
+  }
+  return observed;
+}
 
 function windowsPathIdentity(stats: WindowsPathStats): WindowsPathIdentity {
   return {
@@ -691,6 +733,745 @@ const UNINSTALL_REGISTRY_ROOTS = [
   "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
 ] as const;
 
+const WINDOWS_SDK_UNINSTALL_REGISTRY_ROOTS = [
+  "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+  "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+] as const;
+
+const WINDOWS_SDK_UNINSTALL_ARGUMENTS = [
+  "/uninstall",
+  "/quiet",
+  "/norestart",
+] as const;
+
+const WINDOWS_SDK_PACKAGE_CACHE = "C:\\ProgramData\\Package Cache";
+const WINDOWS_SDK_POSTCONDITION_DETAIL_LIMIT = 1024;
+const WINDOWS_SDK_POSTCONDITION_ENTRY_LIMIT = 8;
+
+export type WindowsSdkBundleKind = "wdk" | "sdk";
+
+export interface WindowsSdkBundleRecord {
+  readonly registryKey: string;
+  readonly displayName:
+    "Windows Driver Kit" | "Windows Software Development Kit";
+  readonly kind: WindowsSdkBundleKind;
+  readonly bundleCachePath: string;
+}
+
+export interface WindowsSdkBundleDependencies {
+  readonly inventory: () => Promise<readonly WindowsSdkBundleRecord[]>;
+  readonly probe?: WindowsPathProbe;
+  readonly execute?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
+  readonly registryExecutableExists?: (executable: string) => Promise<boolean>;
+  readonly queryRegistry?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
+}
+
+interface WindowsSdkRegistryRecordState {
+  readonly registryKey: string;
+  displayName?: string;
+  bundleCachePath?: string;
+  sawDisplayName: boolean;
+  sawBundleCachePath: boolean;
+  invalid: boolean;
+}
+
+type WindowsSdkBundleSnapshot =
+  | {
+      readonly record: WindowsSdkBundleRecord;
+      readonly status: "missing";
+      readonly ancestors: readonly WindowsSdkAncestorSnapshot[];
+    }
+  | {
+      readonly record: WindowsSdkBundleRecord;
+      readonly status: "present";
+      readonly ancestors: readonly WindowsSdkAncestorSnapshot[];
+      readonly identity: WindowsPathIdentity;
+    };
+
+interface WindowsSdkAncestorSnapshot {
+  readonly path: string;
+  readonly identity: WindowsSdkAncestorIdentity;
+}
+
+interface WindowsSdkAncestorIdentity {
+  readonly dev: bigint;
+  readonly ino: bigint;
+}
+
+function abbreviatedRegistryKey(value: string): string {
+  return value
+    .replace(/^HKEY_LOCAL_MACHINE(?=\\|$)/i, "HKLM")
+    .replace(/^HKEY_CURRENT_USER(?=\\|$)/i, "HKCU");
+}
+
+function canonicalRegistryKey(value: string): string {
+  return abbreviatedRegistryKey(value).toLowerCase();
+}
+
+function isRegistryKeyDescendant(value: string, registryRoot: string): boolean {
+  if (value.trim() !== value || registryRoot.trim() !== registryRoot) {
+    return false;
+  }
+  const abbreviated = abbreviatedRegistryKey(value);
+  const abbreviatedRoot = abbreviatedRegistryKey(registryRoot);
+  const canonical = canonicalRegistryKey(abbreviated);
+  const canonicalRoot = canonicalRegistryKey(abbreviatedRoot);
+  if (!canonical.startsWith(`${canonicalRoot}\\`)) return false;
+  const suffix = abbreviated.slice(abbreviatedRoot.length + 1);
+  return suffix !== "" && suffix.split("\\").every((segment) => segment !== "");
+}
+
+function windowsSdkKind(displayName: string): WindowsSdkBundleKind | undefined {
+  if (displayName === "Windows Driver Kit") return "wdk";
+  if (displayName === "Windows Software Development Kit") return "sdk";
+  return undefined;
+}
+
+function isWindowsSdkBundleCachePath(candidate: string): boolean {
+  return (
+    win32.isAbsolute(candidate) &&
+    isStrictWindowsDescendant(candidate, WINDOWS_SDK_PACKAGE_CACHE)
+  );
+}
+
+export function parseWindowsSdkBundleRegistry(
+  output: string,
+  registryRoot: string,
+): readonly WindowsSdkBundleRecord[] {
+  const states = new Map<string, WindowsSdkRegistryRecordState>();
+  let current: WindowsSdkRegistryRecordState | undefined;
+
+  for (const line of output.split(/\r?\n/)) {
+    const unpaddedLine = line.trim();
+    if (/^(?:HKEY_[A-Z_]+|HK[A-Z]+)(?:\\|$)/i.test(unpaddedLine)) {
+      current = undefined;
+      if (!isRegistryKeyDescendant(unpaddedLine, registryRoot)) {
+        continue;
+      }
+      const abbreviated = abbreviatedRegistryKey(unpaddedLine);
+      const canonical = canonicalRegistryKey(abbreviated);
+      const existing = states.get(canonical);
+      if (existing !== undefined) {
+        existing.invalid = true;
+        current = existing;
+        continue;
+      }
+      current = {
+        registryKey: abbreviated,
+        sawDisplayName: false,
+        sawBundleCachePath: false,
+        invalid: unpaddedLine !== line,
+      };
+      states.set(canonical, current);
+      continue;
+    }
+    if (current === undefined) continue;
+
+    const targeted = /^[ \t]*(DisplayName|BundleCachePath)(?:[ \t]|$)/i.exec(
+      line,
+    );
+    if (targeted === null) continue;
+    const value =
+      /^[ \t]+(DisplayName|BundleCachePath)[ \t]+(REG_\w+)[ \t]{4}(.*)$/i.exec(
+        line,
+      );
+    if (value === null) {
+      current.invalid = true;
+      continue;
+    }
+    const name = value[1]?.toLowerCase();
+    const type = value[2]?.toUpperCase();
+    const data = value[3] ?? "";
+    const invalidData = data === "" || data.trim() !== data;
+    if (name === "displayname") {
+      if (current.sawDisplayName) current.invalid = true;
+      current.sawDisplayName = true;
+      if (type !== "REG_SZ" || invalidData) current.invalid = true;
+      current.displayName = data;
+    } else {
+      if (current.sawBundleCachePath) current.invalid = true;
+      current.sawBundleCachePath = true;
+      if (type !== "REG_SZ" || invalidData) current.invalid = true;
+      current.bundleCachePath = data;
+    }
+  }
+
+  const records: WindowsSdkBundleRecord[] = [];
+  for (const state of states.values()) {
+    if (
+      state.invalid ||
+      !state.sawDisplayName ||
+      !state.sawBundleCachePath ||
+      state.displayName === undefined ||
+      state.bundleCachePath === undefined
+    ) {
+      continue;
+    }
+    const kind = windowsSdkKind(state.displayName);
+    if (
+      kind === undefined ||
+      !isWindowsSdkBundleCachePath(state.bundleCachePath)
+    ) {
+      continue;
+    }
+    records.push({
+      registryKey: state.registryKey,
+      displayName:
+        kind === "wdk"
+          ? "Windows Driver Kit"
+          : "Windows Software Development Kit",
+      kind,
+      bundleCachePath: state.bundleCachePath,
+    });
+  }
+  return records;
+}
+
+async function listWindowsSdkBundles(
+  paths: WindowsPaths,
+  registryExecutableExists: (executable: string) => Promise<boolean>,
+  queryRegistry: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>,
+): Promise<readonly WindowsSdkBundleRecord[]> {
+  if (!(await registryExecutableExists(paths.reg))) {
+    throw new Error(
+      `The fixed registry executable is missing: '${paths.reg}'.`,
+    );
+  }
+  const records: WindowsSdkBundleRecord[] = [];
+  for (const root of WINDOWS_SDK_UNINSTALL_REGISTRY_ROOTS) {
+    const result = await queryRegistry(paths.reg, ["query", root, "/s"]);
+    if (result.stdoutTruncated === true) {
+      throw new Error(
+        `The registry inventory for '${root}' was truncated; refusing standalone Windows SDK/WDK cleanup.`,
+      );
+    }
+    if (result.exitCode !== 0) {
+      throw new Error(failureDetail(result.stderr, paths.reg, result.exitCode));
+    }
+    records.push(...parseWindowsSdkBundleRegistry(result.stdout, root));
+  }
+  return records;
+}
+
+function validateWindowsSdkBundleRecord(record: WindowsSdkBundleRecord): void {
+  const expectedKind = windowsSdkKind(record.displayName);
+  if (expectedKind === undefined || expectedKind !== record.kind) {
+    throw new Error(
+      `Refusing inconsistent standalone Windows SDK/WDK metadata at '${record.registryKey}'.`,
+    );
+  }
+  if (
+    !WINDOWS_SDK_UNINSTALL_REGISTRY_ROOTS.some((root) =>
+      isRegistryKeyDescendant(record.registryKey, root),
+    )
+  ) {
+    throw new Error(
+      `Refusing standalone Windows SDK/WDK metadata outside the fixed uninstall roots: '${record.registryKey}'.`,
+    );
+  }
+  if (
+    record.bundleCachePath.trim() !== record.bundleCachePath ||
+    !isWindowsSdkBundleCachePath(record.bundleCachePath)
+  ) {
+    throw new Error(
+      `Refusing standalone Windows SDK/WDK bundle outside the fixed Package Cache: '${record.bundleCachePath}'.`,
+    );
+  }
+}
+
+function sortWindowsSdkBundleRecords(
+  records: readonly WindowsSdkBundleRecord[],
+): readonly WindowsSdkBundleRecord[] {
+  return [...records].sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === "wdk" ? -1 : 1;
+    return canonicalRegistryKey(left.registryKey).localeCompare(
+      canonicalRegistryKey(right.registryKey),
+    );
+  });
+}
+
+function normalizedWindowsSdkBundleRecords(
+  records: readonly WindowsSdkBundleRecord[],
+): readonly WindowsSdkBundleRecord[] {
+  const registryKeys = new Set<string>();
+  const bundlePaths = new Set<string>();
+  for (const record of records) {
+    validateWindowsSdkBundleRecord(record);
+    const registryKey = canonicalRegistryKey(record.registryKey);
+    const bundlePath = win32.normalize(record.bundleCachePath).toLowerCase();
+    if (registryKeys.has(registryKey) || bundlePaths.has(bundlePath)) {
+      throw new Error(
+        "Refusing duplicate standalone Windows SDK/WDK bundle metadata.",
+      );
+    }
+    registryKeys.add(registryKey);
+    bundlePaths.add(bundlePath);
+  }
+  return sortWindowsSdkBundleRecords(records);
+}
+
+async function inspectWindowsSdkBundle(
+  record: WindowsSdkBundleRecord,
+  probe: WindowsPathProbe,
+): Promise<WindowsSdkBundleSnapshot> {
+  const candidateParent = win32.dirname(record.bundleCachePath);
+  const relativeParent = win32.relative(
+    WINDOWS_SDK_PACKAGE_CACHE,
+    candidateParent,
+  );
+  const ancestorPaths = [
+    win32.dirname(WINDOWS_SDK_PACKAGE_CACHE),
+    WINDOWS_SDK_PACKAGE_CACHE,
+  ];
+  let ancestorPath = WINDOWS_SDK_PACKAGE_CACHE;
+  if (relativeParent !== "") {
+    for (const segment of relativeParent.split(win32.sep)) {
+      ancestorPath = win32.join(ancestorPath, segment);
+      ancestorPaths.push(ancestorPath);
+    }
+  }
+  const attributedAncestors: WindowsAttributedPath[] = [];
+  for (const path of ancestorPaths) {
+    let stats: WindowsPathStats;
+    try {
+      stats = await probe.lstat(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        const stableAncestors = await assertNoWindowsReparsePoints(
+          attributedAncestors,
+          probe,
+          (unsafePath) =>
+            `Refusing standalone Windows SDK/WDK with an unexpected ancestor type (reparse point): '${unsafePath}'.`,
+        );
+        return {
+          record,
+          status: "missing",
+          ancestors: stableAncestors.map(({ path, stats: stableStats }) => ({
+            path,
+            identity: { dev: stableStats.dev, ino: stableStats.ino },
+          })),
+        };
+      }
+      throw error;
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new Error(
+        `Refusing standalone Windows SDK/WDK with an unexpected ancestor type: '${path}'.`,
+      );
+    }
+    attributedAncestors.push({ path, stats });
+  }
+
+  let stats: WindowsPathStats;
+  try {
+    stats = await probe.lstat(record.bundleCachePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      const stableAncestors = await assertNoWindowsReparsePoints(
+        attributedAncestors,
+        probe,
+        (unsafePath) =>
+          `Refusing standalone Windows SDK/WDK with an unexpected ancestor type (reparse point): '${unsafePath}'.`,
+      );
+      return {
+        record,
+        status: "missing",
+        ancestors: stableAncestors.map(({ path, stats: stableStats }) => ({
+          path,
+          identity: { dev: stableStats.dev, ino: stableStats.ino },
+        })),
+      };
+    }
+    throw error;
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(
+      `Refusing standalone Windows SDK/WDK with an unexpected bundle file type: '${record.bundleCachePath}'.`,
+    );
+  }
+  const stablePaths = await assertNoWindowsReparsePoints(
+    [...attributedAncestors, { path: record.bundleCachePath, stats }],
+    probe,
+    (unsafePath) =>
+      unsafePath === record.bundleCachePath
+        ? `Refusing standalone Windows SDK/WDK with an unexpected bundle file type (reparse point): '${unsafePath}'.`
+        : `Refusing standalone Windows SDK/WDK with an unexpected ancestor type (reparse point): '${unsafePath}'.`,
+    (path, before, after) =>
+      path !== record.bundleCachePath ||
+      (before.size === after.size && before.mtimeNs === after.mtimeNs),
+  );
+  const stableBundle = stablePaths[stablePaths.length - 1];
+  if (
+    stableBundle === undefined ||
+    stableBundle.path !== record.bundleCachePath
+  ) {
+    throw new Error("Windows file attribute probe returned malformed output.");
+  }
+  return {
+    record,
+    status: "present",
+    ancestors: stablePaths.slice(0, -1).map(({ path, stats: stableStats }) => ({
+      path,
+      identity: { dev: stableStats.dev, ino: stableStats.ino },
+    })),
+    identity: windowsPathIdentity(stableBundle.stats),
+  };
+}
+
+async function snapshotWindowsSdkBundles(
+  inventory: WindowsSdkBundleDependencies["inventory"],
+  probe: WindowsPathProbe,
+): Promise<readonly WindowsSdkBundleSnapshot[]> {
+  const records = normalizedWindowsSdkBundleRecords(await inventory());
+  return await snapshotWindowsSdkBundleRecords(records, probe);
+}
+
+async function snapshotWindowsSdkBundleRecords(
+  records: readonly WindowsSdkBundleRecord[],
+  probe: WindowsPathProbe,
+): Promise<readonly WindowsSdkBundleSnapshot[]> {
+  const snapshots: WindowsSdkBundleSnapshot[] = [];
+  for (const record of records) {
+    snapshots.push(await inspectWindowsSdkBundle(record, probe));
+  }
+  const physicalIdentities = new Map<bigint, Map<bigint, string>>();
+  for (const snapshot of snapshots) {
+    if (snapshot.status !== "present") continue;
+    let deviceIdentities = physicalIdentities.get(snapshot.identity.dev);
+    if (deviceIdentities === undefined) {
+      deviceIdentities = new Map<bigint, string>();
+      physicalIdentities.set(snapshot.identity.dev, deviceIdentities);
+    }
+    const existing = deviceIdentities.get(snapshot.identity.ino);
+    if (existing !== undefined) {
+      throw new Error(
+        `Refusing duplicate standalone Windows SDK/WDK physical bundle identity for '${existing}' and '${snapshot.record.registryKey}'.`,
+      );
+    }
+    deviceIdentities.set(snapshot.identity.ino, snapshot.record.registryKey);
+  }
+  return snapshots;
+}
+
+function sameWindowsSdkRecordInventory(
+  records: readonly WindowsSdkBundleRecord[],
+  snapshots: readonly WindowsSdkBundleSnapshot[],
+): boolean {
+  return (
+    records.length === snapshots.length &&
+    records.every((record, index) => {
+      const snapshot = snapshots[index];
+      return (
+        snapshot !== undefined &&
+        sameWindowsSdkBundleMetadata(record, snapshot.record)
+      );
+    })
+  );
+}
+
+function sameWindowsSdkBundleMetadata(
+  left: WindowsSdkBundleRecord,
+  right: WindowsSdkBundleRecord,
+): boolean {
+  return (
+    canonicalRegistryKey(left.registryKey) ===
+      canonicalRegistryKey(right.registryKey) &&
+    left.displayName === right.displayName &&
+    left.kind === right.kind &&
+    left.bundleCachePath === right.bundleCachePath
+  );
+}
+
+function sameWindowsSdkBundleInventory(
+  left: readonly WindowsSdkBundleSnapshot[],
+  right: readonly WindowsSdkBundleSnapshot[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((snapshot, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        sameWindowsSdkBundleMetadata(snapshot.record, other.record)
+      );
+    })
+  );
+}
+
+function sameWindowsSdkBundleAncestors(
+  left: readonly WindowsSdkBundleSnapshot[],
+  right: readonly WindowsSdkBundleSnapshot[],
+): boolean {
+  return (
+    sameWindowsSdkBundleInventory(left, right) &&
+    left.every((snapshot, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        snapshot.ancestors.length === other.ancestors.length &&
+        snapshot.ancestors.every((ancestor, ancestorIndex) => {
+          const otherAncestor = other.ancestors[ancestorIndex];
+          return (
+            otherAncestor !== undefined &&
+            win32.normalize(ancestor.path).toLowerCase() ===
+              win32.normalize(otherAncestor.path).toLowerCase() &&
+            ancestor.identity.dev === otherAncestor.identity.dev &&
+            ancestor.identity.ino === otherAncestor.identity.ino
+          );
+        })
+      );
+    })
+  );
+}
+
+function sameWindowsSdkBundleSnapshots(
+  left: readonly WindowsSdkBundleSnapshot[],
+  right: readonly WindowsSdkBundleSnapshot[],
+): boolean {
+  return (
+    sameWindowsSdkBundleAncestors(left, right) &&
+    left.every((snapshot, index) => {
+      const other = right[index];
+      return (
+        other !== undefined &&
+        snapshot.status === other.status &&
+        (snapshot.status === "missing" ||
+          (other.status === "present" &&
+            sameWindowsPathIdentity(snapshot.identity, other.identity)))
+      );
+    })
+  );
+}
+
+function remainingWindowsSdkBundleDetail(
+  snapshots: readonly WindowsSdkBundleSnapshot[],
+): string {
+  const present = snapshots.filter(
+    (
+      snapshot,
+    ): snapshot is Extract<
+      WindowsSdkBundleSnapshot,
+      { readonly status: "present" }
+    > => snapshot.status === "present",
+  );
+  const listed = present
+    .slice(0, WINDOWS_SDK_POSTCONDITION_ENTRY_LIMIT)
+    .map(({ record }) => `${record.kind}:${record.registryKey}`)
+    .join(", ");
+  const omitted = present.length - WINDOWS_SDK_POSTCONDITION_ENTRY_LIMIT;
+  const detail =
+    `${present.length} standalone Windows SDK/WDK bundle(s) remain: ${listed}` +
+    (omitted > 0 ? `, and ${omitted} more` : "");
+  return detail.slice(0, WINDOWS_SDK_POSTCONDITION_DETAIL_LIMIT);
+}
+
+export function standaloneWindowsSdkOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  dependencies: Partial<WindowsSdkBundleDependencies> = {},
+): Operation {
+  const registryExecutableExists =
+    dependencies.registryExecutableExists ??
+    (async (executable: string) => await pathExists(executable));
+  const queryRegistry =
+    dependencies.queryRegistry ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: true,
+        timeoutMs: 2 * 60_000,
+      }));
+  const inventory =
+    dependencies.inventory ??
+    (async () =>
+      await listWindowsSdkBundles(
+        paths,
+        registryExecutableExists,
+        queryRegistry,
+      ));
+  const probe = dependencies.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const execute =
+    dependencies.execute ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: true,
+        timeoutMs: 30 * 60_000,
+      }));
+  let validated: readonly WindowsSdkBundleSnapshot[] | undefined;
+
+  return createFunctionOperation({
+    id: "windows:windows-sdk:standalone-bundles",
+    component: "windows-sdk",
+    description: "Uninstall standalone Windows SDK and WDK bundles",
+    phase: "package",
+    dedupeKey: "windows:windows-sdk:standalone-bundles",
+    validate: async () => {
+      if (context.platform !== "windows") {
+        throw new Error("Standalone Windows SDK cleanup requires Windows.");
+      }
+      validated = await snapshotWindowsSdkBundles(inventory, probe);
+    },
+    run: async (): Promise<OperationResult> => {
+      try {
+        if (validated === undefined) {
+          return {
+            status: "failed",
+            detail:
+              "standalone Windows SDK/WDK bundles were not validated before execution",
+          };
+        }
+        let removed = false;
+        const completedRegistryKeys = new Set<string>();
+        let expectedPending = validated;
+        for (const snapshot of validated) {
+          if (snapshot.status !== "present") continue;
+          const immediateRecords = normalizedWindowsSdkBundleRecords(
+            await inventory(),
+          );
+          const immediatePending = await snapshotWindowsSdkBundleRecords(
+            immediateRecords.filter(
+              ({ registryKey }) =>
+                !completedRegistryKeys.has(canonicalRegistryKey(registryKey)),
+            ),
+            probe,
+          );
+          if (
+            !sameWindowsSdkBundleInventory(expectedPending, immediatePending)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK inventory changed after plan validation immediately before spawn",
+            };
+          }
+          if (
+            !sameWindowsSdkBundleAncestors(expectedPending, immediatePending)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK ancestor changed after plan validation immediately before spawn",
+            };
+          }
+          if (
+            !sameWindowsSdkBundleSnapshots(expectedPending, immediatePending)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK bundle file changed after plan validation immediately before spawn",
+            };
+          }
+          const expectedRegistryKey = canonicalRegistryKey(
+            snapshot.record.registryKey,
+          );
+          const immediate = immediatePending.find(
+            ({ record }) =>
+              canonicalRegistryKey(record.registryKey) === expectedRegistryKey,
+          );
+          if (immediate?.status !== "present") {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK candidate disappeared immediately before spawn",
+            };
+          }
+
+          // Refresh registry metadata after the complete pending-set check,
+          // then make a selected-record-only filesystem inspection the final
+          // filesystem observation before spawn. A later candidate probe must
+          // never be able to invalidate the selected executable unnoticed.
+          const refreshedRecords = normalizedWindowsSdkBundleRecords(
+            await inventory(),
+          ).filter(
+            ({ registryKey }) =>
+              !completedRegistryKeys.has(canonicalRegistryKey(registryKey)),
+          );
+          if (
+            !sameWindowsSdkRecordInventory(refreshedRecords, immediatePending)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK inventory changed after plan validation immediately before spawn",
+            };
+          }
+          const refreshedRecord = refreshedRecords.find(
+            ({ registryKey }) =>
+              canonicalRegistryKey(registryKey) === expectedRegistryKey,
+          );
+          if (
+            refreshedRecord === undefined ||
+            !sameWindowsSdkBundleMetadata(refreshedRecord, immediate.record)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK inventory changed after plan validation immediately before spawn",
+            };
+          }
+          const refreshedSelected = await inspectWindowsSdkBundle(
+            refreshedRecord,
+            probe,
+          );
+          if (
+            refreshedSelected.status !== "present" ||
+            !sameWindowsSdkBundleSnapshots([immediate], [refreshedSelected])
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "standalone Windows SDK/WDK selected bundle changed immediately before spawn",
+            };
+          }
+          const result = await execute(
+            refreshedSelected.record.bundleCachePath,
+            WINDOWS_SDK_UNINSTALL_ARGUMENTS,
+          );
+          if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+            return {
+              status: "failed",
+              detail: failureDetail(
+                result.stderr,
+                snapshot.record.bundleCachePath,
+                result.exitCode,
+              ),
+            };
+          }
+          removed = true;
+          completedRegistryKeys.add(expectedRegistryKey);
+          expectedPending = expectedPending.filter(
+            ({ record }) =>
+              canonicalRegistryKey(record.registryKey) !== expectedRegistryKey,
+          );
+        }
+
+        const remaining = await snapshotWindowsSdkBundles(inventory, probe);
+        if (remaining.some(({ status }) => status === "present")) {
+          return {
+            status: "failed",
+            detail: remainingWindowsSdkBundleDetail(remaining),
+          };
+        }
+        return removed ? { status: "removed" } : { status: "not-found" };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+}
+
 function parseMsiProducts(output: string): readonly MsiProduct[] {
   const products: MsiProduct[] = [];
   let currentProductCode: string | undefined;
@@ -874,10 +1655,23 @@ async function inspectExecutableUninstallCandidate(
     executable = await probe.lstat(candidate.executable);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      const [stableRoot] = await assertNoWindowsReparsePoints(
+        [{ path: candidate.installationRoot, stats: root }],
+        probe,
+        (path) =>
+          `Refusing executable uninstaller with a reparse-point installation root: '${path}'.`,
+        (_path, before, after) =>
+          before.size === after.size && before.mtimeNs === after.mtimeNs,
+      );
+      if (stableRoot === undefined) {
+        throw new Error(
+          "Windows file attribute probe returned malformed output.",
+        );
+      }
       return {
         candidate,
         status: "executable-absent",
-        root: windowsPathIdentity(root),
+        root: windowsPathIdentity(stableRoot.stats),
       };
     }
     throw error;
@@ -887,11 +1681,27 @@ async function inspectExecutableUninstallCandidate(
       `Refusing executable uninstaller with an unexpected executable type: '${candidate.executable}'.`,
     );
   }
+  const [stableRoot, stableExecutable] = await assertNoWindowsReparsePoints(
+    [
+      { path: candidate.installationRoot, stats: root },
+      { path: candidate.executable, stats: executable },
+    ],
+    probe,
+    (path) =>
+      path === candidate.installationRoot
+        ? `Refusing executable uninstaller with a reparse-point installation root: '${path}'.`
+        : `Refusing executable uninstaller with a reparse-point executable: '${path}'.`,
+    (_path, before, after) =>
+      before.size === after.size && before.mtimeNs === after.mtimeNs,
+  );
+  if (stableRoot === undefined || stableExecutable === undefined) {
+    throw new Error("Windows file attribute probe returned malformed output.");
+  }
   return {
     candidate,
     status: "present",
-    root: windowsPathIdentity(root),
-    executable: windowsPathIdentity(executable),
+    root: windowsPathIdentity(stableRoot.stats),
+    executable: windowsPathIdentity(stableExecutable.stats),
   };
 }
 
@@ -1301,24 +2111,59 @@ export function managedDirectoryUninstallOperation(options: {
       }
       throw error;
     }
+    let uninstaller: WindowsPathStats;
     try {
-      const uninstaller = await probe.lstat(executable);
-      if (uninstaller.isSymbolicLink() || !uninstaller.isFile()) {
-        throw new Error(
-          `Refusing managed uninstaller with an unexpected target type: '${executable}'.`,
-        );
-      }
-      return {
-        status: "root-present",
-        root: windowsPathIdentity(root),
-        uninstaller: windowsPathIdentity(uninstaller),
-      };
+      uninstaller = await probe.lstat(executable);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return { status: "root-present", root: windowsPathIdentity(root) };
+        const [stableRoot] = await assertNoWindowsReparsePoints(
+          [{ path: options.target, stats: root }],
+          probe,
+          (path) =>
+            `Refusing managed directory with a reparse-point target: '${path}'.`,
+          (_path, before, after) =>
+            before.size === after.size && before.mtimeNs === after.mtimeNs,
+        );
+        if (stableRoot === undefined) {
+          throw new Error(
+            "Windows file attribute probe returned malformed output.",
+          );
+        }
+        return {
+          status: "root-present",
+          root: windowsPathIdentity(stableRoot.stats),
+        };
       }
       throw error;
     }
+    if (uninstaller.isSymbolicLink() || !uninstaller.isFile()) {
+      throw new Error(
+        `Refusing managed uninstaller with an unexpected target type: '${executable}'.`,
+      );
+    }
+    const [stableRoot, stableUninstaller] = await assertNoWindowsReparsePoints(
+      [
+        { path: options.target, stats: root },
+        { path: executable, stats: uninstaller },
+      ],
+      probe,
+      (path) =>
+        path === options.target
+          ? `Refusing managed directory with a reparse-point target: '${path}'.`
+          : `Refusing managed uninstaller with a reparse-point executable: '${path}'.`,
+      (_path, before, after) =>
+        before.size === after.size && before.mtimeNs === after.mtimeNs,
+    );
+    if (stableRoot === undefined || stableUninstaller === undefined) {
+      throw new Error(
+        "Windows file attribute probe returned malformed output.",
+      );
+    }
+    return {
+      status: "root-present",
+      root: windowsPathIdentity(stableRoot.stats),
+      uninstaller: windowsPathIdentity(stableUninstaller.stats),
+    };
   };
   let validatedState: ManagedTargets | undefined;
   const sameTargets = (left: ManagedTargets, right: ManagedTargets): boolean =>
@@ -1392,16 +2237,36 @@ function residualPathOperation(
   });
 }
 
-function dockerEngineOperation(
-  context: RuntimeContext,
+export function windowsDockerEngineTargets(
   paths: WindowsPaths,
-): Operation {
-  const targets = [
+): readonly string[] {
+  return [
     win32.join(paths.system32, "docker.exe"),
     win32.join(paths.system32, "dockerd.exe"),
     win32.join(paths.systemRoot, "SysWOW64", "docker.exe"),
     win32.join(paths.programData, "docker", "cli-plugins"),
+    win32.join(paths.programFiles, "docker", "cli-plugins"),
+    win32.join(paths.system32, "docker-credential-wincred.exe"),
   ];
+}
+
+export interface WindowsDockerEngineDependencies {
+  readonly validateTarget?: (target: string) => Promise<void>;
+  readonly removeTarget?: (target: string) => Promise<OperationResult>;
+}
+
+export function dockerEngineOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  dependencies: WindowsDockerEngineDependencies = {},
+): Operation {
+  const targets = windowsDockerEngineTargets(paths);
+  const validateTarget =
+    dependencies.validateTarget ??
+    (async (target: string) => await validateExactTarget(context, target));
+  const removeTarget =
+    dependencies.removeTarget ??
+    (async (target: string) => await removeExactTarget(context, target));
   return createFunctionOperation({
     id: "windows:docker:engine",
     component: "docker-engine",
@@ -1410,19 +2275,14 @@ function dockerEngineOperation(
     dedupeKey: "windows:docker:engine",
     validate: async () => {
       for (const target of targets) {
-        await validateExactTarget(context, target);
+        await validateTarget(target);
       }
     },
     run: async (): Promise<OperationResult> => {
-      const hadTargets = (await Promise.all(targets.map(pathExists))).some(
-        Boolean,
-      );
-      if (!hadTargets) return { status: "not-found" };
-
       const failures: string[] = [];
       let removed = false;
       for (const target of targets) {
-        const result = await removeExactTarget(context, target);
+        const result = await removeTarget(target);
         if (result.status === "removed") removed = true;
         if (result.status === "failed") {
           failures.push(`${target}: ${result.detail ?? "removal failed"}`);
@@ -1436,8 +2296,13 @@ function dockerEngineOperation(
   });
 }
 
+export interface WindowsAdapterDependencies {
+  readonly dockerEngine?: WindowsDockerEngineDependencies;
+}
+
 export async function createWindowsAdapter(
   context: RuntimeContext,
+  dependencies: WindowsAdapterDependencies = {},
 ): Promise<Adapter> {
   const normalizedHome = win32.normalize(context.home);
   if (normalizedHome.toLowerCase() !== "c:\\users\\runneradmin") {
@@ -1948,12 +2813,16 @@ export async function createWindowsAdapter(
           blockedBy: ["docker-images"],
         }),
       );
-      operations.push(dockerEngineOperation(context, paths));
+      operations.push(
+        dockerEngineOperation(context, paths, dependencies.dockerEngine),
+      );
 
-      // A successful complete Visual Studio uninstall includes its SDK
-      // workloads. Keep the narrower SDK operation as an outcome-dependent
-      // fallback so an absent or failed broad uninstall does not suppress an
-      // explicitly selected SDK cleanup.
+      // Standalone Burn bundles are independent of Visual Studio instances and
+      // must be handled before the broad instance uninstall. A successful
+      // complete Visual Studio uninstall includes its component workloads, so
+      // keep only the narrower component operation as an outcome-dependent
+      // fallback.
+      operations.push(standaloneWindowsSdkOperation(context, paths));
       operations.push(visualStudioOperation(paths, visualStudioInstances));
       operations.push(windowsSdkOperation(paths, visualStudioInstances));
 

@@ -64,10 +64,11 @@ test("skipping an umbrella protects every owned child", () => {
     "haskell",
     "swift",
     "julia",
-    "java",
   ] as const) {
     assert.equal(plan.enabled.has(component), true, component);
   }
+  assert.equal(plan.skipped.has("java"), true);
+  assert.equal(plan.enabled.has("java"), false);
 });
 
 test("skipping one child preserves it while enabling sibling cleanup", () => {
@@ -95,6 +96,50 @@ test("toolcache owners cannot be deleted by the broad cache operation", () => {
     assert.equal(plan.enabled.has("cached-tools"), false, owner);
     assert.equal(plan.enabled.has(owner), false, owner);
   }
+});
+
+test("skipping Java-dependent tools preserves Java and the toolcache", () => {
+  for (const component of [
+    "android",
+    "maven",
+    "gradle",
+    "ant",
+    "selenium",
+  ] as const) {
+    const plan = createPlan(inputs({ "skip-components": component }));
+    assert.equal(plan.skipped.has(component), true, component);
+    assert.equal(plan.skipped.has("java"), true, component);
+    assert.equal(plan.enabled.has(component), false, component);
+    assert.equal(plan.enabled.has("java"), false, component);
+    assert.equal(plan.enabled.has("cached-tools"), false, component);
+  }
+});
+
+test("multiple Java-dependent skips reach the same preservation closure", () => {
+  const plan = createPlan(inputs({ "skip-components": "android,maven" }));
+  for (const component of ["android", "maven", "java"] as const) {
+    assert.equal(plan.skipped.has(component), true, component);
+    assert.equal(plan.enabled.has(component), false, component);
+  }
+  assert.equal(plan.enabled.has("cached-tools"), false);
+});
+
+test("unrelated skips do not preserve Java", () => {
+  const plan = createPlan(inputs({ "skip-components": "php" }));
+  assert.equal(plan.skipped.has("java"), false);
+  assert.equal(plan.enabled.has("java"), true);
+});
+
+test("custom ignores skipped dependencies and enables explicitly requested Java", () => {
+  const plan = createPlan(
+    inputs({
+      "cleanup-profile": "custom",
+      "skip-components": "maven",
+      "remove-java": "true",
+    }),
+  );
+  assert.equal(plan.skipped.size, 0);
+  assert.equal(plan.enabled.has("java"), true);
 });
 
 test("the Linux large-packages umbrella yields to protected components", () => {

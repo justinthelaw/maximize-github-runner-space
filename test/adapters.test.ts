@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { win32 } from "node:path";
 import { COMPONENTS } from "../src/components.js";
 import {
   createLinuxAdapter,
@@ -22,10 +23,17 @@ import {
   type WindowsPathProbe,
   type WindowsServiceControl,
   windowsPaths,
+  windowsDockerEngineTargets,
 } from "../src/platforms/windows.js";
 import { prepareOperations } from "../src/operations.js";
 import { createPlan } from "../src/planner.js";
-import type { Adapter, ComponentId, Platform } from "../src/types.js";
+import type {
+  Adapter,
+  ComponentId,
+  OperationResult,
+  Platform,
+  RuntimeContext,
+} from "../src/types.js";
 import { contextFor, planFor } from "./helpers.js";
 
 const factories: Readonly<Record<Platform, () => Promise<Adapter>>> = {
@@ -118,6 +126,36 @@ test("macOS ignores workflow path overrides outside exact image definitions", as
       else process.env[name] = value;
     }
   }
+});
+
+test("macOS schedules only scoped Android and Azure user cleanup paths", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"));
+  const plan = maxPlan();
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+
+  assert.deepEqual(
+    prepared
+      .filter(({ component }) => component === "android")
+      .map(({ id }) => id)
+      .filter((id) => id.includes(".android") || id.includes(".gradle")),
+    ["android:/Users/runner/.android", "android:/Users/runner/.gradle"],
+  );
+  assert.deepEqual(
+    prepared.find(({ id }) => id === "android:/Users/runner/.gradle")
+      ?.blockedBy,
+    ["gradle"],
+  );
+  assert.equal(
+    prepared.some(
+      ({ id }) =>
+        id === "azure-cli:/Users/runner/.azure/cliextensions/azure-devops",
+    ),
+    true,
+  );
+  assert.equal(
+    prepared.some(({ id }) => id === "azure-cli:/Users/runner/.azure"),
+    false,
+  );
 });
 
 test("Windows fails closed for a home outside the users directory", async () => {
@@ -240,10 +278,13 @@ test("skipping Visual Studio preserves every overlapping Windows toolchain", asy
   );
 });
 
-test("Windows SDK cleanup is an outcome-dependent Visual Studio fallback", async () => {
+test("Windows SDK cleanup orders standalone bundles before Visual Studio and keeps only the component fallback covered", async () => {
   const adapter = await createWindowsAdapter(contextFor("windows"));
   const plan = planFor("visual-studio", "windows-sdk", "azcopy");
   const prepared = prepareOperations(await adapter.operations(plan), plan);
+  const standaloneIndex = prepared.findIndex(
+    ({ id }) => id === "windows:windows-sdk:standalone-bundles",
+  );
   const visualStudioIndex = prepared.findIndex(
     ({ id }) => id === "windows:visual-studio:uninstall",
   );
@@ -252,9 +293,15 @@ test("Windows SDK cleanup is an outcome-dependent Visual Studio fallback", async
   );
   const windowsSdk = prepared[windowsSdkIndex];
 
+  assert.notEqual(standaloneIndex, -1);
   assert.notEqual(visualStudioIndex, -1);
   assert.notEqual(windowsSdkIndex, -1);
+  assert.ok(standaloneIndex < visualStudioIndex);
   assert.ok(visualStudioIndex < windowsSdkIndex);
+  assert.equal(
+    prepared[standaloneIndex]?.coveredBySuccessfulOperations,
+    undefined,
+  );
   assert.deepEqual(windowsSdk?.coveredBySuccessfulOperations, [
     "windows:visual-studio:uninstall",
   ]);
@@ -338,6 +385,84 @@ test("Windows Docker engine cleanup owns its image data without a redundant prun
     prepared.find(({ id }) => id === "windows:docker:engine")?.phase,
     "system",
   );
+});
+
+test("Windows Docker engine cleanup tracks current definition helpers", async () => {
+  const paths = windowsPaths();
+  const targets = windowsDockerEngineTargets(paths);
+  const expectedTargets = [
+    win32.join(paths.system32, "docker.exe"),
+    win32.join(paths.system32, "dockerd.exe"),
+    win32.join(paths.systemRoot, "SysWOW64", "docker.exe"),
+    win32.join(paths.programData, "docker", "cli-plugins"),
+    win32.join(paths.programFiles, "docker", "cli-plugins"),
+    win32.join(paths.system32, "docker-credential-wincred.exe"),
+  ];
+  const adapter = await createWindowsAdapter(contextFor("windows"));
+  const plan = planFor("docker-engine");
+  const prepared = prepareOperations(await adapter.operations(plan), plan);
+  const engine = prepared.find(({ id }) => id === "windows:docker:engine");
+
+  assert.deepEqual(targets, expectedTargets);
+  assert.equal(engine?.component, "docker-engine");
+  const expectedParents = new Map([
+    [expectedTargets[3], win32.join(paths.programData, "docker")],
+    [expectedTargets[4], win32.join(paths.programFiles, "docker")],
+    [expectedTargets[5], paths.system32],
+  ]);
+  for (const target of expectedTargets.slice(3)) {
+    assert.equal(
+      targets.filter((candidate) => candidate === target).length,
+      1,
+      `expected exactly one Docker Engine target for ${target}`,
+    );
+    assert.equal(
+      win32.dirname(target),
+      expectedParents.get(target),
+      `expected a fixed allowlist parent for ${target}`,
+    );
+  }
+});
+
+test("Windows Docker engine cleanup consumes every helper through injected safety boundaries", async () => {
+  const paths = windowsPaths();
+  const targets = windowsDockerEngineTargets(paths);
+  const validated: string[] = [];
+  const removed: string[] = [];
+  type DockerDependencies = {
+    readonly dockerEngine?: {
+      readonly validateTarget?: (target: string) => Promise<void>;
+      readonly removeTarget?: (target: string) => Promise<OperationResult>;
+    };
+  };
+  const createWithDependencies = createWindowsAdapter as unknown as (
+    context: RuntimeContext,
+    dependencies?: DockerDependencies,
+  ) => Promise<Adapter>;
+  const adapter = await createWithDependencies(contextFor("windows"), {
+    dockerEngine: {
+      validateTarget: async (target) => {
+        validated.push(target);
+      },
+      removeTarget: async (target) => {
+        removed.push(target);
+        return {
+          status: target === targets[0] ? "removed" : "not-found",
+        };
+      },
+    },
+  });
+  const plan = planFor("docker-engine");
+  const operation = prepareOperations(
+    await adapter.operations(plan),
+    plan,
+  ).find(({ id }) => id === "windows:docker:engine");
+  assert.ok(operation?.validate);
+
+  await operation.validate();
+  assert.deepEqual(await operation.run(), { status: "removed" });
+  assert.deepEqual(validated, targets);
+  assert.deepEqual(removed, targets);
 });
 
 test("Linux Docker data cleanup has a fatal service-stop precondition", async () => {
@@ -716,19 +841,229 @@ function windowsPathStats(
   kind: "directory" | "file",
   options: {
     readonly link?: boolean;
+    readonly fileAttributes?: number;
     readonly ino?: bigint;
+    readonly size?: bigint;
+    readonly mtimeNs?: bigint;
   } = {},
 ): Awaited<ReturnType<WindowsPathProbe["lstat"]>> {
-  return {
-    isDirectory: () => kind === "directory",
-    isFile: () => kind === "file",
-    isSymbolicLink: () => options.link ?? false,
-    dev: 1n,
-    ino: options.ino ?? (kind === "directory" ? 2n : 3n),
-    size: 4n,
-    mtimeNs: 5n,
-  };
+  return Object.assign(
+    {
+      isDirectory: () => kind === "directory",
+      isFile: () => kind === "file",
+      isSymbolicLink: () => options.link ?? false,
+      dev: 1n,
+      ino: options.ino ?? (kind === "directory" ? 2n : 3n),
+      size: options.size ?? 4n,
+      mtimeNs: options.mtimeNs ?? 5n,
+    },
+    { fileAttributes: options.fileAttributes ?? 0 },
+  );
 }
+
+function windowsPathStatsWithoutAttributes(
+  kind: "directory" | "file",
+  options: Parameters<typeof windowsPathStats>[1] = {},
+): Awaited<ReturnType<WindowsPathProbe["lstat"]>> {
+  const { fileAttributes: _fileAttributes, ...stats } = windowsPathStats(
+    kind,
+    options,
+  );
+  return stats;
+}
+
+test("Windows executable uninstall rejects ordinary-looking reparse roots and files", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  for (const reparsePath of [installationRoot, executable]) {
+    let executions = 0;
+    const operation = executableUninstallOperation({
+      context: contextFor("windows"),
+      component: "postgresql",
+      id: "postgresql-reparse-test",
+      description: "test PostgreSQL reparse protection",
+      candidates: [{ installationRoot, executable }],
+      args: ["--mode", "unattended"],
+      probe: {
+        lstat: async (path) =>
+          windowsPathStats(path === installationRoot ? "directory" : "file", {
+            fileAttributes: path === reparsePath ? 0x400 : 0,
+          }),
+      },
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await assert.rejects(operation.validate(), /reparse/i);
+    assert.equal(executions, 0);
+  }
+});
+
+test("Windows executable uninstall rejects identity drift during its attribute probe", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  let transitioned = false;
+  let executions = 0;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-attribute-transition-test",
+    description: "test PostgreSQL attribute transition",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStatsWithoutAttributes(
+          path === installationRoot ? "directory" : "file",
+          { ino: path === executable && transitioned ? 99n : 3n },
+        ),
+      fileAttributes: async (paths) => {
+        transitioned = true;
+        return paths.map(() => 0);
+      },
+    },
+    execute: async () => {
+      executions += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+
+  await assert.rejects(
+    operation.validate(),
+    /identity.*changed|changed.*attribute/i,
+  );
+  assert.equal(executions, 0);
+});
+
+test("Windows executable uninstall rejects size-only and mtime-only drift during attributes", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  for (const changedField of ["size", "mtimeNs"] as const) {
+    let transitioned = false;
+    let executions = 0;
+    const operation = executableUninstallOperation({
+      context: contextFor("windows"),
+      component: "postgresql",
+      id: `postgresql-${changedField}-transition-test`,
+      description: `test PostgreSQL ${changedField} transition`,
+      candidates: [{ installationRoot, executable }],
+      args: ["--mode", "unattended"],
+      probe: {
+        lstat: async (path) =>
+          windowsPathStatsWithoutAttributes(
+            path === installationRoot ? "directory" : "file",
+            {
+              size:
+                path === executable && transitioned && changedField === "size"
+                  ? 99n
+                  : 4n,
+              mtimeNs:
+                path === executable &&
+                transitioned &&
+                changedField === "mtimeNs"
+                  ? 99n
+                  : 5n,
+            },
+          ),
+        fileAttributes: async (paths) => {
+          transitioned = true;
+          return paths.map(() => 0);
+        },
+      },
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+
+    await assert.rejects(operation.validate(), /identity|kind.*changed/i);
+    assert.equal(executions, 0);
+  }
+});
+
+test("Windows executable uninstall spawns adjacent to its explicit-attribute observation", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  const events: string[] = [];
+  let attributeCalls = 0;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-attribute-adjacency-test",
+    description: "test PostgreSQL attribute adjacency",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) => {
+        events.push(`lstat:${path}`);
+        return windowsPathStatsWithoutAttributes(
+          path === installationRoot ? "directory" : "file",
+        );
+      },
+      fileAttributes: async (paths) => {
+        attributeCalls += 1;
+        events.push(`attributes:${paths.join("|")}`);
+        return paths.map(() => 0);
+      },
+    },
+    execute: async () => {
+      assert.deepEqual(events.slice(-3), [
+        `attributes:${installationRoot}|${executable}`,
+        `lstat:${installationRoot}`,
+        `lstat:${executable}`,
+      ]);
+      events.push("execute");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+  await operation.validate();
+
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(attributeCalls, 3);
+  assert.equal(events.filter((event) => event === "execute").length, 1);
+});
+
+test("Windows executable uninstall stabilizes a present root when its child is missing", async () => {
+  const installationRoot = "C:\\Program Files\\PostgreSQL\\17";
+  const executable = `${installationRoot}\\uninstall-postgresql.exe`;
+  let transitioned = false;
+  let executions = 0;
+  const operation = executableUninstallOperation({
+    context: contextFor("windows"),
+    component: "postgresql",
+    id: "postgresql-missing-child-transition-test",
+    description: "test PostgreSQL missing child transition",
+    candidates: [{ installationRoot, executable }],
+    args: ["--mode", "unattended"],
+    probe: {
+      lstat: async (path) => {
+        if (path === executable) {
+          throw Object.assign(new Error("missing"), { code: "ENOENT" });
+        }
+        return windowsPathStatsWithoutAttributes("directory", {
+          ino: transitioned ? 99n : 2n,
+        });
+      },
+      fileAttributes: async (paths) => {
+        transitioned = true;
+        return paths.map(() => 0);
+      },
+    },
+    execute: async () => {
+      executions += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+
+  await assert.rejects(operation.validate(), /identity.*changed/i);
+  assert.equal(executions, 0);
+});
 
 test("Windows executable uninstall preflights all roots and executable types before spawn", async () => {
   const safeRoot = "C:\\Program Files\\Mozilla Firefox";
@@ -907,6 +1242,199 @@ test("Windows managed uninstall rejects a junction root and linked uninstaller",
   }
 });
 
+test("Windows managed uninstall rejects ordinary-looking reparse roots and files", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  for (const reparsePath of [root, executable]) {
+    let executions = 0;
+    const operation = managedDirectoryUninstallOperation({
+      context: contextFor("windows"),
+      component: "miniconda",
+      id: "miniconda-reparse-test",
+      description: "test Miniconda reparse protection",
+      target: root,
+      uninstaller: "Uninstall-Miniconda3.exe",
+      args: ["/S"],
+      probe: {
+        lstat: async (path) =>
+          windowsPathStats(path === root ? "directory" : "file", {
+            fileAttributes: path === reparsePath ? 0x400 : 0,
+          }),
+      },
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+    await assert.rejects(operation.validate(), /reparse/i);
+    assert.equal(executions, 0);
+  }
+});
+
+test("Windows managed uninstall rejects identity drift during its attribute probe", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  let transitioned = false;
+  let executions = 0;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-attribute-transition-test",
+    description: "test Miniconda attribute transition",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStatsWithoutAttributes(
+          path === root ? "directory" : "file",
+          {
+            ino: path === executable && transitioned ? 99n : 3n,
+          },
+        ),
+      fileAttributes: async (paths) => {
+        transitioned = true;
+        return paths.map(() => 0);
+      },
+    },
+    execute: async () => {
+      executions += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+
+  await assert.rejects(
+    operation.validate(),
+    /identity.*changed|changed.*attribute/i,
+  );
+  assert.equal(executions, 0);
+});
+
+test("Windows managed uninstall rejects size-only and mtime-only drift during attributes", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  for (const changedField of ["size", "mtimeNs"] as const) {
+    let transitioned = false;
+    let executions = 0;
+    const operation = managedDirectoryUninstallOperation({
+      context: contextFor("windows"),
+      component: "miniconda",
+      id: `miniconda-${changedField}-transition-test`,
+      description: `test Miniconda ${changedField} transition`,
+      target: root,
+      uninstaller: "Uninstall-Miniconda3.exe",
+      args: ["/S"],
+      probe: {
+        lstat: async (path) =>
+          windowsPathStatsWithoutAttributes(
+            path === root ? "directory" : "file",
+            {
+              size:
+                path === executable && transitioned && changedField === "size"
+                  ? 99n
+                  : 4n,
+              mtimeNs:
+                path === executable &&
+                transitioned &&
+                changedField === "mtimeNs"
+                  ? 99n
+                  : 5n,
+            },
+          ),
+        fileAttributes: async (paths) => {
+          transitioned = true;
+          return paths.map(() => 0);
+        },
+      },
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    });
+    assert.ok(operation.validate);
+
+    await assert.rejects(operation.validate(), /identity|kind.*changed/i);
+    assert.equal(executions, 0);
+  }
+});
+
+test("Windows managed uninstall spawns adjacent to its explicit-attribute observation", async () => {
+  const root = "C:\\Miniconda";
+  const executable = `${root}\\Uninstall-Miniconda3.exe`;
+  const events: string[] = [];
+  let attributeCalls = 0;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-attribute-adjacency-test",
+    description: "test Miniconda attribute adjacency",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) => {
+        events.push(`lstat:${path}`);
+        return windowsPathStatsWithoutAttributes(
+          path === root ? "directory" : "file",
+        );
+      },
+      fileAttributes: async (paths) => {
+        attributeCalls += 1;
+        events.push(`attributes:${paths.join("|")}`);
+        return paths.map(() => 0);
+      },
+    },
+    execute: async () => {
+      assert.deepEqual(events.slice(-3), [
+        `attributes:${root}|${executable}`,
+        `lstat:${root}`,
+        `lstat:${executable}`,
+      ]);
+      events.push("execute");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+  assert.ok(operation.validate);
+  await operation.validate();
+
+  assert.equal((await operation.run()).status, "removed");
+  assert.equal(attributeCalls, 2);
+  assert.equal(events.filter((event) => event === "execute").length, 1);
+});
+
+test("Windows managed uninstall does not treat attribute-time ENOENT as initial child absence", async () => {
+  const root = "C:\\Miniconda";
+  let attributeCalls = 0;
+  const operation = managedDirectoryUninstallOperation({
+    context: contextFor("windows"),
+    component: "miniconda",
+    id: "miniconda-attribute-enoent-test",
+    description: "test Miniconda attribute ENOENT",
+    target: root,
+    uninstaller: "Uninstall-Miniconda3.exe",
+    args: ["/S"],
+    probe: {
+      lstat: async (path) =>
+        windowsPathStatsWithoutAttributes(path === root ? "directory" : "file"),
+      fileAttributes: async (paths) => {
+        attributeCalls += 1;
+        if (attributeCalls === 1) {
+          throw Object.assign(new Error("changed during attributes"), {
+            code: "ENOENT",
+          });
+        }
+        return paths.map(() => 0);
+      },
+    },
+  });
+  assert.ok(operation.validate);
+
+  await assert.rejects(operation.validate(), /changed during attributes/);
+  assert.equal(attributeCalls, 1);
+});
+
 test("Windows managed uninstall rechecks file identity immediately before spawn", async () => {
   const root = "C:\\Miniconda";
   const executable = `${root}\\Uninstall-Miniconda3.exe`;
@@ -921,6 +1449,7 @@ test("Windows managed uninstall rechecks file identity immediately before spawn"
       ino: path === root ? 2n : ++executableChecks === 1 ? 3n : 99n,
       size: 4n,
       mtimeNs: 5n,
+      fileAttributes: 0,
     }),
   };
   const operation = managedDirectoryUninstallOperation({

@@ -58,9 +58,69 @@ jobs:
         with:
           persist-credentials: false
 
-      # Keep the configured swap active across every compatibility assertion,
-      # including historical no-input max. Remove it only after preservation is
-      # proven so this one runner covers the full transactional lifecycle.
+      - name: Prepare a mounted Swift cleanup boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="${RUNNER_TEMP}/maximize-space-swift-source"
+          target="/usr/share/swift/maximize-space-bind-mount"
+          marker="/usr/share/swift/maximize-space-ordinary-marker"
+          owner="${RUNNER_TEMP}/maximize-space-swift-fixture-owned"
+          test ! -e "$source"
+          test ! -e "$target"
+          test ! -e "$marker"
+          test ! -e "$owner"
+          : >"$owner"
+          install -d "$source"
+          printf '%s\n' preserve-me >"${source}/sentinel"
+          sudo install -d "$target"
+          sudo touch "$marker"
+          sudo mount --bind "$source" "$target"
+
+      - name: Refuse Swift cleanup across a mounted descendant
+        id: mounted-swift
+        continue-on-error: true
+        uses: ./
+        with:
+          cleanup-profile: custom
+          remove-swift: "true"
+
+      - name: Verify mounted Swift cleanup failed before mutation
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.mounted-swift.outcome }}
+        run: |
+          set -euo pipefail
+          source="${RUNNER_TEMP}/maximize-space-swift-source"
+          target="/usr/share/swift/maximize-space-bind-mount"
+          marker="/usr/share/swift/maximize-space-ordinary-marker"
+          [[ "$OUTCOME" == failure ]]
+          mountpoint -q "$target"
+          test -f "${source}/sentinel"
+          test -f "${target}/sentinel"
+          test -f "$marker"
+          test -d /usr/share/swift
+
+      - name: Remove mounted Swift cleanup fixture
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="${RUNNER_TEMP}/maximize-space-swift-source"
+          target="/usr/share/swift/maximize-space-bind-mount"
+          marker="/usr/share/swift/maximize-space-ordinary-marker"
+          owner="${RUNNER_TEMP}/maximize-space-swift-fixture-owned"
+          if [[ -f "$owner" ]]; then
+            if mountpoint -q "$target"; then
+              sudo umount "$target"
+            fi
+            sudo rm -rf -- "$target" "$marker"
+            rm -rf -- "$source" "$owner"
+          fi
+
+      # Keep the configured swap active across every compatibility assertion.
+      # Remove it only after preservation is proven so this runner covers the
+      # full transactional lifecycle.
       - name: Prepare untrusted swap utility shims
         shell: bash
         run: |
@@ -127,6 +187,8 @@ jobs:
           command -v azcopy >/dev/null
           command -v firefox >/dev/null
           command -v google-chrome >/dev/null
+          command -v mvn >/dev/null
+          command -v java >/dev/null
 
       - name: Preserve exact custom-toggle semantics
         uses: ./
@@ -176,7 +238,7 @@ jobs:
         uses: ./
         with:
           cleanup-profile: " MaX "
-          skip-components: " DotNet , Cached-Node , Firefox "
+          skip-components: " DotNet , Cached-Node , Firefox , Maven "
 
       - name: Verify skipped children survived and sibling cleanup ran
         shell: bash
@@ -194,6 +256,9 @@ jobs:
           test ! -e "${RUNNER_TOOL_CACHE}/Python"
           test -x /home/linuxbrew/.linuxbrew/bin/brew
           command -v firefox >/dev/null
+          command -v mvn >/dev/null
+          command -v java >/dev/null
+          mvn --batch-mode --version
           if command -v google-chrome >/dev/null 2>&1; then
             echo "google-chrome should have been removed" >&2
             exit 1
@@ -201,33 +266,6 @@ jobs:
           test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
           swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
           grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
-
-      - name: Run historical no-input max profile
-        id: cleanup
-        uses: ./
-
-      - name: Verify compatibility contract
-        shell: bash
-        env:
-          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
-          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
-          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
-          FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
-          PLATFORM: ${{ steps.cleanup.outputs.platform }}
-          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
-        run: |
-          set -euo pipefail
-          [[ "$BEFORE" =~ ^[0-9]+$ ]]
-          [[ "$AFTER" =~ ^[0-9]+$ ]]
-          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
-          [[ "$FAILED_OPERATIONS" == 0 ]]
-          [[ "$PLATFORM" == linux ]]
-          [[ "$ARCHITECTURE" == x64 ]]
-          test "$(stat -c %s /mnt/swapfile)" -eq 1610612736
-          swapon --show=NAME --noheadings | awk '{print $1}' | grep -Fx /mnt/swapfile
-          grep -Eq '^/mnt/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]' /etc/fstab
-          test ! -e /usr/share/dotnet
-          test -x /home/linuxbrew/.linuxbrew/bin/brew
 
       - name: Remove the managed swapfile
         uses: ./

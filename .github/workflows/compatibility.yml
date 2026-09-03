@@ -90,3 +90,93 @@ jobs:
         with:
           expected-platform: ${{ matrix.platform }}
           expected-architecture: ${{ matrix.architecture }}
+
+  generated-dist:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use the minimum supported Node.js version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify committed action bundle
+        run: npm run check-dist
+
+  default-max:
+    if: github.event_name == 'workflow_dispatch'
+    needs: generated-dist
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - {runner: ubuntu-latest, platform: linux, architecture: x64, timeout: 30}
+          - {runner: ubuntu-24.04-arm, platform: linux, architecture: arm64, timeout: 30}
+          - {runner: ubuntu-slim, platform: linux, architecture: x64, timeout: 12}
+          - {runner: windows-latest, platform: windows, architecture: x64, timeout: 120}
+          - {runner: windows-11-arm, platform: windows, architecture: arm64, timeout: 120}
+          - {runner: macos-latest, platform: macos, architecture: arm64, timeout: 90}
+          - {runner: macos-15-intel, platform: macos, architecture: x64, timeout: 90}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run no-input default max
+        id: cleanup
+        uses: ./
+
+      - name: Verify default-max outputs on Unix
+        if: matrix.platform != 'windows'
+        shell: bash
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          [[ "$BEFORE" =~ ^[0-9]+$ ]]
+          [[ "$AFTER" =~ ^[0-9]+$ ]]
+          [[ "$RECLAIMED" =~ ^[0-9]+$ ]]
+          [[ "$FAILED_OPERATIONS" == 0 ]]
+          [[ "$PLATFORM" == "$EXPECTED_PLATFORM" ]]
+          [[ "$ARCHITECTURE" == "$EXPECTED_ARCHITECTURE" ]]
+
+      - name: Verify default-max outputs on Windows
+        if: matrix.platform == 'windows'
+        shell: powershell
+        env:
+          BEFORE: ${{ steps.cleanup.outputs.available-bytes-before }}
+          AFTER: ${{ steps.cleanup.outputs.available-bytes-after }}
+          RECLAIMED: ${{ steps.cleanup.outputs.reclaimed-bytes }}
+          FAILED_OPERATIONS: ${{ steps.cleanup.outputs.failed-operations }}
+          PLATFORM: ${{ steps.cleanup.outputs.platform }}
+          ARCHITECTURE: ${{ steps.cleanup.outputs.architecture }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          if ($env:BEFORE -notmatch '^\d+$') { throw 'Invalid before output.' }
+          if ($env:AFTER -notmatch '^\d+$') { throw 'Invalid after output.' }
+          if ($env:RECLAIMED -notmatch '^\d+$') { throw 'Invalid reclaimed output.' }
+          if ($env:FAILED_OPERATIONS -ne '0') { throw 'A default-max operation failed.' }
+          if ($env:PLATFORM -ne $env:EXPECTED_PLATFORM) { throw 'Platform mismatch.' }
+          if ($env:ARCHITECTURE -ne $env:EXPECTED_ARCHITECTURE) { throw 'Architecture mismatch.' }

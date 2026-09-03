@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { constants } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import test from "node:test";
 import { COMPONENTS } from "../src/components.js";
 import {
@@ -41,6 +41,324 @@ const BREW_PATHS: Readonly<
     executable: "/usr/local/Homebrew/bin/brew",
   },
 };
+
+function xcodeEntry(
+  name: string,
+  kind: "directory" | "symlink" = "directory",
+): Dirent {
+  return {
+    name,
+    isDirectory: () => kind === "directory",
+    isSymbolicLink: () => kind === "symlink",
+  } as Dirent;
+}
+
+function xcodeSelect(path: string, exitCode = 0) {
+  return { exitCode, stdout: `${path}\n`, stderr: "" };
+}
+
+const SELECTED_XCODE = "/Applications/Xcode_16.4.app";
+const SELECTED_DEVELOPER = `${SELECTED_XCODE}/Contents/Developer`;
+
+test("macOS revalidates stable Xcode selection immediately before removal", async () => {
+  let selectionCalls = 0;
+  const validationCalls: string[] = [];
+  const removalCalls: string[] = [];
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => {
+      selectionCalls += 1;
+      return xcodeSelect(SELECTED_DEVELOPER);
+    },
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [
+      xcodeEntry("Xcode.app", "symlink"),
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async (target) => {
+      validationCalls.push(target);
+    },
+    removeXcodeTarget: async (target) => {
+      removalCalls.push(target);
+      return { status: "removed" };
+    },
+  });
+  const operations = await adapter.operations(planFor("xcode"));
+  const removal = operations.find(({ id }) => id === "xcode:Xcode_15.4.app");
+  assert.ok(removal?.validate);
+
+  await removal.validate();
+  assert.deepEqual(await removal.run(), { status: "removed" });
+  assert.equal(selectionCalls, 3);
+  assert.deepEqual(validationCalls, [
+    "/Applications/Xcode_15.4.app",
+    "/Applications/Xcode_15.4.app",
+  ]);
+  assert.deepEqual(removalCalls, ["/Applications/Xcode_15.4.app"]);
+});
+
+test("macOS refuses Xcode removal without a plan-validation snapshot", async () => {
+  let selectionCalls = 0;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => {
+      selectionCalls += 1;
+      return xcodeSelect(SELECTED_DEVELOPER);
+    },
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal);
+
+  const result = await removal.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /validation snapshot/);
+  assert.equal(selectionCalls, 1);
+  assert.equal(removalCalls, 0);
+});
+
+test("macOS refuses Xcode removal after developer-directory selection drift", async () => {
+  const selections = [
+    SELECTED_DEVELOPER,
+    SELECTED_DEVELOPER,
+    "/Applications/Xcode_15.4.app/Contents/Developer",
+  ];
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(selections.shift() ?? ""),
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.equal(removalCalls, 0, "selection drift must fail before deletion");
+});
+
+test("macOS refuses Xcode removal after selected-bundle realpath drift", async () => {
+  const selectedSpelling = "/Applications/Xcode.app";
+  const selectedDeveloper = `${selectedSpelling}/Contents/Developer`;
+  let selectionCalls = 0;
+  let selectedVersion = SELECTED_XCODE;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => {
+      selectionCalls += 1;
+      if (selectionCalls === 3) {
+        selectedVersion = "/Applications/Xcode_15.4.app";
+      }
+      return xcodeSelect(selectedDeveloper);
+    },
+    resolveXcodePath: async (path) => {
+      if (path === selectedSpelling) return selectedVersion;
+      if (path === selectedDeveloper)
+        return `${selectedVersion}/Contents/Developer`;
+      return path;
+    },
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.equal(removalCalls, 0);
+});
+
+test("macOS samples Xcode selection after removal-candidate resolution", async () => {
+  const target = "/Applications/Xcode_15.4.app";
+  let selectedDeveloper = SELECTED_DEVELOPER;
+  let targetResolutions = 0;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(selectedDeveloper),
+    resolveXcodePath: async (path) => {
+      if (path === target && ++targetResolutions === 2) {
+        selectedDeveloper = `${target}/Contents/Developer`;
+      }
+      return path;
+    },
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.ok(targetResolutions >= 2);
+  assert.equal(removalCalls, 0);
+});
+
+test("macOS samples Xcode selection after run-time target validation", async () => {
+  const target = "/Applications/Xcode_15.4.app";
+  let selectedDeveloper = SELECTED_DEVELOPER;
+  let validations = 0;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(selectedDeveloper),
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {
+      validations += 1;
+      if (validations === 2) {
+        selectedDeveloper = `${target}/Contents/Developer`;
+      }
+    },
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Xcode selection changed/);
+  assert.equal(validations, 2);
+  assert.equal(removalCalls, 0);
+});
+
+test("macOS rejects an ordinary target that becomes an alias of the selected bundle", async () => {
+  const target = "/Applications/Xcode_15.4.app";
+  let targetResolutions = 0;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(SELECTED_DEVELOPER),
+    resolveXcodePath: async (path) =>
+      path === target && ++targetResolutions >= 2 ? SELECTED_XCODE : path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /aliases the selected bundle/);
+  assert.equal(removalCalls, 0);
+});
+
+test("macOS preserves a versioned Xcode alias resolving to the selected bundle", async () => {
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => xcodeSelect(SELECTED_DEVELOPER),
+    resolveXcodePath: async (path) =>
+      path === "/Applications/Xcode_15.4.app" ? SELECTED_XCODE : path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app", "symlink"),
+      xcodeEntry("Xcode_14.3.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => ({ status: "removed" }),
+  });
+
+  assert.deepEqual(
+    (await adapter.operations(planFor("xcode"))).map(({ id }) => id),
+    ["xcode:Xcode_14.3.app"],
+  );
+});
+
+test("macOS bounds Xcode selection-command failures and skips removal", async () => {
+  let selectionCalls = 0;
+  let removalCalls = 0;
+  const adapter = await createMacOSAdapter(contextFor("macos"), {
+    runXcodeSelect: async () => {
+      selectionCalls += 1;
+      if (selectionCalls < 3) return xcodeSelect(SELECTED_DEVELOPER);
+      throw new Error("x".repeat(4_000));
+    },
+    resolveXcodePath: async (path) => path,
+    listApplications: async () => [
+      xcodeEntry("Xcode_16.4.app"),
+      xcodeEntry("Xcode_15.4.app"),
+    ],
+    validateXcodeRemoval: async () => {},
+    removeXcodeTarget: async () => {
+      removalCalls += 1;
+      return { status: "removed" };
+    },
+  });
+  const removal = (await adapter.operations(planFor("xcode"))).find(
+    ({ id }) => id === "xcode:Xcode_15.4.app",
+  );
+  assert.ok(removal?.validate);
+  await removal.validate();
+
+  const result = await removal.run();
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /Unable to identify.*Xcode selection/);
+  assert.ok((result.detail ?? "").length <= 2_000);
+  assert.equal(removalCalls, 0);
+});
 
 for (const architecture of ["arm64", "x64"] as const) {
   test(`macOS ${architecture} accepts only its verified definition Homebrew executable`, async () => {

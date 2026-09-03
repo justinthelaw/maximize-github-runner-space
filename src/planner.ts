@@ -3,6 +3,7 @@ import {
   COMPONENTS,
   COMPONENT_ID_SET,
   LARGE_PACKAGE_OVERLAPS,
+  PRESERVATION_DEPENDENCIES,
   TOOLCACHE_CHILDREN,
   TOOLCACHE_OWNERS,
 } from "./components.js";
@@ -19,6 +20,17 @@ function containsAny(
   candidates: readonly ComponentId[],
 ): boolean {
   return candidates.some((candidate) => values.has(candidate));
+}
+
+function expandPreservationDependencies(skipped: Set<ComponentId>): void {
+  const pending = [...skipped];
+  for (const component of pending) {
+    for (const dependency of PRESERVATION_DEPENDENCIES[component] ?? []) {
+      if (skipped.has(dependency)) continue;
+      skipped.add(dependency);
+      pending.push(dependency);
+    }
+  }
 }
 
 function parseProfile(raw: string): "max" | "custom" {
@@ -126,6 +138,7 @@ export function createPlan(readInput: InputReader): CleanupPlan {
   if (skipped.has("cached-tools")) {
     for (const component of TOOLCACHE_CHILDREN) skipped.add(component);
   }
+  expandPreservationDependencies(skipped);
   const enabled = new Set<ComponentId>();
 
   for (const component of COMPONENTS) {

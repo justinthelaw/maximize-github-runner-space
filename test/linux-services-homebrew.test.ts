@@ -1,7 +1,16 @@
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
-import { access, lstat, mkdtemp, rm } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import test from "node:test";
+import type { RemovePathDependencies } from "../src/operations.js";
 import {
   createLinuxAdapter,
   createLinuxHomebrewCleanupOperation,
@@ -22,6 +31,10 @@ function commandResult(
   stderr = "",
 ): CommandResult {
   return { exitCode, stdout, stderr };
+}
+
+function linuxMountInfoLine(mountPoint: string): string {
+  return `36 25 0:32 / ${mountPoint} rw,relatime - ext4 /dev/root rw`;
 }
 
 test("Linux service commands ignore workflow-selected D-Bus endpoints", () => {
@@ -475,3 +488,75 @@ test("Linux Homebrew cleanup fails closed if the verified file identity changes"
   assert.equal(result.status, "failed");
   assert.equal(executed, false);
 });
+
+for (const mountedPath of ["target", "descendant"] as const) {
+  test(`Linux Homebrew temporary config cleanup rejects ${mountedPath} mount drift`, async () => {
+    const createWithRemovalDependencies =
+      createLinuxHomebrewCleanupOperation as unknown as (
+        ...args: unknown[]
+      ) => ReturnType<typeof createLinuxHomebrewCleanupOperation>;
+    let configDirectory: string | undefined;
+    let sentinel: string | undefined;
+    let mountReads = 0;
+    let recursiveRemovals = 0;
+    let elevatedRemovals = 0;
+    const removalDependencies: RemovePathDependencies = {
+      readLinuxMountInfo: async () => {
+        mountReads += 1;
+        if (mountReads === 1) return "";
+        assert.ok(configDirectory);
+        return linuxMountInfoLine(
+          mountedPath === "target"
+            ? configDirectory
+            : `${configDirectory}/mounted-child`,
+        );
+      },
+      runElevated: async () => {
+        elevatedRemovals += 1;
+        return commandResult("");
+      },
+    };
+    const operation = createWithRemovalDependencies(
+      contextFor("linux"),
+      async () => ({
+        executable: "/home/linuxbrew/.linuxbrew/Homebrew/bin/brew",
+      }),
+      async () => {
+        assert.ok(configDirectory);
+        const child = `${configDirectory}/mounted-child`;
+        await mkdir(child);
+        sentinel = `${child}/sentinel`;
+        await writeFile(sentinel, "preserve me");
+        return commandResult("");
+      },
+      async () => undefined,
+      async () => {
+        configDirectory = await mkdtemp(
+          "/tmp/maximize-github-runner-space-brew-config-",
+        );
+        return configDirectory;
+      },
+      async () => {
+        recursiveRemovals += 1;
+      },
+      removalDependencies,
+    );
+    assert.ok(operation.validate);
+
+    try {
+      await operation.validate();
+      const result = await operation.run();
+      assert.equal(result.status, "failed");
+      assert.match(result.detail ?? "", /mounted path/);
+      assert.equal(mountReads, 2);
+      assert.equal(recursiveRemovals, 0);
+      assert.equal(elevatedRemovals, 0);
+      assert.ok(sentinel);
+      assert.equal(await readFile(sentinel, "utf8"), "preserve me");
+    } finally {
+      if (configDirectory !== undefined) {
+        await rm(configDirectory, { recursive: true, force: true });
+      }
+    }
+  });
+}

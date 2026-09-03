@@ -122,6 +122,16 @@ export const TOOLCACHE_CHILDREN = [
   "cached-ruby",
 ] as const satisfies readonly ComponentId[];
 
+export const PRESERVATION_DEPENDENCIES: Readonly<
+  Partial<Record<ComponentId, readonly ComponentId[]>>
+> = {
+  android: ["java"],
+  maven: ["java"],
+  gradle: ["java"],
+  ant: ["java"],
+  selenium: ["java"],
+};
+
 // These components own files below RUNNER_TOOL_CACHE. Skipping one must disable
 // the broad cached-tools operation so the skip promise remains true.
 export const TOOLCACHE_OWNERS = [

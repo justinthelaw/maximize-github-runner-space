@@ -52,3 +52,13 @@ pre-commit run --all-files --hook-stage pre-push
 Use a conventional-style commit where practical. Describe the change and its
 runner/toolchain risk, include validation results, and update documentation
 when public behavior changes.
+
+## Release gate
+
+Before publishing a release, require green PR CI, completed automated review,
+the manually dispatched seven-class default-max matrix, and the 18-label
+bounded compatibility sweep. The scheduled compatibility run remains bounded;
+default `max` release validation runs only on fresh runners from a manual
+dispatch. Its `generated-dist` job is an explicit dependency of the no-input
+default-max jobs, ensuring they use the committed bundle on fresh runners.
+Each destructive smoke must assert numeric outputs and zero failed operations.

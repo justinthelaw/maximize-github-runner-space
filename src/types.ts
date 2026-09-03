@@ -33,6 +33,8 @@ export interface CommandResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly stdoutTruncated?: boolean;
+  readonly stderrTruncated?: boolean;
 }
 
 export type OperationPhase = "preflight" | "filesystem" | "package" | "system";
