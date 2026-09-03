@@ -1522,6 +1522,10 @@ test("Windows file attributes use a fixed executable and carry hostile paths onl
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
+      "-InputFormat",
+      "Text",
+      "-OutputFormat",
+      "Text",
       "-EncodedCommand",
     ]);
     const encodedCommand = args.at(-1) ?? "";
@@ -1568,6 +1572,14 @@ test("Windows file attribute probing fails closed on incomplete or malformed out
       /Windows file attribute|read complete Windows/i,
     );
   }
+  await assert.rejects(
+    readWindowsFileAttributes(["C:\\ordinary"], async () => ({
+      exitCode: 7,
+      stdout: "",
+      stderr: "path-bearing diagnostics stay private",
+    })),
+    /exit code 7/,
+  );
 
   let calls = 0;
   assert.deepEqual(

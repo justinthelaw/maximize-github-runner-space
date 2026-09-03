@@ -71,6 +71,10 @@ export async function readWindowsFileAttributes(
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
+      "-InputFormat",
+      "Text",
+      "-OutputFormat",
+      "Text",
       "-EncodedCommand",
       WINDOWS_FILE_ATTRIBUTE_COMMAND,
     ],
@@ -80,12 +84,15 @@ export async function readWindowsFileAttributes(
       timeoutMs: 30_000,
     },
   );
-  if (
-    result.exitCode !== 0 ||
-    result.stdoutTruncated === true ||
-    result.stderrTruncated === true
-  ) {
-    throw new Error("Unable to read complete Windows file attributes safely.");
+  const incompleteReasons = [
+    ...(result.exitCode === 0 ? [] : [`exit code ${result.exitCode}`]),
+    ...(result.stdoutTruncated === true ? ["stdout truncated"] : []),
+    ...(result.stderrTruncated === true ? ["stderr truncated"] : []),
+  ];
+  if (incompleteReasons.length > 0) {
+    throw new Error(
+      `Unable to read complete Windows file attributes safely (${incompleteReasons.join(", ")}).`,
+    );
   }
 
   // Windows PowerShell 5.1 can emit bounded startup progress records as
