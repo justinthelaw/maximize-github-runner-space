@@ -1610,6 +1610,32 @@ test("Windows file attribute probing accepts bounded host diagnostics after vali
   );
 });
 
+test("Windows file attribute probing reports only a whitelisted failure stage", async () => {
+  await assert.rejects(
+    readWindowsFileAttributes(["C:\\ordinary"], async () => ({
+      exitCode: 1,
+      stdout: "maximize-space-probe-error:decode-input",
+      stderr: "C:\\ordinary should remain private",
+    })),
+    (error: unknown) => {
+      assert.match(String(error), /probe stage decode-input/);
+      assert.doesNotMatch(String(error), /C:\\ordinary|remain private/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    readWindowsFileAttributes(["C:\\ordinary"], async () => ({
+      exitCode: 1,
+      stdout: "maximize-space-probe-error:C:\\ordinary",
+      stderr: "",
+    })),
+    (error: unknown) => {
+      assert.doesNotMatch(String(error), /C:\\ordinary/);
+      return true;
+    },
+  );
+});
+
 test("a target containing a protected workspace is rejected", () => {
   const context = contextFor("linux");
   assert.throws(

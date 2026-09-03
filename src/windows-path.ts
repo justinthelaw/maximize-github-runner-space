@@ -38,16 +38,27 @@ export type WindowsPathIdentityComparator<Stats extends WindowsPathStatsLike> =
 
 const TRUSTED_WINDOWS_POWERSHELL =
   "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+const WINDOWS_FILE_ATTRIBUTE_FAILURE_PREFIX = "maximize-space-probe-error:";
 const WINDOWS_FILE_ATTRIBUTE_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
-  "$encoded = [Console]::In.ReadToEnd()",
-  "$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))",
-  "$paths = @($json | ConvertFrom-Json)",
-  "$attributes = @()",
-  "foreach ($path in $paths) {",
-  "  $attributes += [int64][System.IO.File]::GetAttributes([string]$path)",
+  "$stage = 'read-input'",
+  "try {",
+  "  $encoded = [Console]::In.ReadToEnd()",
+  "  $stage = 'decode-input'",
+  "  $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))",
+  "  $stage = 'parse-input'",
+  "  $paths = @($json | ConvertFrom-Json)",
+  "  $stage = 'read-attributes'",
+  "  $attributes = @()",
+  "  foreach ($path in $paths) {",
+  "    $attributes += [int64][System.IO.File]::GetAttributes([string]$path)",
+  "  }",
+  "  $stage = 'serialize-output'",
+  "  [Console]::Out.Write((ConvertTo-Json -Compress -InputObject @($attributes)))",
+  "} catch {",
+  `  [Console]::Out.Write("${WINDOWS_FILE_ATTRIBUTE_FAILURE_PREFIX}" + $stage)`,
+  "  exit 1",
   "}",
-  "[Console]::Out.Write((ConvertTo-Json -Compress -InputObject @($attributes)))",
 ].join("\n");
 const WINDOWS_FILE_ATTRIBUTE_COMMAND = Buffer.from(
   WINDOWS_FILE_ATTRIBUTE_SCRIPT,
@@ -84,10 +95,14 @@ export async function readWindowsFileAttributes(
       timeoutMs: 30_000,
     },
   );
+  const failureStage = new RegExp(
+    `^${WINDOWS_FILE_ATTRIBUTE_FAILURE_PREFIX}(read-input|decode-input|parse-input|read-attributes|serialize-output)$`,
+  ).exec(result.stdout)?.[1];
   const incompleteReasons = [
     ...(result.exitCode === 0 ? [] : [`exit code ${result.exitCode}`]),
     ...(result.stdoutTruncated === true ? ["stdout truncated"] : []),
     ...(result.stderrTruncated === true ? ["stderr truncated"] : []),
+    ...(failureStage === undefined ? [] : [`probe stage ${failureStage}`]),
   ];
   if (incompleteReasons.length > 0) {
     throw new Error(
