@@ -750,13 +750,14 @@ const WINDOWS_SDK_UNINSTALL_ARGUMENTS = [
 const WINDOWS_SDK_PACKAGE_CACHE = "C:\\ProgramData\\Package Cache";
 const WINDOWS_SDK_POSTCONDITION_DETAIL_LIMIT = 1024;
 const WINDOWS_SDK_POSTCONDITION_ENTRY_LIMIT = 8;
+const WINDOWS_SDK_DISPLAY_NAME =
+  /^(Windows Driver Kit|Windows Software Development Kit)(?: - Windows 10\.0\.[0-9]{1,10}\.[0-9]{1,10})?$/;
 
 export type WindowsSdkBundleKind = "wdk" | "sdk";
 
 export interface WindowsSdkBundleRecord {
   readonly registryKey: string;
-  readonly displayName:
-    "Windows Driver Kit" | "Windows Software Development Kit";
+  readonly displayName: string;
   readonly kind: WindowsSdkBundleKind;
   readonly bundleCachePath: string;
 }
@@ -831,8 +832,9 @@ function isRegistryKeyDescendant(value: string, registryRoot: string): boolean {
 }
 
 function windowsSdkKind(displayName: string): WindowsSdkBundleKind | undefined {
-  if (displayName === "Windows Driver Kit") return "wdk";
-  if (displayName === "Windows Software Development Kit") return "sdk";
+  const product = WINDOWS_SDK_DISPLAY_NAME.exec(displayName)?.[1];
+  if (product === "Windows Driver Kit") return "wdk";
+  if (product === "Windows Software Development Kit") return "sdk";
   return undefined;
 }
 
@@ -925,10 +927,7 @@ export function parseWindowsSdkBundleRegistry(
     }
     records.push({
       registryKey: state.registryKey,
-      displayName:
-        kind === "wdk"
-          ? "Windows Driver Kit"
-          : "Windows Software Development Kit",
+      displayName: state.displayName,
       kind,
       bundleCachePath: state.bundleCachePath,
     });

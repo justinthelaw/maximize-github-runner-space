@@ -75,11 +75,12 @@ Use `custom` first on a new platform integration, or protect required tools
 with `skip-components`.
 
 Component ownership includes related definition payloads: macOS Android
-cleanup removes its SDK/NDK, user state, and Android-owned Gradle cache (unless
-Gradle is protected), while macOS Azure CLI cleanup also removes the Azure
+cleanup removes its SDK/NDK and Android user state. On Linux and macOS, Gradle
+cleanup owns the shared `~/.gradle` user state; under `max`, skipping either
+Android or Gradle preserves it. macOS Azure CLI cleanup also removes the Azure
 DevOps extension. Windows SDK/WDK cleanup handles both Visual Studio-owned
-components and eligible standalone bundles identified by exact registry
-metadata.
+components and eligible standalone bundles identified by strict registry
+metadata, including current version-suffixed runner-image registrations.
 
 ## Runner support
 

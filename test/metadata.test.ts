@@ -360,7 +360,7 @@ function assertWorkflowTopology(
     "Install locked dependencies for the native Windows probe",
     "Compile the native Windows probe regression",
     "Exercise the native Windows PowerShell probe",
-    "Validate native Visual Studio inventory without mutation",
+    "Validate native Visual Studio and standalone SDK inventory without mutation",
     "Exercise the native adapter",
   ]);
   assert.deepEqual(stepNames(generatedDist, 6), [
@@ -411,7 +411,7 @@ function assertWorkflowTopology(
     "Install locked dependencies for the native Windows probe",
     "Compile the native Windows probe regression",
     "Exercise the native Windows PowerShell probe",
-    "Validate native Visual Studio inventory without mutation",
+    "Validate native Visual Studio and standalone SDK inventory without mutation",
     "Assert Windows PostgreSQL fixture and service exist",
     "Exercise Windows PostgreSQL cleanup",
     "Verify Windows PostgreSQL cleanup",
@@ -1764,7 +1764,19 @@ test("public docs describe the v0.12.3 safety and release contracts", async () =
   );
   assert.match(
     configuration,
-    /`~\/Library\/Android\/sdk`[\s\S]*`~\/\.android`[\s\S]*`~\/\.gradle`/,
+    /remove-android[\s\S]*`~\/Library\/Android\/sdk`[\s\S]*`~\/\.android`/,
+  );
+  assert.match(
+    configuration,
+    /remove-gradle[\s\S]*shared `~\/\.gradle` user state[\s\S]*skipping either `android` or `gradle` preserves that state/,
+  );
+  assert.match(
+    readme,
+    /Gradle\s+cleanup owns the shared `~\/\.gradle` user state[\s\S]*skipping either\s+Android or Gradle preserves it/,
+  );
+  assert.match(
+    migrations,
+    /Android-only cleanup now[\s\S]*preserves `\.gradle`[\s\S]*Gradle cleanup removes it/,
   );
   assert.match(
     configuration,
@@ -1781,7 +1793,15 @@ test("public docs describe the v0.12.3 safety and release contracts", async () =
   assert.match(migrations, /v0\.12\.2 to v0\.12\.3/);
   assert.match(
     migrations,
-    /no new inputs[\s\S]*conditional behavior change[\s\S]*mount/i,
+    /no new inputs[\s\S]*targeted behavior changes[\s\S]*mount[\s\S]*Gradle/i,
+  );
+  assert.match(
+    migrations,
+    /Review[\s\S]*`remove-gradle`[\s\S]*`skip-components`/i,
+  );
+  assert.doesNotMatch(
+    migrations,
+    /No configuration changes are required unless a workflow intentionally mounts/i,
   );
   assert.doesNotMatch(migrations, /no breaking changes/i);
   assert.match(

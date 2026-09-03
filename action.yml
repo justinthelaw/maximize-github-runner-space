@@ -184,7 +184,7 @@ inputs:
     required: false
     default: "false"
   remove-gradle:
-    description: "Removes Gradle"
+    description: "Removes Gradle and its user state where applicable"
     required: false
     default: "false"
   remove-ant:

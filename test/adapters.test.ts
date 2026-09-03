@@ -128,7 +128,7 @@ test("macOS ignores workflow path overrides outside exact image definitions", as
   }
 });
 
-test("macOS schedules only scoped Android and Azure user cleanup paths", async () => {
+test("macOS schedules only component-owned Android, Gradle, and Azure user cleanup paths", async () => {
   const adapter = await createMacOSAdapter(contextFor("macos"));
   const plan = maxPlan();
   const prepared = prepareOperations(await adapter.operations(plan), plan);
@@ -138,12 +138,11 @@ test("macOS schedules only scoped Android and Azure user cleanup paths", async (
       .filter(({ component }) => component === "android")
       .map(({ id }) => id)
       .filter((id) => id.includes(".android") || id.includes(".gradle")),
-    ["android:/Users/runner/.android", "android:/Users/runner/.gradle"],
+    ["android:/Users/runner/.android"],
   );
   assert.deepEqual(
-    prepared.find(({ id }) => id === "android:/Users/runner/.gradle")
-      ?.blockedBy,
-    ["gradle"],
+    prepared.find(({ id }) => id === "gradle:/Users/runner/.gradle")?.blockedBy,
+    ["android"],
   );
   assert.equal(
     prepared.some(
@@ -157,6 +156,58 @@ test("macOS schedules only scoped Android and Azure user cleanup paths", async (
     false,
   );
 });
+
+for (const platform of ["linux", "macos"] as const) {
+  test(`${platform} assigns shared Gradle user state only to the Gradle component`, async () => {
+    const adapter = await factories[platform]();
+    const gradleHome = `${contextFor(platform).home}/.gradle`;
+    const androidPlan = planFor("android");
+    const androidOperations = prepareOperations(
+      await adapter.operations(androidPlan),
+      androidPlan,
+    );
+    const gradlePlan = planFor("gradle");
+    const gradleOperations = prepareOperations(
+      await adapter.operations(gradlePlan),
+      gradlePlan,
+    );
+
+    assert.equal(
+      androidOperations.some(({ id }) => id.endsWith(gradleHome)),
+      false,
+      "Android-only custom cleanup must preserve shared Gradle state",
+    );
+    assert.equal(
+      gradleOperations.some(
+        ({ component, id, blockedBy }) =>
+          component === "gradle" &&
+          id.endsWith(gradleHome) &&
+          blockedBy?.length === 1 &&
+          blockedBy[0] === "android",
+      ),
+      true,
+      "Gradle cleanup must own shared Gradle state",
+    );
+    assert.equal(
+      prepareOperations(await adapter.operations(maxPlan()), maxPlan()).some(
+        ({ id }) => id.endsWith(gradleHome),
+      ),
+      true,
+      "default max cleanup must retain its existing Gradle-state cleanup",
+    );
+    for (const protectedComponent of ["android", "gradle"] as const) {
+      const protectedPlan = maxPlan(protectedComponent);
+      assert.equal(
+        prepareOperations(
+          await adapter.operations(protectedPlan),
+          protectedPlan,
+        ).some(({ id }) => id.endsWith(gradleHome)),
+        false,
+        `max cleanup must preserve Gradle state when ${protectedComponent} is protected`,
+      );
+    }
+  });
+}
 
 test("Windows fails closed for a home outside the users directory", async () => {
   await assert.rejects(

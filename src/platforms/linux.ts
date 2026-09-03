@@ -1777,11 +1777,11 @@ export async function createLinuxAdapter(
           "Remove Android user state",
         ],
         [
-          "android",
+          "gradle",
           join(home, ".gradle"),
           [home],
-          "Remove Android Gradle cache",
-          ["gradle"],
+          "Remove Gradle user home",
+          ["android"],
         ],
         [
           "haskell",

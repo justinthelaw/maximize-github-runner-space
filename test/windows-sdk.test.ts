@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { win32 } from "node:path";
 import test from "node:test";
+import { runCommand } from "../src/command.js";
 import {
   parseWindowsSdkBundleRegistry,
   standaloneWindowsSdkOperation,
+  windowsPaths,
   type WindowsPathProbe,
   type WindowsSdkBundleRecord,
 } from "../src/platforms/windows.js";
@@ -125,7 +127,7 @@ function testPaths() {
   } as const;
 }
 
-test("Windows SDK registry parser accepts only exact bundle names and classifies both kinds", () => {
+test("Windows SDK registry parser accepts exact legacy bundle names and classifies both kinds", () => {
   const accepted = parseWindowsSdkBundleRegistry(
     [
       registryRecord(
@@ -148,6 +150,72 @@ test("Windows SDK registry parser accepts only exact bundle names and classifies
   );
 
   assert.deepEqual(accepted, [sdk, wdk]);
+});
+
+test("Windows SDK registry parser accepts bounded runner-image version suffixes", () => {
+  const versionedSdkPath = `${cache}\\{versioned-sdk}\\sdksetup.exe`;
+  const versionedWdkPath = `${cache}\\{versioned-wdk}\\wdksetup.exe`;
+
+  assert.deepEqual(
+    parseWindowsSdkBundleRegistry(
+      [
+        registryRecord(
+          `${root}\\{versioned-sdk}`,
+          "Windows Software Development Kit - Windows 10.0.26100.7705",
+          versionedSdkPath,
+        ),
+        registryRecord(
+          `${root}\\{versioned-wdk}`,
+          "Windows Driver Kit - Windows 10.0.26100.6584",
+          versionedWdkPath,
+        ),
+      ].join("\r\n"),
+      root,
+    ),
+    [
+      {
+        registryKey: `${root}\\{versioned-sdk}`,
+        displayName:
+          "Windows Software Development Kit - Windows 10.0.26100.7705",
+        kind: "sdk",
+        bundleCachePath: versionedSdkPath,
+      },
+      {
+        registryKey: `${root}\\{versioned-wdk}`,
+        displayName: "Windows Driver Kit - Windows 10.0.26100.6584",
+        kind: "wdk",
+        bundleCachePath: versionedWdkPath,
+      },
+    ],
+  );
+});
+
+test("Windows SDK registry parser rejects preview and lookalike bundle names", () => {
+  for (const [index, displayName] of [
+    "Windows Driver Kit Preview",
+    "Windows Driver Kit - Windows 10.0.26100.6584 Preview",
+    "Windows Driver Kit Visual Studio Extension",
+    "Windows Driver Kit - Windows 10.0",
+    "Windows Driver Kit - Windows 10.0.26100",
+    "Windows Driver Kit - Windows 10.0.26100.beta",
+    "Windows Driver Kit - Windows 10.0.12345678901.6584",
+    "Windows Driver Kit - Windows 11.0.26100.6584",
+    "Windows Driver Kit - Windows 10.0.26100.6584.1",
+    "Windows Software Development Kit AddOn",
+  ].entries()) {
+    assert.deepEqual(
+      parseWindowsSdkBundleRegistry(
+        registryRecord(
+          `${root}\\{lookalike-${index}}`,
+          displayName,
+          `${cache}\\{lookalike-${index}}\\setup.exe`,
+        ),
+        root,
+      ),
+      [],
+      displayName,
+    );
+  }
 });
 
 test("Windows SDK registry parser rejects incomplete, duplicate, conflicting, and wrong-typed records", () => {
@@ -753,6 +821,39 @@ test("standalone Windows SDK refuses inventory membership and metadata drift bef
   }
 });
 
+test("standalone Windows SDK preserves versioned display names for drift detection", async () => {
+  const initial: WindowsSdkBundleRecord = {
+    ...wdk,
+    displayName: "Windows Driver Kit - Windows 10.0.26100.6584",
+  };
+  const changed: WindowsSdkBundleRecord = {
+    ...initial,
+    displayName: "Windows Driver Kit - Windows 10.0.26100.7705",
+  };
+  let calls = 0;
+  let executed = false;
+  const operation = standaloneWindowsSdkOperation(
+    contextFor("windows"),
+    testPaths(),
+    {
+      inventory: async () => (++calls === 1 ? [initial] : [changed]),
+      probe: safeBundleProbe(),
+      execute: async () => {
+        executed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  );
+
+  assert.ok(operation.validate);
+  await operation.validate();
+  const result = await operation.run();
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /inventory changed after plan validation/);
+  assert.equal(executed, false);
+});
+
 test("standalone Windows SDK refuses identity drift in any bundle before first spawn", async () => {
   let sdkStats = 0;
   let executed = false;
@@ -1120,3 +1221,48 @@ test("standalone Windows SDK fails with bounded diagnostics when accepted entrie
   assert.match(result.detail ?? "", /standalone Windows SDK\/WDK bundle/);
   assert.ok((result.detail?.length ?? 0) <= 1024);
 });
+
+test(
+  "native Windows standalone SDK registry inventory validates without mutation",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const livePaths = windowsPaths();
+    const records: WindowsSdkBundleRecord[] = [];
+
+    for (const registryRoot of [root, wowRoot]) {
+      const result = await runCommand(
+        livePaths.reg,
+        ["query", registryRoot, "/s"],
+        { silent: true, timeoutMs: 2 * 60_000 },
+      );
+      assert.equal(
+        result.exitCode,
+        0,
+        `supported Windows images must expose '${registryRoot}'`,
+      );
+      assert.notEqual(
+        result.stdoutTruncated,
+        true,
+        `registry inventory for '${registryRoot}' must fit the production capture bound`,
+      );
+      records.push(
+        ...parseWindowsSdkBundleRegistry(result.stdout, registryRoot),
+      );
+    }
+
+    assert.ok(
+      records.some(({ kind }) => kind === "sdk"),
+      "supported Windows images must expose an eligible standalone Windows SDK bundle",
+    );
+
+    const context = {
+      ...contextFor("windows"),
+      architecture: process.arch === "arm64" ? "arm64" : "x64",
+    } as const;
+    const operation = standaloneWindowsSdkOperation(context, livePaths, {
+      inventory: async () => records,
+    });
+    assert.ok(operation.validate);
+    await operation.validate();
+  },
+);

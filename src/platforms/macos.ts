@@ -1499,11 +1499,11 @@ export async function createMacOSAdapter(
           "Remove Android user state",
         ],
         [
-          "android",
+          "gradle",
           join(safeHome, ".gradle"),
           [safeHome],
-          "Remove Android Gradle cache",
-          ["gradle"],
+          "Remove Gradle user home",
+          ["android"],
         ],
         [
           "codeql",

@@ -33,7 +33,7 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | Input | Component ID | Platforms | Effect |
 | --- | --- | --- | --- |
 | `remove-dotnet` | `dotnet` | Linux, macOS, Windows | Removes installed .NET SDKs, runtimes, and user tools. |
-| `remove-android` | `android` | Linux, macOS, Windows | Removes the Android SDK/NDK and Android user state. On macOS this includes `~/Library/Android/sdk`, `~/.android`, and Android-owned `~/.gradle`; the Gradle cache is preserved when `gradle` is protected. |
+| `remove-android` | `android` | Linux, macOS, Windows | Removes the Android SDK/NDK and Android user state. On macOS this includes `~/Library/Android/sdk` and `~/.android`. |
 | `remove-haskell` | `haskell` | Linux, Windows | Removes GHCup, GHC, Cabal, and Stack artifacts where installed. |
 | `remove-codeql` | `codeql` | Linux, macOS, Windows | Removes CodeQL Action bundles from the hosted toolcache. |
 | `remove-cached-tools` | `cached-tools` | Linux, macOS, Windows | Removes and recreates the hosted setup-action toolcache. |
@@ -71,7 +71,7 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | `remove-buildah` | `buildah` | Linux | Removes Buildah where installed. |
 | `remove-podman` | `podman` | Linux | Removes Podman and its runner storage where installed. |
 | `remove-maven` | `maven` | Linux, macOS, Windows | Removes Apache Maven. |
-| `remove-gradle` | `gradle` | Linux, macOS, Windows | Removes Gradle. |
+| `remove-gradle` | `gradle` | Linux, macOS, Windows | Removes Gradle and, on Linux and macOS, the shared `~/.gradle` user state. Under `max`, skipping either `android` or `gradle` preserves that state for compatibility. |
 | `remove-ant` | `ant` | Linux, macOS, Windows | Removes Apache Ant. |
 | `remove-php` | `php` | Linux, macOS, Windows | Removes PHP, Composer, and PHPUnit where installed. |
 | `remove-rust` | `rust` | Linux, macOS, Windows | Removes Rustup, Cargo, and Rust toolchains. |
@@ -83,7 +83,7 @@ Set an input to `"true"` to select its component in `custom`. In `max`, the same
 | `remove-large-packages` | `large-packages` | Linux | Purges the legacy set of additional large apt packages on Linux. |
 | `remove-xcode` | `xcode` | macOS | Removes unselected versioned Xcode applications while preserving the selected Xcode. |
 | `remove-visual-studio` | `visual-studio` | Windows | Removes eligible runner-image Visual Studio instances through the registered installer. |
-| `remove-windows-sdk` | `windows-sdk` | Windows | Windows SDK/WDK cleanup covers both definition-listed Visual Studio-owned components and eligible registered standalone Burn bundles. Visual Studio-owned payloads use the Visual Studio Installer; standalone bundles run only from their exact uninstall-registry metadata. |
+| `remove-windows-sdk` | `windows-sdk` | Windows | Windows SDK/WDK cleanup covers both definition-listed Visual Studio-owned components and eligible registered standalone Burn bundles. Visual Studio-owned payloads use the Visual Studio Installer; standalone bundles run only from strict uninstall-registry metadata whose display name is either the exact legacy product name or its current `Windows 10.0.<build>.<revision>` suffix form. |
 
 ## Outputs
 
