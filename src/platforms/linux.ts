@@ -590,6 +590,7 @@ interface LinuxBrewFileIdentity {
   readonly inode: bigint;
   readonly size: bigint;
   readonly modifiedNanoseconds: bigint;
+  readonly changedNanoseconds: bigint;
 }
 
 export interface LinuxBrewPathProbe {
@@ -610,6 +611,7 @@ const NODE_LINUX_BREW_PATH_PROBE: LinuxBrewPathProbe = {
       inode: stat.ino,
       size: stat.size,
       modifiedNanoseconds: stat.mtimeNs,
+      changedNanoseconds: stat.ctimeNs,
     };
   },
 };
@@ -815,7 +817,9 @@ export function createLinuxHomebrewCleanupOperation(
     current?.identity?.inode === validated?.identity?.inode &&
     current?.identity?.size === validated?.identity?.size &&
     current?.identity?.modifiedNanoseconds ===
-      validated?.identity?.modifiedNanoseconds;
+      validated?.identity?.modifiedNanoseconds &&
+    current?.identity?.changedNanoseconds ===
+      validated?.identity?.changedNanoseconds;
 
   return createFunctionOperation({
     id: "linux:brew:cleanup",
@@ -861,12 +865,25 @@ export function createLinuxHomebrewCleanupOperation(
 
       let result: CommandResult | undefined;
       let executionError: unknown;
+      let lateConfig: string | undefined;
       try {
-        result = await execute(
-          LINUXBREW_CANDIDATE,
-          ["cleanup", "--prune=120"],
-          linuxBrewEnvironment(context, configDirectory),
-        );
+        lateConfig = await findLinuxBrewConfig(inspectConfig);
+        if (lateConfig === undefined) {
+          const executionExecutable = await resolveExecutable();
+          if (
+            executionExecutable === undefined ||
+            !sameExecutable(executionExecutable, executable)
+          ) {
+            throw new Error(
+              "Linuxbrew executable changed immediately before execution",
+            );
+          }
+          result = await execute(
+            executionExecutable.executable,
+            ["cleanup", "--prune=120"],
+            linuxBrewEnvironment(context, configDirectory),
+          );
+        }
       } catch (error) {
         executionError = error;
       }
@@ -897,6 +914,18 @@ export function createLinuxHomebrewCleanupOperation(
         removalError = error;
       }
 
+      if (lateConfig !== undefined) {
+        if (removalError !== undefined) {
+          return {
+            status: "failed",
+            detail: `Homebrew configuration appeared before cleanup (${lateConfig}); temporary config cleanup failed: ${removalError instanceof Error ? removalError.message : String(removalError)}`,
+          };
+        }
+        return {
+          status: "unsupported",
+          detail: `Homebrew configuration can override cleanup paths (${lateConfig})`,
+        };
+      }
       if (executionError !== undefined) {
         return {
           status: "failed",

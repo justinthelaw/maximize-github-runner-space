@@ -8,7 +8,10 @@ import {
   removePathTarget,
   validateRemovePathTarget,
 } from "../operations.js";
-import { assertSafeDirectoryTarget } from "../safety.js";
+import {
+  assertSafeDirectoryTarget,
+  assertSafeRemovalTarget,
+} from "../safety.js";
 import {
   isWindowsReparsePoint,
   observeStableWindowsPaths,
@@ -262,10 +265,10 @@ interface MsiProduct {
   readonly displayName: string;
 }
 
-interface VisualStudioInstance {
+export interface VisualStudioInstance {
   readonly installationPath: string;
-  readonly installationVersion?: string;
-  readonly productId?: string;
+  readonly installationVersion: string;
+  readonly productId: string;
 }
 
 type AsyncValue<T> = () => Promise<T>;
@@ -1827,104 +1830,112 @@ export function isStrictWindowsDescendant(
   );
 }
 
-async function listVisualStudioInstances(
+export interface VisualStudioDiscoveryDependencies {
+  readonly pathExists?: (path: string) => Promise<boolean>;
+  readonly execute?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
+}
+
+class VisualStudioInventoryUnavailableError extends Error {
+  constructor() {
+    super("Visual Studio inventory unavailable: vswhere.exe was not found");
+    this.name = "VisualStudioInventoryUnavailableError";
+  }
+}
+
+function normalizedVisualStudioInstance(
   paths: WindowsPaths,
-): Promise<readonly VisualStudioInstance[]> {
-  const vswhere = (await pathExists(paths.vswhere))
-    ? paths.vswhere
-    : win32.join(win32.dirname(paths.chocolatey), "vswhere.exe");
-  if (!(await pathExists(vswhere))) return [];
-  const result = await runCommand(
-    vswhere,
-    ["-all", "-prerelease", "-products", "*", "-format", "json", "-utf8"],
-    { silent: true, timeoutMs: 2 * 60_000 },
+  value: unknown,
+): VisualStudioInstance | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const installationPath = record.installationPath;
+  const installationVersion = record.installationVersion;
+  const productId = record.productId;
+  if (
+    typeof installationPath !== "string" ||
+    installationPath.trim() !== installationPath ||
+    !win32.isAbsolute(installationPath) ||
+    typeof installationVersion !== "string" ||
+    installationVersion.length > 64 ||
+    productId !== "Microsoft.VisualStudio.Product.Enterprise"
+  ) {
+    return undefined;
+  }
+
+  const version = /^(17|18)(?:\.\d+){2,3}$/.exec(installationVersion);
+  if (version === null) return undefined;
+  const expectedPath = win32.join(
+    paths.programFiles,
+    "Microsoft Visual Studio",
+    version[1] === "17" ? "2022" : "18",
+    "Enterprise",
   );
+  const normalizedPath = win32.normalize(installationPath);
+  if (normalizedPath.toLowerCase() !== expectedPath.toLowerCase()) {
+    return undefined;
+  }
+  return {
+    installationPath: normalizedPath,
+    installationVersion,
+    productId,
+  };
+}
+
+export async function discoverVisualStudioInstances(
+  paths: WindowsPaths,
+  requiredComponents: readonly string[] = [],
+  dependencies: VisualStudioDiscoveryDependencies = {},
+): Promise<readonly VisualStudioInstance[]> {
+  const exists = dependencies.pathExists ?? pathExists;
+  const fallback = win32.join(win32.dirname(paths.chocolatey), "vswhere.exe");
+  const vswhere = (await exists(paths.vswhere))
+    ? paths.vswhere
+    : (await exists(fallback))
+      ? fallback
+      : undefined;
+  if (vswhere === undefined) {
+    throw new VisualStudioInventoryUnavailableError();
+  }
+  const execute =
+    dependencies.execute ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: true,
+        timeoutMs: 2 * 60_000,
+      }));
+  const result = await execute(vswhere, [
+    "-all",
+    "-prerelease",
+    "-products",
+    "*",
+    ...(requiredComponents.length === 0
+      ? []
+      : ["-requires", ...requiredComponents, "-requiresAny"]),
+    "-format",
+    "json",
+    "-utf8",
+  ]);
   if (result.exitCode !== 0) {
     throw new Error(failureDetail(result.stderr, vswhere, result.exitCode));
+  }
+  if (result.stdoutTruncated === true) {
+    throw new Error("vswhere returned truncated JSON output");
   }
 
   const parsed: unknown = JSON.parse(result.stdout);
   if (!Array.isArray(parsed)) throw new Error("vswhere returned invalid JSON");
-  const roots = [
-    win32.join(paths.programFiles, "Microsoft Visual Studio"),
-    win32.join(paths.programFilesX86, "Microsoft Visual Studio"),
-  ];
   const instances: VisualStudioInstance[] = [];
   for (const value of parsed) {
-    if (typeof value !== "object" || value === null) continue;
-    const record = value as Record<string, unknown>;
-    const installationPath = record.installationPath;
-    const installationVersion = record.installationVersion;
-    const productId = record.productId;
-    if (
-      typeof installationPath !== "string" ||
-      !win32.isAbsolute(installationPath) ||
-      !roots.some((root) =>
-        isStrictWindowsDescendant(installationPath, root),
-      ) ||
-      productId !== "Microsoft.VisualStudio.Product.Enterprise" ||
-      typeof installationVersion !== "string" ||
-      !/^(?:17|18)\./.test(installationVersion)
-    ) {
-      continue;
-    }
-    instances.push({
-      installationPath: win32.normalize(installationPath),
-      ...(typeof installationVersion === "string"
-        ? { installationVersion }
-        : {}),
-      ...(typeof productId === "string" ? { productId } : {}),
-    });
+    const instance = normalizedVisualStudioInstance(paths, value);
+    if (instance !== undefined) instances.push(instance);
   }
   return instances.slice(0, 8);
 }
 
-function visualStudioOperation(
-  paths: WindowsPaths,
-  instances: AsyncValue<readonly VisualStudioInstance[]>,
-): Operation {
-  return createFunctionOperation({
-    id: "windows:visual-studio:uninstall",
-    component: "visual-studio",
-    description: "Uninstall runner-image Visual Studio instances",
-    phase: "package",
-    dedupeKey: "windows:visual-studio:uninstall",
-    blockedBy: VISUAL_STUDIO_OVERLAPS,
-    validate: async () => {
-      await instances();
-    },
-    run: async (): Promise<OperationResult> => {
-      const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
-      if (!(await pathExists(setup))) return { status: "not-found" };
-      const selected = await instances();
-      if (selected.length === 0) return { status: "not-found" };
-
-      for (const instance of selected) {
-        const result = await runCommand(
-          setup,
-          [
-            "uninstall",
-            "--installPath",
-            instance.installationPath,
-            "--quiet",
-            "--norestart",
-            "--force",
-          ],
-          { silent: false, timeoutMs: 75 * 60_000 },
-        );
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
-          return {
-            status: "failed",
-            detail: failureDetail(result.stderr, setup, result.exitCode),
-          };
-        }
-      }
-      return { status: "removed", detail: `${selected.length} instance(s)` };
-    },
-  });
-}
-
-const WINDOWS_SDK_COMPONENTS = [
+export const WINDOWS_SDK_COMPONENTS = [
   "Microsoft.VisualStudio.Component.Windows10SDK.19041",
   "Microsoft.VisualStudio.Component.Windows11SDK.22621",
   "Microsoft.VisualStudio.Component.Windows11SDK.26100",
@@ -1935,52 +1946,526 @@ const WINDOWS_SDK_COMPONENTS = [
 // installer component IDs from the image definitions; never delete Windows Kits,
 // invoke DISM package removal, or touch WinSxS directly.
 
-function windowsSdkOperation(
+export interface VisualStudioOperationDependencies {
+  readonly inventory?: () => Promise<readonly VisualStudioInstance[]>;
+  readonly componentInventory?: () => Promise<readonly VisualStudioInstance[]>;
+  readonly discovery?: VisualStudioDiscoveryDependencies;
+  readonly probe?: WindowsPathProbe;
+  readonly execute?: (
+    executable: string,
+    args: readonly string[],
+  ) => Promise<CommandResult>;
+}
+
+interface VisualStudioObservedPath {
+  readonly path: string;
+  readonly identity: {
+    readonly dev: bigint;
+    readonly ino: bigint;
+  };
+}
+
+interface VisualStudioBoundarySnapshot {
+  readonly instance: VisualStudioInstance;
+  readonly observedPaths: readonly VisualStudioObservedPath[];
+  readonly setupIdentity: WindowsPathIdentity;
+}
+
+interface VisualStudioPlanSnapshot {
+  readonly instances: readonly VisualStudioInstance[];
+  readonly boundaries?: readonly VisualStudioBoundarySnapshot[];
+}
+
+function normalizedVisualStudioInstances(
   paths: WindowsPaths,
-  instances: AsyncValue<readonly VisualStudioInstance[]>,
+  instances: readonly VisualStudioInstance[],
+): readonly VisualStudioInstance[] {
+  const byPath = new Map<string, VisualStudioInstance>();
+  for (const instance of instances) {
+    const normalized = normalizedVisualStudioInstance(paths, instance);
+    if (normalized === undefined) {
+      throw new Error("Refusing an invalid Visual Studio instance inventory");
+    }
+    const canonical = normalized.installationPath.toLowerCase();
+    if (byPath.has(canonical)) {
+      throw new Error("Refusing a duplicate Visual Studio instance inventory");
+    }
+    byPath.set(canonical, normalized);
+  }
+  return [...byPath.values()].sort((left, right) =>
+    left.installationPath
+      .toLowerCase()
+      .localeCompare(right.installationPath.toLowerCase()),
+  );
+}
+
+function createVisualStudioDiscoveryInventory(
+  paths: WindowsPaths,
+  requiredComponents: readonly string[],
+  dependencies: VisualStudioDiscoveryDependencies | undefined,
+): () => Promise<readonly VisualStudioInstance[]> {
+  let returnedNonemptyInventory = false;
+  return async () => {
+    try {
+      const instances = await discoverVisualStudioInstances(
+        paths,
+        requiredComponents,
+        dependencies,
+      );
+      if (instances.length > 0) returnedNonemptyInventory = true;
+      return instances;
+    } catch (error) {
+      if (
+        error instanceof VisualStudioInventoryUnavailableError &&
+        !returnedNonemptyInventory
+      ) {
+        return [];
+      }
+      throw error;
+    }
+  };
+}
+
+function sameVisualStudioInstance(
+  left: VisualStudioInstance,
+  right: VisualStudioInstance,
+): boolean {
+  return (
+    win32.normalize(left.installationPath).toLowerCase() ===
+      win32.normalize(right.installationPath).toLowerCase() &&
+    left.installationVersion === right.installationVersion &&
+    left.productId === right.productId
+  );
+}
+
+function sameVisualStudioInventory(
+  left: readonly VisualStudioInstance[],
+  right: readonly VisualStudioInstance[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((instance, index) => {
+      const other = right[index];
+      return other !== undefined && sameVisualStudioInstance(instance, other);
+    })
+  );
+}
+
+function isUnchangedVisualStudioInventorySubset(
+  subset: readonly VisualStudioInstance[],
+  superset: readonly VisualStudioInstance[],
+): boolean {
+  return (
+    subset.length <= superset.length &&
+    subset.every((instance) =>
+      superset.some((candidate) =>
+        sameVisualStudioInstance(instance, candidate),
+      ),
+    )
+  );
+}
+
+function visualStudioPathChain(parent: string, target: string): string[] {
+  const normalizedParent = win32.normalize(parent);
+  const difference = win32.relative(normalizedParent, win32.normalize(target));
+  if (
+    difference === "" ||
+    difference === ".." ||
+    difference.startsWith(`..${win32.sep}`) ||
+    win32.isAbsolute(difference)
+  ) {
+    throw new Error("Refusing a Visual Studio path outside its fixed root");
+  }
+  const paths = [normalizedParent];
+  let current = normalizedParent;
+  for (const segment of difference.split(win32.sep)) {
+    current = win32.join(current, segment);
+    paths.push(current);
+  }
+  return paths;
+}
+
+function visualStudioInstanceDefinition(
+  paths: WindowsPaths,
+  instance: VisualStudioInstance,
+): { readonly base: string; readonly root: string } {
+  for (const base of [paths.programFiles, paths.programFilesX86]) {
+    const root = win32.join(base, "Microsoft Visual Studio");
+    if (isStrictWindowsDescendant(instance.installationPath, root)) {
+      return { base, root };
+    }
+  }
+  throw new Error("Refusing a Visual Studio instance outside its fixed roots");
+}
+
+async function inspectVisualStudioBoundary(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  instance: VisualStudioInstance,
+  probe: WindowsPathProbe,
+): Promise<VisualStudioBoundarySnapshot | undefined> {
+  const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
+  const definition = visualStudioInstanceDefinition(paths, instance);
+  assertSafeRemovalTarget(
+    instance.installationPath,
+    [definition.root],
+    context,
+  );
+  assertSafeRemovalTarget(setup, [paths.visualStudioInstaller], context);
+
+  const expectedPaths = new Map<
+    string,
+    { readonly path: string; readonly kind: "directory" | "file" }
+  >();
+  for (const path of visualStudioPathChain(
+    definition.base,
+    instance.installationPath,
+  )) {
+    expectedPaths.set(win32.normalize(path).toLowerCase(), {
+      path,
+      kind: "directory",
+    });
+  }
+  const setupChain = visualStudioPathChain(paths.programFilesX86, setup);
+  for (const [index, path] of setupChain.entries()) {
+    expectedPaths.set(win32.normalize(path).toLowerCase(), {
+      path,
+      kind: index === setupChain.length - 1 ? "file" : "directory",
+    });
+  }
+
+  const setupPaths = new Set(
+    setupChain.map((path) => win32.normalize(path).toLowerCase()),
+  );
+  const initial: WindowsAttributedPath[] = [];
+  for (const [canonical, expected] of expectedPaths) {
+    let stats: WindowsPathStats;
+    try {
+      stats = await probe.lstat(expected.path);
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" &&
+        setupPaths.has(canonical)
+      ) {
+        return undefined;
+      }
+      throw new Error(
+        `Visual Studio instance changed during validation: '${instance.installationPath}'.`,
+      );
+    }
+    if (
+      stats.isSymbolicLink() ||
+      (expected.kind === "directory" ? !stats.isDirectory() : !stats.isFile())
+    ) {
+      throw new Error(
+        `Refusing an unexpected Visual Studio path type: '${expected.path}'.`,
+      );
+    }
+    initial.push({ path: expected.path, stats });
+  }
+
+  const stable = await assertNoWindowsReparsePoints(
+    initial,
+    probe,
+    (path) => `Refusing a Visual Studio reparse-point path: '${path}'.`,
+    (path, before, after) =>
+      win32.normalize(path).toLowerCase() !== setup.toLowerCase() ||
+      (before.size === after.size && before.mtimeNs === after.mtimeNs),
+  );
+  const stableSetup = stable.at(-1);
+  if (
+    stableSetup === undefined ||
+    win32.normalize(stableSetup.path).toLowerCase() !== setup.toLowerCase()
+  ) {
+    throw new Error("Windows file attribute probe returned malformed output.");
+  }
+  return {
+    instance,
+    observedPaths: stable.map(({ path, stats }) => ({
+      path,
+      identity: { dev: stats.dev, ino: stats.ino },
+    })),
+    setupIdentity: windowsPathIdentity(stableSetup.stats),
+  };
+}
+
+function sameVisualStudioBoundary(
+  left: VisualStudioBoundarySnapshot,
+  right: VisualStudioBoundarySnapshot,
+): boolean {
+  return (
+    sameVisualStudioInstance(left.instance, right.instance) &&
+    left.observedPaths.length === right.observedPaths.length &&
+    left.observedPaths.every((path, index) => {
+      const other = right.observedPaths[index];
+      return (
+        other !== undefined &&
+        win32.normalize(path.path).toLowerCase() ===
+          win32.normalize(other.path).toLowerCase() &&
+        path.identity.dev === other.identity.dev &&
+        path.identity.ino === other.identity.ino
+      );
+    }) &&
+    sameWindowsPathIdentity(left.setupIdentity, right.setupIdentity)
+  );
+}
+
+async function snapshotVisualStudioPlan(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  inventory: () => Promise<readonly VisualStudioInstance[]>,
+  probe: WindowsPathProbe,
+): Promise<VisualStudioPlanSnapshot> {
+  const instances = normalizedVisualStudioInstances(paths, await inventory());
+  const boundaries: VisualStudioBoundarySnapshot[] = [];
+  for (const instance of instances) {
+    const boundary = await inspectVisualStudioBoundary(
+      context,
+      paths,
+      instance,
+      probe,
+    );
+    if (boundary === undefined) return { instances };
+    boundaries.push(boundary);
+  }
+  return { instances, boundaries };
+}
+
+function createVisualStudioInstallerOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  options: {
+    readonly id: string;
+    readonly component: "visual-studio" | "windows-sdk";
+    readonly description: string;
+    readonly inventory: () => Promise<readonly VisualStudioInstance[]>;
+    readonly arguments: (instance: VisualStudioInstance) => readonly string[];
+    readonly allowValidatedInventorySubset?: boolean;
+    readonly blockedBy?: readonly ComponentId[];
+    readonly coveredBySuccessfulOperations?: readonly string[];
+    readonly probe: WindowsPathProbe;
+    readonly execute: (
+      executable: string,
+      args: readonly string[],
+    ) => Promise<CommandResult>;
+  },
 ): Operation {
+  let validated: VisualStudioPlanSnapshot | undefined;
+  const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
   return createFunctionOperation({
+    id: options.id,
+    component: options.component,
+    description: options.description,
+    phase: "package",
+    dedupeKey: options.id,
+    ...(options.blockedBy === undefined
+      ? {}
+      : { blockedBy: options.blockedBy }),
+    ...(options.coveredBySuccessfulOperations === undefined
+      ? {}
+      : {
+          coveredBySuccessfulOperations: options.coveredBySuccessfulOperations,
+        }),
+    validate: async () => {
+      validated = await snapshotVisualStudioPlan(
+        context,
+        paths,
+        options.inventory,
+        options.probe,
+      );
+    },
+    run: async (): Promise<OperationResult> => {
+      try {
+        validated ??= await snapshotVisualStudioPlan(
+          context,
+          paths,
+          options.inventory,
+          options.probe,
+        );
+        if (validated.instances.length === 0) {
+          return { status: "not-found" };
+        }
+        if (validated.boundaries === undefined) {
+          return {
+            status: "failed",
+            detail:
+              "Visual Studio instances were discovered but the trusted installer path is unavailable",
+          };
+        }
+
+        let expectedPending = validated.instances;
+        let initialInventoryCheck = true;
+        let removed = 0;
+        while (expectedPending.length > 0) {
+          const immediateInventory = normalizedVisualStudioInstances(
+            paths,
+            await options.inventory(),
+          );
+          if (
+            initialInventoryCheck &&
+            options.allowValidatedInventorySubset === true
+          ) {
+            if (
+              !isUnchangedVisualStudioInventorySubset(
+                immediateInventory,
+                expectedPending,
+              )
+            ) {
+              return {
+                status: "failed",
+                detail:
+                  "Visual Studio instance inventory changed immediately before setup execution",
+              };
+            }
+            expectedPending = immediateInventory;
+          } else if (
+            !sameVisualStudioInventory(expectedPending, immediateInventory)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "Visual Studio instance inventory changed immediately before setup execution",
+            };
+          }
+          initialInventoryCheck = false;
+          const selected = expectedPending[0];
+          if (selected === undefined) break;
+          const expectedBoundary = validated.boundaries.find((boundary) =>
+            sameVisualStudioInstance(boundary.instance, selected),
+          );
+          const immediateBoundary = await inspectVisualStudioBoundary(
+            context,
+            paths,
+            selected,
+            options.probe,
+          );
+          if (
+            expectedBoundary === undefined ||
+            immediateBoundary === undefined ||
+            !sameVisualStudioBoundary(expectedBoundary, immediateBoundary)
+          ) {
+            return {
+              status: "failed",
+              detail:
+                "Visual Studio setup or instance path changed immediately before execution",
+            };
+          }
+
+          const result = await options.execute(
+            setup,
+            options.arguments(selected),
+          );
+          if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
+            return {
+              status: "failed",
+              detail: failureDetail(result.stderr, setup, result.exitCode),
+            };
+          }
+
+          const remaining = expectedPending.slice(1);
+          const postcondition = normalizedVisualStudioInstances(
+            paths,
+            await options.inventory(),
+          );
+          if (!sameVisualStudioInventory(remaining, postcondition)) {
+            return {
+              status: "failed",
+              detail:
+                "Visual Studio installer reported success without satisfying its inventory postcondition",
+            };
+          }
+          expectedPending = remaining;
+          removed += 1;
+        }
+        return removed === 0
+          ? { status: "not-found" }
+          : { status: "removed", detail: `${removed} instance(s)` };
+      } catch (error) {
+        return {
+          status: "failed",
+          detail: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+}
+
+export function visualStudioOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  dependencies: VisualStudioOperationDependencies = {},
+): Operation {
+  const inventory =
+    dependencies.inventory ??
+    createVisualStudioDiscoveryInventory(paths, [], dependencies.discovery);
+  const probe = dependencies.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const execute =
+    dependencies.execute ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: false,
+        timeoutMs: 75 * 60_000,
+      }));
+  return createVisualStudioInstallerOperation(context, paths, {
+    id: "windows:visual-studio:uninstall",
+    component: "visual-studio",
+    description: "Uninstall runner-image Visual Studio instances",
+    inventory,
+    arguments: (instance) => [
+      "uninstall",
+      "--installPath",
+      instance.installationPath,
+      "--quiet",
+      "--norestart",
+      "--force",
+    ],
+    blockedBy: VISUAL_STUDIO_OVERLAPS,
+    probe,
+    execute,
+  });
+}
+
+export function windowsSdkOperation(
+  context: RuntimeContext,
+  paths: WindowsPaths,
+  dependencies: VisualStudioOperationDependencies = {},
+): Operation {
+  const inventory =
+    dependencies.componentInventory ??
+    createVisualStudioDiscoveryInventory(
+      paths,
+      WINDOWS_SDK_COMPONENTS,
+      dependencies.discovery,
+    );
+  const probe = dependencies.probe ?? NODE_WINDOWS_PATH_PROBE;
+  const execute =
+    dependencies.execute ??
+    (async (executable: string, args: readonly string[]) =>
+      await runCommand(executable, args, {
+        silent: false,
+        timeoutMs: 75 * 60_000,
+      }));
+  const removeArguments = WINDOWS_SDK_COMPONENTS.flatMap((component) => [
+    "--remove",
+    component,
+  ]);
+  return createVisualStudioInstallerOperation(context, paths, {
     id: "windows:windows-sdk:remove-components",
     component: "windows-sdk",
     description: "Remove definition-listed Windows SDK and WDK components",
-    phase: "package",
-    dedupeKey: "windows:windows-sdk:remove-components",
+    inventory,
+    arguments: (instance) => [
+      "modify",
+      "--installPath",
+      instance.installationPath,
+      ...removeArguments,
+      "--quiet",
+      "--norestart",
+    ],
+    allowValidatedInventorySubset: true,
     coveredBySuccessfulOperations: ["windows:visual-studio:uninstall"],
-    validate: async () => {
-      await instances();
-    },
-    run: async (): Promise<OperationResult> => {
-      const setup = win32.join(paths.visualStudioInstaller, "setup.exe");
-      if (!(await pathExists(setup))) return { status: "not-found" };
-      const selected = await instances();
-      if (selected.length === 0) return { status: "not-found" };
-
-      const removeArguments = WINDOWS_SDK_COMPONENTS.flatMap((component) => [
-        "--remove",
-        component,
-      ]);
-      for (const instance of selected) {
-        const result = await runCommand(
-          setup,
-          [
-            "modify",
-            "--installPath",
-            instance.installationPath,
-            ...removeArguments,
-            "--quiet",
-            "--norestart",
-          ],
-          { silent: false, timeoutMs: 75 * 60_000 },
-        );
-        if (!SUCCESS_EXIT_CODES.has(result.exitCode)) {
-          return {
-            status: "failed",
-            detail: failureDetail(result.stderr, setup, result.exitCode),
-          };
-        }
-      }
-      return { status: "removed", detail: `${selected.length} instance(s)` };
-    },
+    probe,
+    execute,
   });
 }
 
@@ -2298,6 +2783,7 @@ export function dockerEngineOperation(
 
 export interface WindowsAdapterDependencies {
   readonly dockerEngine?: WindowsDockerEngineDependencies;
+  readonly visualStudio?: VisualStudioOperationDependencies;
 }
 
 export async function createWindowsAdapter(
@@ -2317,10 +2803,6 @@ export async function createWindowsAdapter(
   const installedMsiProducts = lazyAsync(
     async () => await listMsiProducts(paths),
   );
-  const visualStudioInstances = lazyAsync(
-    async () => await listVisualStudioInstances(paths),
-  );
-
   return {
     supportedComponents: SUPPORTED,
     operations: async (plan: CleanupPlan): Promise<readonly Operation[]> => {
@@ -2823,8 +3305,12 @@ export async function createWindowsAdapter(
       // keep only the narrower component operation as an outcome-dependent
       // fallback.
       operations.push(standaloneWindowsSdkOperation(context, paths));
-      operations.push(visualStudioOperation(paths, visualStudioInstances));
-      operations.push(windowsSdkOperation(paths, visualStudioInstances));
+      operations.push(
+        visualStudioOperation(context, paths, dependencies.visualStudio),
+      );
+      operations.push(
+        windowsSdkOperation(context, paths, dependencies.visualStudio),
+      );
 
       // Retaining Visual Studio while stripping one of its definition-owned
       // SDK/toolchain roots can leave the selected instance unusable.  A

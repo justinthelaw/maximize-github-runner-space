@@ -874,6 +874,7 @@ async function discoverXcodeSelection(
   const value = selected.stdout.trim();
   if (
     selected.exitCode !== 0 ||
+    selected.stdoutTruncated === true ||
     value === "" ||
     value.length > 1024 ||
     !isAbsolute(value)
@@ -921,6 +922,84 @@ async function discoverXcodeSelection(
     return {
       failure:
         "Xcode selection changed or could not be resolved safely; no Xcode bundle was removed.",
+    };
+  }
+
+  let closingSelection: CommandResult;
+  try {
+    closingSelection = await runXcodeSelect();
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const closingValue = closingSelection.stdout.trim();
+  if (
+    closingSelection.exitCode !== 0 ||
+    closingSelection.stdoutTruncated === true ||
+    closingValue === "" ||
+    closingValue.length > 1024 ||
+    !isAbsolute(closingValue) ||
+    normalize(closingValue) !== developerDirectory
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
+    };
+  }
+
+  let closingResolvedDeveloper: string | undefined;
+  let closingResolvedSpellingBundle: string | undefined;
+  try {
+    closingResolvedDeveloper = await resolveXcodePath(developerDirectory);
+    closingResolvedSpellingBundle = await resolveXcodePath(
+      selectedSpellingBundle,
+    );
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the resolved Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const closingDeveloperBundle =
+    closingResolvedDeveloper === undefined
+      ? undefined
+      : xcodeBundleFromPath(normalize(closingResolvedDeveloper));
+  const closingSelectedBundle =
+    closingResolvedSpellingBundle === undefined
+      ? undefined
+      : xcodeBundleFromPath(normalize(closingResolvedSpellingBundle));
+
+  let finalSelection: CommandResult;
+  try {
+    finalSelection = await runXcodeSelect();
+  } catch (error) {
+    return {
+      failure: boundedXcodeFailure(
+        `Unable to confirm the current Xcode selection; no Xcode bundle was removed (${error instanceof Error ? error.message : String(error)})`,
+      ),
+    };
+  }
+  const finalValue = finalSelection.stdout.trim();
+  if (
+    finalSelection.exitCode !== 0 ||
+    finalSelection.stdoutTruncated === true ||
+    finalValue === "" ||
+    finalValue.length > 1024 ||
+    !isAbsolute(finalValue) ||
+    normalize(finalValue) !== developerDirectory ||
+    closingDeveloperBundle === undefined ||
+    closingSelectedBundle === undefined ||
+    normalize(closingDeveloperBundle) !== normalize(closingSelectedBundle) ||
+    normalize(closingDeveloperBundle) !== normalize(developerBundle) ||
+    normalize(closingSelectedBundle) !== normalize(selectedBundle)
+  ) {
+    return {
+      failure:
+        "Xcode selection changed while it was being resolved; no Xcode bundle was removed.",
     };
   }
 
@@ -995,13 +1074,20 @@ async function xcodeOperations(
   }
 
   const operations: Operation[] = [];
-  for (const entry of entries) {
-    if (
-      (!entry.isDirectory() && !entry.isSymbolicLink()) ||
-      !/^Xcode_[0-9][A-Za-z0-9._-]{0,63}\.app$/.test(entry.name)
-    ) {
-      continue;
-    }
+  const candidates = entries
+    .filter(
+      (entry) =>
+        (entry.isDirectory() || entry.isSymbolicLink()) &&
+        /^Xcode_[0-9][A-Za-z0-9._-]{0,63}\.app$/.test(entry.name),
+    )
+    // Remove aliases before backing bundles so this cleanup cannot turn a
+    // later alias into a broken link before its own operation runs.
+    .sort(
+      (left, right) =>
+        Number(right.isSymbolicLink()) - Number(left.isSymbolicLink()),
+    );
+  for (const entry of candidates) {
+    const candidateWasLink = entry.isSymbolicLink();
 
     const target = normalize(join(APPLICATIONS_ROOT, entry.name));
     let targetRealPath: string | undefined;
@@ -1047,6 +1133,7 @@ async function xcodeOperations(
         if ("failure" in validationSnapshot) {
           return { status: "failed", detail: validationSnapshot.failure };
         }
+        const expectedSelection = validationSnapshot.selection;
 
         let resolvedTarget: string | undefined;
         try {
@@ -1059,7 +1146,7 @@ async function xcodeOperations(
             ),
           };
         }
-        if (resolvedTarget === undefined) {
+        if (resolvedTarget === undefined && !candidateWasLink) {
           return {
             status: "failed",
             detail:
@@ -1081,37 +1168,53 @@ async function xcodeOperations(
           };
         }
 
-        // Take the final selected-Xcode sample only after every candidate path
-        // resolution and validation step. Nothing may resolve or validate a
-        // candidate between this snapshot and the removal boundary.
-        const current = await discoverXcodeSelection(
-          dependencies.runXcodeSelect,
-          dependencies.resolveXcodePath,
-        );
-        if ("failure" in current) {
-          return { status: "failed", detail: current.failure };
-        }
-        if (
-          xcodeSelectionChanged(validationSnapshot.selection, current.selection)
-        ) {
-          return {
-            status: "failed",
-            detail:
+        const assertSelectionStillSafe = async (
+          currentResolvedTarget: string | undefined,
+          isLink = false,
+        ): Promise<void> => {
+          if (currentResolvedTarget === undefined && !isLink) {
+            throw new Error(
+              "Unable to resolve the Xcode removal target; no Xcode bundle was removed.",
+            );
+          }
+          const current = await discoverXcodeSelection(
+            dependencies.runXcodeSelect,
+            dependencies.resolveXcodePath,
+          );
+          if ("failure" in current) throw new Error(current.failure);
+          if (xcodeSelectionChanged(expectedSelection, current.selection)) {
+            throw new Error(
               "Xcode selection changed after plan validation; no Xcode bundle was removed.",
-          };
-        }
-        const normalizedResolvedTarget = normalize(resolvedTarget);
-        if (
-          target === current.selection.selectedSpellingBundle ||
-          target === current.selection.selectedBundle ||
-          normalizedResolvedTarget ===
-            current.selection.selectedSpellingBundle ||
-          normalizedResolvedTarget === current.selection.selectedBundle
-        ) {
+            );
+          }
+          const normalizedResolvedTarget =
+            currentResolvedTarget === undefined
+              ? undefined
+              : normalize(currentResolvedTarget);
+          if (
+            target === current.selection.selectedSpellingBundle ||
+            target === current.selection.selectedBundle ||
+            normalizedResolvedTarget ===
+              current.selection.selectedSpellingBundle ||
+            normalizedResolvedTarget === current.selection.selectedBundle
+          ) {
+            throw new Error(
+              "Xcode selection changed or the removal target now aliases the selected bundle; no Xcode bundle was removed.",
+            );
+          }
+        };
+
+        // Preserve the existing early run-time check for injected removers,
+        // then repeat it inside removePathTarget after its filesystem safety
+        // pass and immediately before each local or elevated mutation.
+        try {
+          await assertSelectionStillSafe(resolvedTarget, candidateWasLink);
+        } catch (error) {
           return {
             status: "failed",
-            detail:
-              "Xcode selection changed or the removal target now aliases the selected bundle; no Xcode bundle was removed.",
+            detail: boundedXcodeFailure(
+              error instanceof Error ? error.message : String(error),
+            ),
           };
         }
 
@@ -1119,6 +1222,14 @@ async function xcodeOperations(
           target,
           [APPLICATIONS_ROOT],
           context,
+          {
+            beforeMutation: async (_boundary, inspection) => {
+              await assertSelectionStillSafe(
+                inspection.realPath,
+                inspection.isLink,
+              );
+            },
+          },
         );
       },
     });

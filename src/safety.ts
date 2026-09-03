@@ -718,7 +718,7 @@ export async function assertSafeExistingTarget(
     context,
     dependencies,
   );
-  const mountPoints = parseLinuxMountPoints(await readLinuxMountInfo());
+  const openingMountPoints = parseLinuxMountPoints(await readLinuxMountInfo());
   const normalizedTarget = posix.normalize(posix.resolve(target));
   const afterMountAncestors = await snapshotRemovalAncestors(
     normalizedTarget,
@@ -751,8 +751,15 @@ export async function assertSafeExistingTarget(
   if (!closingTarget.exists || closingTarget.realPath === undefined) {
     throw new Error(`Unable to resolve cleanup target safely: '${target}'.`);
   }
+  // Read the mount table again after every awaited path observation. This is
+  // the final awaited probe in this safety pass, so a mount introduced during
+  // those observations cannot be missed.
+  const closingMountPoints = parseLinuxMountPoints(await readLinuxMountInfo());
   const canonicalTarget = canonicalLexical(closingTarget.realPath, posix);
-  const offendingMountPoint = mountPoints.find((mountPoint) => {
+  const offendingMountPoint = [
+    ...openingMountPoints,
+    ...closingMountPoints,
+  ].find((mountPoint) => {
     const canonicalMountPoint = canonicalLexical(mountPoint, posix);
     return (
       canonicalMountPoint === canonicalTarget ||

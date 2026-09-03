@@ -39,7 +39,13 @@ export interface RemovePathDependencies {
   readonly remove?: typeof rm;
   readonly unlink?: typeof unlink;
   readonly runElevated?: typeof runElevated;
+  readonly beforeMutation?: (
+    boundary: "local" | "elevated",
+    inspection: Extract<TargetInspection, { readonly exists: true }>,
+  ) => Promise<void>;
 }
+
+const MAX_MUTATION_GUARD_FAILURE_LENGTH = 2_000;
 
 function classifyWindowsReparseInspection(
   inspection: TargetInspection,
@@ -120,6 +126,24 @@ export async function removePathTarget(
   const remove = dependencies.remove ?? rm;
   const unlinkTarget = dependencies.unlink ?? unlink;
   const elevate = dependencies.runElevated ?? runElevated;
+  const runMutationGuard = async (
+    boundary: "local" | "elevated",
+    inspection: Extract<TargetInspection, { readonly exists: true }>,
+  ): Promise<OperationResult | undefined> => {
+    if (dependencies.beforeMutation === undefined) return undefined;
+    try {
+      await dependencies.beforeMutation(boundary, inspection);
+      return undefined;
+    } catch (error) {
+      return {
+        status: "failed",
+        detail: (error instanceof Error ? error.message : String(error)).slice(
+          0,
+          MAX_MUTATION_GUARD_FAILURE_LENGTH,
+        ),
+      };
+    }
+  };
   const inspectSafely = async (): Promise<
     | { readonly inspection: TargetInspection }
     | { readonly failure: OperationResult }
@@ -151,9 +175,10 @@ export async function removePathTarget(
   const inspected = initialResult.inspection;
   if (!inspected.exists) return { status: "not-found" };
 
-  // This complete safety pass is the final observation before local mutation.
-  // Its returned classification, not an older preflight snapshot, decides
-  // whether the entry can be recursively removed or must be unlinked.
+  // This complete safety pass is the final filesystem observation before the
+  // optional policy guard and local mutation. Its returned classification,
+  // not an older preflight snapshot, decides whether the entry can be
+  // recursively removed or must be unlinked.
   const revalidatedResult = await inspectSafely();
   if ("failure" in revalidatedResult) return revalidatedResult.failure;
   const revalidated = revalidatedResult.inspection;
@@ -178,6 +203,9 @@ export async function removePathTarget(
       };
     }
   };
+
+  const localGuardFailure = await runMutationGuard("local", revalidated);
+  if (localGuardFailure !== undefined) return localGuardFailure;
 
   try {
     if (revalidated.isLink) {
@@ -214,6 +242,12 @@ export async function removePathTarget(
       target,
     );
     if (elevationFailure !== undefined) return elevationFailure;
+
+    const elevatedGuardFailure = await runMutationGuard(
+      "elevated",
+      elevatedTarget,
+    );
+    if (elevatedGuardFailure !== undefined) return elevatedGuardFailure;
 
     const result = await elevate(
       context,

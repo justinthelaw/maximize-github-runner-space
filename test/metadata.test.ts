@@ -360,6 +360,7 @@ function assertWorkflowTopology(
     "Install locked dependencies for the native Windows probe",
     "Compile the native Windows probe regression",
     "Exercise the native Windows PowerShell probe",
+    "Validate native Visual Studio inventory without mutation",
     "Exercise the native adapter",
   ]);
   assert.deepEqual(stepNames(generatedDist, 6), [
@@ -410,6 +411,7 @@ function assertWorkflowTopology(
     "Install locked dependencies for the native Windows probe",
     "Compile the native Windows probe regression",
     "Exercise the native Windows PowerShell probe",
+    "Validate native Visual Studio inventory without mutation",
     "Assert Windows PostgreSQL fixture and service exist",
     "Exercise Windows PostgreSQL cleanup",
     "Verify Windows PostgreSQL cleanup",
@@ -1777,7 +1779,15 @@ test("public docs describe the v0.12.3 safety and release contracts", async () =
     /MySQL owns `libmysqlclient-dev`, `mysql-common`, `mysql-\*`, and `mariadb-\*`/,
   );
   assert.match(migrations, /v0\.12\.2 to v0\.12\.3/);
-  assert.match(migrations, /no new inputs[\s\S]*no breaking changes/i);
+  assert.match(
+    migrations,
+    /no new inputs[\s\S]*conditional behavior change[\s\S]*mount/i,
+  );
+  assert.doesNotMatch(migrations, /no breaking changes/i);
+  assert.match(
+    migrations,
+    /fails closed instead of recursively\s+deleting across the mount/i,
+  );
   assert.match(migrations, /Linux[\s\S]*macOS[\s\S]*Windows/);
   assert.match(runnerSupport, /seven-class[\s\S]*default-max/i);
   assert.match(runnerSupport, /18-label[\s\S]*bounded compatibility/i);

@@ -1,16 +1,33 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import type { PathLike, Stats } from "node:fs";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import type { stat as fsStat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 import {
   createElevatedInvocation,
+  createWindowsTaskkillInvocation,
   findCommandPath,
   runCommand,
 } from "../src/command.js";
 import { contextFor } from "./helpers.js";
+
+type CommandSpawn = typeof import("node:child_process").spawn;
+
+function fakeCommandChild(pid: number): ChildProcess {
+  return Object.assign(new EventEmitter(), {
+    pid,
+    stdin: null,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: () => true,
+    unref: () => undefined,
+  }) as unknown as ChildProcess;
+}
 
 test("findCommandPath skips an earlier non-executable shadow", async (context) => {
   if (process.platform === "win32") {
@@ -126,6 +143,75 @@ test("elevation fails closed when passwordless sudo is unavailable", () => {
     ),
     undefined,
   );
+});
+
+test("Windows timeout cleanup pins taskkill outside workflow PATH", () => {
+  const originalPath = process.env.PATH;
+  process.env.PATH = "C:\\workflow\\shadow";
+  try {
+    assert.deepEqual(createWindowsTaskkillInvocation(42, false), {
+      executable: "C:\\Windows\\System32\\taskkill.exe",
+      args: ["/pid", "42", "/t"],
+    });
+    assert.deepEqual(createWindowsTaskkillInvocation(42, true), {
+      executable: "C:\\Windows\\System32\\taskkill.exe",
+      args: ["/pid", "42", "/t", "/f"],
+    });
+  } finally {
+    process.env.PATH = originalPath;
+  }
+});
+
+test("runCommand Windows timeout launches pinned System32 taskkill", async () => {
+  const primary = fakeCommandChild(2_000_000_000);
+  const killer = fakeCommandChild(2_000_000_001);
+  const calls: { executable: string; args: readonly string[] }[] = [];
+  const spawn = ((executable: string, args: readonly string[]) => {
+    calls.push({ executable, args: [...args] });
+    if (calls.length === 1) return primary;
+    setImmediate(() => primary.emit("close", null, "SIGKILL"));
+    return killer;
+  }) as CommandSpawn;
+
+  const result = await runCommand(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 10_000)"],
+    { timeoutMs: 5, silent: true },
+    { platform: "win32", spawn },
+  );
+
+  assert.equal(result.exitCode, 124);
+  assert.deepEqual(calls[1], {
+    executable: "C:\\Windows\\System32\\taskkill.exe",
+    args: ["/pid", "2000000000", "/t", "/f"],
+  });
+});
+
+test("runCommand Windows timeout tolerates a taskkill spawn error", async () => {
+  const primary = fakeCommandChild(2_000_000_000);
+  const killer = fakeCommandChild(2_000_000_001);
+  let spawnCount = 0;
+  const spawn = (() => {
+    spawnCount += 1;
+    if (spawnCount === 1) return primary;
+    setImmediate(() =>
+      killer.emit(
+        "error",
+        Object.assign(new Error("taskkill unavailable"), { code: "ENOENT" }),
+      ),
+    );
+    setImmediate(() => primary.emit("close", null, "SIGKILL"));
+    return killer;
+  }) as CommandSpawn;
+
+  const result = await runCommand(
+    process.execPath,
+    ["-e", "setTimeout(() => {}, 10_000)"],
+    { timeoutMs: 5, silent: true },
+    { platform: "win32", spawn },
+  );
+
+  assert.equal(result.exitCode, 124);
 });
 
 test("timeouts terminate a Unix descendant process tree", async (context) => {

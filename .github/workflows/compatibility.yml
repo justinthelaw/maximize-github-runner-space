@@ -107,6 +107,13 @@ jobs:
           --test-name-pattern="native Windows PowerShell probe"
           build/test/safety.test.js
 
+      - name: Validate native Visual Studio inventory without mutation
+        if: matrix.platform == 'windows'
+        run: >-
+          node --test
+          --test-name-pattern="native Windows Visual Studio inventory"
+          build/test/windows-visual-studio.test.js
+
       - name: Exercise the native adapter
         uses: ./.github/actions/platform-smoke
         with:

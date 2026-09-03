@@ -19,7 +19,12 @@ export interface CommandPathDependencies {
   readonly access?: typeof access;
 }
 
-interface CommandInvocation {
+export interface RunCommandDependencies {
+  readonly platform?: NodeJS.Platform;
+  readonly spawn?: typeof spawn;
+}
+
+export interface CommandInvocation {
   readonly executable: string;
   readonly args: readonly string[];
 }
@@ -27,18 +32,33 @@ interface CommandInvocation {
 const DEFAULT_COMMAND_TIMEOUT_MS = 10 * 60_000;
 export const TRUSTED_UNIX_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
 export const UNIX_SUDO_EXECUTABLE = "/usr/bin/sudo";
+export const WINDOWS_TASKKILL_EXECUTABLE =
+  "C:\\Windows\\System32\\taskkill.exe";
+
+export function createWindowsTaskkillInvocation(
+  pid: number,
+  force: boolean,
+): CommandInvocation {
+  return {
+    executable: WINDOWS_TASKKILL_EXECUTABLE,
+    args: ["/pid", String(pid), "/t", ...(force ? ["/f"] : [])],
+  };
+}
 
 export async function runCommand(
   executable: string,
   args: readonly string[],
   options: CommandOptions = {},
+  dependencies: RunCommandDependencies = {},
 ): Promise<CommandResult> {
   return await new Promise<CommandResult>((resolve) => {
-    const child = spawn(executable, [...args], {
+    const platform = dependencies.platform ?? process.platform;
+    const spawnProcess = dependencies.spawn ?? spawn;
+    const child = spawnProcess(executable, [...args], {
       env: options.env ?? process.env,
       // A Unix process group lets timeout handling terminate grandchildren
       // that outlive their immediate parent while retaining inherited stdio.
-      detached: process.platform !== "win32",
+      detached: platform !== "win32",
       windowsHide: true,
       stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       shell: false,
@@ -112,17 +132,24 @@ export async function runCommand(
 
     const killTree = (signal: NodeJS.Signals): void => {
       if (child.pid === undefined) return;
-      if (process.platform === "win32") {
-        const killer = spawn(
-          "taskkill.exe",
-          [
-            "/pid",
-            String(child.pid),
-            "/t",
-            ...(signal === "SIGKILL" ? ["/f"] : []),
-          ],
-          { windowsHide: true, stdio: "ignore", shell: false },
+      if (platform === "win32") {
+        const invocation = createWindowsTaskkillInvocation(
+          child.pid,
+          signal === "SIGKILL",
         );
+        const killer = spawnProcess(
+          invocation.executable,
+          [...invocation.args],
+          {
+            windowsHide: true,
+            stdio: "ignore",
+            shell: false,
+          },
+        );
+        // A missing or concurrently replaced taskkill must not surface as an
+        // uncaught ChildProcess error. The hard timeout below still bounds the
+        // original command when Windows cannot start its process-tree killer.
+        killer.on("error", () => undefined);
         killer.unref();
         return;
       }
@@ -135,7 +162,7 @@ export async function runCommand(
       }
     };
     const unixProcessGroupExists = (): boolean => {
-      if (process.platform === "win32" || child.pid === undefined) return false;
+      if (platform === "win32" || child.pid === undefined) return false;
       try {
         process.kill(-child.pid, 0);
         return true;
@@ -145,7 +172,7 @@ export async function runCommand(
     };
     timeout = setTimeout(() => {
       timedOut = true;
-      killTree(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
+      killTree(platform === "win32" ? "SIGKILL" : "SIGTERM");
       forceKill = setTimeout(() => {
         // Kill the group even if the direct child has already exited: a
         // descendant may still hold stdout/stderr and keep `close` pending.

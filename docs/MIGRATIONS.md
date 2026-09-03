@@ -5,8 +5,10 @@ Use these notes when moving between action releases. See the [configuration refe
 ## v0.12.2 to v0.12.3
 
 `v0.12.3` is a safety and compatibility hardening release. It has no new inputs
-and no breaking changes: existing profiles, component IDs, defaults, outputs,
-and supported runner classes remain compatible.
+or workflow-syntax changes: existing profiles, component IDs, defaults,
+outputs, and supported runner classes remain compatible. It does include one
+conditional behavior change for workflows that mount content below a selected
+cleanup target.
 
 Linux recursive removal now refuses targets that are mount points or contain a
 mounted descendant before any cleanup mutation. Skipping `maven` under `max`
@@ -24,9 +26,10 @@ dispatch-only seven-class no-input `max` matrix on fresh runners. The generated
 distribution job is a dependency of that matrix, whose destructive smoke steps
 assert numeric outputs and zero failed operations.
 
-No input or workflow-syntax changes are required. Workflows that intentionally
-mount content below a cleanup target must unmount it first or preserve that
-component.
+No configuration changes are required unless a workflow intentionally mounts
+content below a cleanup target. Such workflows must unmount it first or
+preserve that component; the action now fails closed instead of recursively
+deleting across the mount.
 
 ## v0.11.x to v0.12.0
 

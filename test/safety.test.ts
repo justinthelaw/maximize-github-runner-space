@@ -134,7 +134,7 @@ test("recursive removal allows a lexical sibling mount", async () => {
   );
 });
 
-test("Linux recursive removal rejects a target transition during the final mount read", async () => {
+test("Linux recursive removal rejects a target transition during an opening mount read", async () => {
   const root = await mkdtemp(
     join(tmpdir(), "maximize-space-mount-target-drift-"),
   );
@@ -168,7 +168,7 @@ test("Linux recursive removal rejects a target transition during the final mount
         syntheticDirectoryStats()) as unknown as typeof import("node:fs/promises").lstat,
       readLinuxMountInfo: async () => {
         mountReads += 1;
-        if (mountReads === 2) targetInode = 99n;
+        if (mountReads === 3) targetInode = 99n;
         return "";
       },
       remove: async () => {
@@ -180,11 +180,11 @@ test("Linux recursive removal rejects a target transition during the final mount
 
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /target.*identity.*changed/i);
-  assert.equal(mountReads, 2);
+  assert.equal(mountReads, 3);
   assert.equal(removeCalls, 0);
 });
 
-test("Linux recursive removal leaves its closing target observation adjacent to mutation", async () => {
+test("Linux recursive removal leaves its closing mount observation adjacent to mutation", async () => {
   const root = await mkdtemp(
     join(tmpdir(), "maximize-space-mount-target-last-"),
   );
@@ -233,7 +233,57 @@ test("Linux recursive removal leaves its closing target observation adjacent to 
   );
 
   assert.equal(result.status, "removed");
-  assert.equal(eventAtRemoval, "target:6");
+  assert.equal(eventAtRemoval, "mountinfo");
+});
+
+test("Linux recursive removal rejects a mount added during its closing target observation", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-late-descendant-mount-"),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  const mounted = join(target, "late-mount");
+  await mkdir(mounted, { recursive: true });
+  let targetInspections = 0;
+  let mountPresent = false;
+  let removed = false;
+  let removeCalls = 0;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    {
+      inspectTarget: async () => {
+        targetInspections += 1;
+        if (targetInspections === 6) mountPresent = true;
+        return removed
+          ? { exists: false, isLink: false }
+          : {
+              exists: true,
+              isLink: false,
+              realPath: target,
+              identity: { device: 1n, inode: 20n },
+            };
+      },
+      lstat: (async () =>
+        syntheticDirectoryStats()) as unknown as typeof import("node:fs/promises").lstat,
+      readLinuxMountInfo: async () =>
+        mountPresent ? linuxMountInfoLine(mounted) : "",
+      remove: async () => {
+        removeCalls += 1;
+        removed = true;
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /containing mounted path/);
+  assert.equal(removeCalls, 0);
 });
 
 test("Linux recursive removal rejects an identity transition during authoritative target C realpath", async () => {
@@ -2369,7 +2419,7 @@ test("path removal rechecks mounts immediately before local removal", async () =
       inspectTarget: async () => inspection,
       readLinuxMountInfo: async () => {
         mountReads++;
-        return mountReads === 1 ? "" : linuxMountInfoLine(mounted);
+        return mountReads < 3 ? "" : linuxMountInfoLine(mounted);
       },
       remove: async () => {
         removeCalls++;
@@ -2383,7 +2433,7 @@ test("path removal rechecks mounts immediately before local removal", async () =
 
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /mounted path/);
-  assert.equal(mountReads, 2);
+  assert.equal(mountReads, 4);
   assert.equal(removeCalls, 0);
   assert.equal(elevatedCalls, 0);
   assert.equal(await readFile(sentinel, "utf8"), "preserve me");
@@ -2419,7 +2469,7 @@ test("path removal rechecks mounts immediately before elevated removal", async (
       inspectTarget: async () => inspection,
       readLinuxMountInfo: async () => {
         mountReads++;
-        return mountReads < 3 ? "" : linuxMountInfoLine(mounted);
+        return mountReads < 5 ? "" : linuxMountInfoLine(mounted);
       },
       remove: async () => {
         removeCalls++;
@@ -2434,10 +2484,225 @@ test("path removal rechecks mounts immediately before elevated removal", async (
 
   assert.equal(result.status, "failed");
   assert.match(result.detail ?? "", /mounted path/);
-  assert.equal(mountReads, 3);
+  assert.equal(mountReads, 6);
   assert.equal(removeCalls, 1);
   assert.equal(elevatedCalls, 0);
   assert.equal(await readFile(sentinel, "utf8"), "preserve me");
+});
+
+test("path removal runs a pre-mutation guard adjacent to local removal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-local-guard-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const events: string[] = [];
+  let removed = false;
+  let eventAtRemoval: string | undefined;
+  const dependencies = {
+    inspectTarget: async () => {
+      events.push("inspect");
+      return removed
+        ? ({ exists: false, isLink: false } as const)
+        : ({
+            exists: true,
+            isLink: false,
+            realPath: target,
+            identity: { device: 1n, inode: 1n },
+          } as const);
+    },
+    readLinuxMountInfo: async () => {
+      events.push("mountinfo");
+      return "";
+    },
+    beforeMutation: async (boundary) => {
+      events.push(`guard:${boundary}`);
+    },
+    remove: async () => {
+      eventAtRemoval = events.at(-1);
+      removed = true;
+    },
+  } as RemovePathDependencies;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    dependencies,
+  );
+
+  assert.equal(result.status, "removed");
+  assert.equal(eventAtRemoval, "guard:local");
+});
+
+test("path removal aborts when its pre-mutation guard fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-failed-guard-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  let removeCalls = 0;
+  let elevatedCalls = 0;
+  const dependencies = {
+    beforeMutation: async () => {
+      throw new Error("selection changed at mutation boundary");
+    },
+    remove: async () => {
+      removeCalls += 1;
+    },
+    runElevated: async () => {
+      elevatedCalls += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  } as RemovePathDependencies;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    dependencies,
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /selection changed at mutation boundary/);
+  assert.equal(removeCalls, 0);
+  assert.equal(elevatedCalls, 0);
+});
+
+test("path removal bounds pre-mutation guard failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-bounded-guard-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  let removeCalls = 0;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    {
+      beforeMutation: async () => {
+        throw new Error("x".repeat(4_000));
+      },
+      remove: async () => {
+        removeCalls += 1;
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.detail?.length, 2_000);
+  assert.equal(removeCalls, 0);
+});
+
+test("path removal reruns its pre-mutation guard adjacent to elevation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "maximize-space-elevated-guard-"));
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const events: string[] = [];
+  let guardCalls = 0;
+  let removed = false;
+  let eventAtElevation: string | undefined;
+  const dependencies = {
+    inspectTarget: async () => {
+      events.push("inspect");
+      return removed
+        ? ({ exists: false, isLink: false } as const)
+        : ({
+            exists: true,
+            isLink: false,
+            realPath: target,
+            identity: { device: 1n, inode: 1n },
+          } as const);
+    },
+    readLinuxMountInfo: async () => {
+      events.push("mountinfo");
+      return "";
+    },
+    beforeMutation: async (boundary) => {
+      guardCalls += 1;
+      events.push(`guard:${boundary}:${guardCalls}`);
+    },
+    remove: async () => {
+      events.push("local-remove");
+      throw new Error("permission denied");
+    },
+    runElevated: async () => {
+      eventAtElevation = events.at(-1);
+      removed = true;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  } as RemovePathDependencies;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    dependencies,
+  );
+
+  assert.equal(result.status, "removed");
+  assert.equal(guardCalls, 2);
+  assert.equal(eventAtElevation, "guard:elevated:2");
+});
+
+test("path removal aborts when its elevated pre-mutation guard fails", async () => {
+  const root = await mkdtemp(
+    join(tmpdir(), "maximize-space-failed-elevated-guard-"),
+  );
+  const allowed = join(root, "allowed");
+  const target = join(allowed, "target");
+  await mkdir(target, { recursive: true });
+  const boundaries: string[] = [];
+  let removeCalls = 0;
+  let elevatedCalls = 0;
+
+  const result = await removePathTarget(
+    target,
+    [allowed],
+    {
+      ...contextFor("linux"),
+      temp: join(root, "runner-temp"),
+      workspace: undefined,
+    },
+    {
+      beforeMutation: async (boundary) => {
+        boundaries.push(boundary);
+        if (boundary === "elevated") {
+          throw new Error("selection changed before elevation");
+        }
+      },
+      remove: async () => {
+        removeCalls += 1;
+        throw new Error("permission denied");
+      },
+      runElevated: async () => {
+        elevatedCalls += 1;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  );
+
+  assert.equal(result.status, "failed");
+  assert.match(result.detail ?? "", /selection changed before elevation/);
+  assert.deepEqual(boundaries, ["local", "elevated"]);
+  assert.equal(removeCalls, 1);
+  assert.equal(elevatedCalls, 0);
 });
 
 test("elevated removal exit 0 still fails when the target exists", async () => {
