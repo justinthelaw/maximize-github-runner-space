@@ -20,6 +20,11 @@ updates:
 
   - package-ecosystem: npm
     directory: "/"
+    ignore:
+      # Keep compile-time APIs compatible with the Node.js 22 development floor.
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
     schedule:
       interval: weekly
     groups:
