@@ -12,6 +12,11 @@ from `main`, install locked dependencies, then install the hooks:
 pre-commit install --hook-type pre-commit --hook-type pre-push
 ```
 
+Keep `@types/node` on the Node.js 22 line so compilation checks the minimum
+supported development runtime. The published action continues to use Node.js 24.
+Dependabot updates Node types within that major; review a runtime-floor change
+separately before allowing a new major.
+
 ## Repository map
 
 - `action.yml`: public action metadata, inputs, outputs, and runtime entrypoint.
