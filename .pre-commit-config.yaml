@@ -30,8 +30,8 @@ repos:
         exclude: ^CHANGELOG\.md$
         stages: [pre-commit, pre-push]
 
-  - repo: https://github.com/sirosen/fix-smartquotes
-    rev: 0.2.0
+  - repo: https://github.com/sirosen/texthooks
+    rev: 0.7.1
     hooks:
       - id: fix-smartquotes
         name: Fix Quotes
