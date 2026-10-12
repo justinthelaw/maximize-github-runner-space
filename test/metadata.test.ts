@@ -1828,3 +1828,14 @@ test("public docs describe the v0.12.3 safety and release contracts", async () =
     /generated-dist[\s\S]*dependency[\s\S]*fresh runners/i,
   );
 });
+
+test("README swap examples identify their privileged Linux requirement", async () => {
+  const readme = await readFile("README.md", "utf8");
+  const swapExamples = [...readme.matchAll(/```yaml\n([\s\S]*?)```/g)]
+    .map((match) => match[1] ?? "")
+    .filter((example) => example.includes("swapfile-size:"));
+  assert.ok(swapExamples.length > 0, "expected a documented swap example");
+  for (const example of swapExamples) {
+    assert.match(example, /^\s*#.*privileged Linux VM/m);
+  }
+});

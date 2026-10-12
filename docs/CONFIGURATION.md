@@ -1,6 +1,6 @@
 # Configuration reference
 
-All inputs are optional. `cleanup-profile` defaults to `max`; every `remove-*` input defaults to `"false"`. The action detects the runner platform and does not schedule an otherwise enabled component when that component does not apply to the platform.
+All inputs are optional. `cleanup-profile` defaults to `max`; `remove-*` inputs default to `"false"`. Only components applicable to the detected platform run.
 
 ## Global inputs
 
@@ -28,7 +28,7 @@ With `max`, every component applicable to the detected platform is selected unle
 
 ## Component inputs
 
-Set an input to `"true"` to select its component in `custom`. In `max`, the same input values are not needed because applicable components are selected by default. Platform applicability below is the component registry's source of truth; an applicable component can still be absent from a particular image.
+In `custom`, set inputs to `"true"`. In `max`, applicable components are selected by default. The registry below defines platform applicability; individual images may lack a component.
 
 | Input | Component ID | Platforms | Effect |
 | --- | --- | --- | --- |
