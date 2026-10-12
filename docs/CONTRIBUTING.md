@@ -1,7 +1,6 @@
 # Contributing
 
-For action use and configuration, start with the root [README](../README.md)
-and [configuration reference](CONFIGURATION.md).
+See [AGENTS](../AGENTS.md) for the repository map and [configuration](CONFIGURATION.md) for action behavior.
 
 ## Prerequisites
 
@@ -16,16 +15,6 @@ Keep `@types/node` on the Node.js 22 line so compilation checks the minimum
 supported development runtime. The published action continues to use Node.js 24.
 Dependabot updates Node types within that major; review a runtime-floor change
 separately before allowing a new major.
-
-## Repository map
-
-- `action.yml`: public action metadata, inputs, outputs, and runtime entrypoint.
-- `src/`: planning, safety, reporting, and platform adapters.
-- `test/`: deterministic unit and contract coverage.
-- `dist/`: committed bundle consumed by GitHub Actions.
-- `.github/workflows/`: quality, representative smoke, and compatibility runs.
-- `docs/CONFIGURATION.md`, `docs/RUNNER-SUPPORT.md`, and `docs/MIGRATIONS.md`:
-  public configuration, support, and migration references.
 
 ## Safety rules
 

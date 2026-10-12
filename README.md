@@ -1,8 +1,7 @@
 # Maximize GitHub Runner Space
 
 Reclaim disk space on standard GitHub-hosted Linux, macOS, and Windows runners
-before a large build, test, or container job. The action detects the runner
-platform and architecture automatically.
+before a large build. Platform and architecture are detected automatically.
 
 > [!WARNING]
 > This action is intentionally destructive. It removes preinstalled tools,
@@ -11,27 +10,9 @@ platform and architecture automatically.
 
 ## Quick start
 
-These examples use `v0.12.3`. Release tags are readable pins.
-Use a full commit SHA for an immutable pin.
-
-Calling the action without `with:` uses the aggressive `max` profile, which
-removes every applicable component unless it is protected.
-
-```yaml
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Free runner space
-        uses: justinthelaw/maximize-github-runner-space@v0.12.3
-        with:
-          skip-components: java,browsers,docker-engine,docker-images
-          swapfile-size: 2GiB
-      - run: ./build.sh
-```
+Release tags such as `v0.12.3` are readable pins; use a full commit SHA for an immutable pin.
+Without `with:`, the destructive `max` profile removes all applicable,
+unprotected components.
 
 For a new workflow, begin with the conservative `custom` profile and opt in
 only to components you have measured as disposable:
@@ -60,6 +41,15 @@ jobs:
 Quote `remove-*` values: `custom` selects a component only when its input is
 exactly the string `"true"`.
 
+For `max`, preserve every required component and opt into swap separately:
+
+```yaml
+- uses: justinthelaw/maximize-github-runner-space@v0.12.3
+  with:
+    skip-components: java,browsers,docker-engine,docker-images
+    swapfile-size: 2GiB
+```
+
 ## Profiles at a glance
 
 - `max` is the default. It enables all components that apply to the detected
@@ -74,13 +64,11 @@ installations on macOS, and Docker data or build tools on Linux and Windows.
 Use `custom` first on a new platform integration, or protect required tools
 with `skip-components`.
 
-Component ownership includes related definition payloads: macOS Android
-cleanup removes its SDK/NDK and Android user state. On Linux and macOS, Gradle
-cleanup owns the shared `~/.gradle` user state; under `max`, skipping either
-Android or Gradle preserves it. macOS Azure CLI cleanup also removes the Azure
-DevOps extension. Windows SDK/WDK cleanup handles both Visual Studio-owned
-components and eligible standalone bundles identified by strict registry
-metadata, including current version-suffixed runner-image registrations.
+On Linux and macOS, Gradle cleanup owns the shared `~/.gradle` user state;
+under `max`, skipping either Android or Gradle preserves it.
+
+See [component ownership and skip precedence](docs/CONFIGURATION.md#profile-and-skip-semantics)
+before protecting shared toolchains or grouped components.
 
 ## Runner support
 

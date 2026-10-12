@@ -14,7 +14,7 @@ This action supports ephemeral, standard GitHub-hosted runner images. It does no
 | macOS Intel VM | Full | Uses the Intel Homebrew layout and preserves the selected Xcode. |
 | macOS arm64 VM | Full, capability-aware | Uses the Apple Silicon Homebrew layout and preserves the selected Xcode. |
 
-"Full" means the runner family is safely supported; it does not mean every component is installed on every label. An applicable but absent component reports `not-found` or `unsupported`.
+"Full" support does not imply every component is installed. Absent components report `not-found` or `unsupported`.
 
 The scheduled/manual compatibility sweep exercises these exact labels:
 
@@ -27,7 +27,7 @@ The scheduled/manual compatibility sweep exercises these exact labels:
   `macos-15-intel`, `macos-26-intel`.
 <!-- compatibility-labels:end -->
 
-GitHub's [standard public-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) and [standard private-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-private-repositories) tables are the authoritative current source for hosted-runner labels and resources. GitHub's `-latest` labels are moving aliases. Pin an explicit runner label when you need to control the operating-system image family, while recognizing that the installed image version can still change.
+GitHub's [standard public-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories) and [standard private-runner](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-private-repositories) tables are the authoritative current source for hosted-runner labels and resources. `-latest` labels move. Explicit labels select an OS family, not a fixed image version.
 
 ## Runtime image validation
 
