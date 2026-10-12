@@ -47,6 +47,7 @@ For `max`, preserve every required component and opt into swap separately:
 - uses: justinthelaw/maximize-github-runner-space@v0.12.3
   with:
     skip-components: java,browsers,docker-engine,docker-images
+    # Optional: privileged Linux VM only; omit on macOS, Windows, or containers.
     swapfile-size: 2GiB
 ```
 
