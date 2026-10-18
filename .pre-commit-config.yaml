@@ -31,7 +31,7 @@ repos:
         stages: [pre-commit, pre-push]
 
   - repo: https://github.com/sirosen/texthooks
-    rev: 0.7.1
+    rev: 1.0.0
     hooks:
       - id: fix-smartquotes
         name: Fix Quotes
