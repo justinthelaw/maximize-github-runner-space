@@ -380,6 +380,8 @@ function assertWorkflowTopology(
     "Use the minimum supported Node.js version",
     "Install locked dependencies",
     "Typecheck and unit tests",
+    "Use the latest active LTS Node.js version",
+    "Verify locked dependencies and tests on active LTS",
     "Formatting",
     "Verify committed action bundle",
   ]);
